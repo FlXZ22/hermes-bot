@@ -30,6 +30,9 @@ export const Sidebar: React.FC = () => {
     connectionStatus,
     connectionDetail,
     profiles,
+    profileSwitching,
+    client,
+    refreshCapabilities,
     activeProfile,
     setActiveProfile,
     botAvatars,
@@ -49,6 +52,11 @@ export const Sidebar: React.FC = () => {
     togglePinSession,
   } = useApp();
 
+  const [newBotOpen, setNewBotOpen] = useState(false);
+  const [botName, setBotName] = useState("");
+  const [botDescription, setBotDescription] = useState("");
+  const [botBusy, setBotBusy] = useState(false);
+  const [botError, setBotError] = useState("");
   const [search, setSearch] = useState("");
   const [showArchived, setShowArchived] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -340,6 +348,7 @@ export const Sidebar: React.FC = () => {
             <>
               <div className="gb-sidebar-section-label">
                 <span>Hermes Bots</span>
+                <button type="button" className="gb-mini-icon-btn" title="Add bot" aria-label="Add bot" onClick={() => { setBotError(""); setNewBotOpen(true); }}><CursorIcon name="plus" size={13} /></button>
                 <button
                   type="button"
                   className="gb-mini-icon-btn"
@@ -355,7 +364,7 @@ export const Sidebar: React.FC = () => {
                 </button>
               </div>
               <div className="gb-pinned-grid">
-                {profiles.slice(0, 6).map((prof) => {
+                {profiles.map((prof) => {
                   const av = botAvatars[prof.name];
                   const active = activeProfile === prof.name;
                   return (
@@ -364,6 +373,8 @@ export const Sidebar: React.FC = () => {
                       type="button"
                       className="gb-pinned-tile"
                       data-active={active ? "true" : undefined}
+                      disabled={profileSwitching}
+                      aria-pressed={active}
                       onClick={() => void setActiveProfile(prof.name)}
                       onContextMenu={(e) => {
                         e.preventDefault();
@@ -501,6 +512,28 @@ export const Sidebar: React.FC = () => {
         </div>
       </aside>
 
+      <Modal open={newBotOpen} title="Add a bot" onClose={() => { if (!botBusy) setNewBotOpen(false); }}>
+        <form className="gb-bot-form" onSubmit={async event => {
+          event.preventDefault();
+          if (!client || botBusy) { if (!client) setBotError("Connect to Hermes to add a bot."); return; }
+          const name = botName.trim();
+          if (profiles.some(profile => profile.name.toLowerCase() === name.toLowerCase())) { setBotError("A bot with that name already exists."); return; }
+          setBotBusy(true); setBotError("");
+          try {
+            await client.createProfile({ name, description: botDescription.trim() || undefined });
+            await refreshCapabilities();
+            await setActiveProfile(name);
+            setNewBotOpen(false); setBotName(""); setBotDescription("");
+          } catch (error) { setBotError(error instanceof Error ? error.message : "Could not create bot"); }
+          finally { setBotBusy(false); }
+        }}>
+          <p className="gb-bot-form__hint">A separate Hermes profile with its own conversations and memory.</p>
+          <label className="gb-field"><span className="gb-field__label">Bot name</span><input autoFocus className="gb-input" value={botName} onChange={event => setBotName(event.target.value)} required pattern="[a-zA-Z0-9_-]+" maxLength={48} placeholder="research" disabled={botBusy} /><span className="gb-bot-form__hint">Letters, numbers, underscores, and hyphens.</span></label>
+          <label className="gb-field"><span className="gb-field__label">Description</span><input className="gb-input" value={botDescription} onChange={event => setBotDescription(event.target.value)} placeholder="Optional purpose for this bot" disabled={botBusy} /></label>
+          {botError && <p role="alert" className="gb-bot-form__error">{botError}</p>}
+          <button type="submit" className="gb-btn gb-btn--primary" disabled={botBusy || !botName.trim()}>{botBusy ? "Creating…" : "Create bot"}</button>
+        </form>
+      </Modal>
       {/* Create New Session Board Modal */}
       <Modal open={newBoardOpen} title="New Session Board" onClose={() => setNewBoardOpen(false)}>
         <form onSubmit={handleCreateBoard} style={{ display: "flex", flexDirection: "column", gap: 14 }}>

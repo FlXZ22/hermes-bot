@@ -1,3 +1,4 @@
+import { useBatchedState } from "../lib/useBatchedState";
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   HermesClient,
@@ -67,6 +68,9 @@ const DEFAULT_BOARD: HermesBoardSummary = {
   workspace_path: "",
 };
 
+const EMPTY_MESSAGES: HermesMessage[] = [];
+const EMPTY_TODOS: HermesTodoItem[] = [];
+
 const STORAGE_THEME_KEY = "hermes-grok-bot:theme";
 const STORAGE_CONN_KEY = "hermes-grok-bot:connection";
 const STORAGE_BOARDS_KEY = "hermes-grok-bot:boards";
@@ -116,6 +120,7 @@ export interface AppContextValue {
   // Profiles / Bots & Avatars
   profiles: HermesProfile[];
   activeProfile: string;
+  profileSwitching: boolean;
   setActiveProfile: (name: string) => Promise<void>;
   botAvatars: Record<string, BotAvatarOverride>;
   updateBotAvatar: (seed: string, patch: BotAvatarOverride) => void;
@@ -289,6 +294,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [profiles, setProfiles] = useState<HermesProfile[]>([
     { name: "default", active: true, default: true, description: "Primary Hermes Agent" },
   ]);
+  const profileSwitchRef = useRef(false);
+  const [profileSwitching, setProfileSwitching] = useState(false);
   const [activeProfile, setActiveProfileState] = useState<string>("default");
   const [soulMd, setSoulMd] = useState("");
   const [memoryMd, setMemoryMd] = useState("");
@@ -307,20 +314,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Sessions & Chat
   const [sessions, setSessions] = useState<HermesSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [messagesBySession, setMessagesBySession] = useState<Record<string, HermesMessage[]>>({});
+  const [messagesBySession, setMessagesBySession] = useBatchedState<Record<string, HermesMessage[]>>({});
   const [todosBySession, setTodosBySession] = useState<Record<string, HermesTodoItem[]>>({});
   const [usageBySession, setUsageBySession] = useState<Record<string, HermesSessionUsage>>({});
   const [streamingBySession, setStreamingBySession] = useState<Record<string, boolean>>({});
   const [statusBySession, setStatusBySession] = useState<Record<string, string>>({});
-  const todos = activeSessionId ? todosBySession[activeSessionId] ?? [] : [];
+  const todos = activeSessionId ? todosBySession[activeSessionId] ?? EMPTY_TODOS : EMPTY_TODOS;
   const sessionUsage = activeSessionId ? usageBySession[activeSessionId] ?? null : null;
   const isStreaming = activeSessionId ? streamingBySession[activeSessionId] ?? false : false;
   const liveStatusText = activeSessionId ? statusBySession[activeSessionId] ?? "" : "";
   const markStreaming = useCallback((sid: string, value: boolean) => {
-    setStreamingBySession(prev => ({ ...prev, [sid]: value }));
+    setStreamingBySession(prev => prev[sid] === value ? prev : ({ ...prev, [sid]: value }));
   }, []);
   const markStatus = useCallback((sid: string, value: string) => {
-    setStatusBySession(prev => ({ ...prev, [sid]: value }));
+    setStatusBySession(prev => prev[sid] === value ? prev : ({ ...prev, [sid]: value }));
   }, []);
 
   // Models & Inference settings
@@ -701,13 +708,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const refreshCapabilities = useCallback(async () => {
     const c = clientRef.current;
     if (!c) return;
+    const requestedProfile = c.getProfile();
 
     // Apply each capability as it arrives: slow model discovery must not
     // delay sessions, boards, or skills. One optional API cannot block startup.
     const load = async <T,>(name: string, request: Promise<T>, apply: (data: T) => void | Promise<void>) => {
       try {
         const data = await request;
-        if (clientRef.current === c) await apply(data);
+        if (clientRef.current === c && c.getProfile() === requestedProfile) await apply(data);
       } catch (error) {
         console.warn(`Hermes ${name}:`, error instanceof Error ? error.message : String(error));
       }
@@ -1027,33 +1035,38 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     await refreshCapabilities();
   }, [isDesktop, isLocalConnection, refreshCapabilities]);
 
-  // Profile switching
-  const setActiveProfile = useCallback(
-    async (name: string) => {
-      setActiveProfileState(name);
-      setActiveSessionId(null);
+  // Commit the selected bot only after the gateway accepts it. Serialize switches
+  // so a slower response cannot overwrite a newer profile selection.
+  const setActiveProfile = useCallback(async (name: string) => {
+    if (profileSwitchRef.current || name === activeProfile) return;
+    const c = clientRef.current;
+    if (!c) { showToast("Connect to Hermes to switch bots"); return; }
+    profileSwitchRef.current = true; setProfileSwitching(true);
+    try {
+      await c.setActiveProfile(name);
+      if (clientRef.current !== c) return;
+      c.setProfile(name);
+      setActiveProfileState(name); activeSessionIdRef.current = null;
+      setActiveSessionId(null); setSessions([]); setActiveView("chat");
       setSoulMd(""); setMemoryMd(""); setUserMd("");
+      setProfiles(prev => prev.map(profile => ({ ...profile, active: profile.name === name })));
       if (isDesktop && isLocalConnection) {
         const local = await tauriBridge.loadLocalBootstrap(name).catch(() => null);
-        if (local) {
+        if (local && clientRef.current === c && c.getProfile() === name) {
           setSoulMd(local.soul_md); setMemoryMd(local.memory_md); setUserMd(local.user_md);
           if (local.active_model) setActiveModel(local.active_model);
           if (local.active_provider) setActiveProvider(local.active_provider);
         }
       }
-      if (clientRef.current) {
-        clientRef.current.setProfile(name);
-        await clientRef.current.setActiveProfile(name).catch(() => undefined);
-        const soul = await clientRef.current.getProfileSoul(name).catch(() => "");
-        if (soul) setSoulMd(soul);
-        await refreshCapabilities();
-      }
-      showToast(`Switched profile to ${name}`);
-    },
-    [refreshCapabilities, showToast, isDesktop, isLocalConnection]
-  );
+      const soul = await c.getProfileSoul(name).catch(() => "");
+      if (clientRef.current !== c || c.getProfile() !== name) return;
+      setSoulMd(soul);
+      await refreshCapabilities();
+      showToast(`Switched to ${name === "default" ? "Hermes" : name}`);
+    } catch (error) { showToast(error instanceof Error ? error.message : "Could not switch bot"); }
+    finally { profileSwitchRef.current = false; setProfileSwitching(false); }
+  }, [activeProfile, refreshCapabilities, showToast, isDesktop, isLocalConnection]);
 
-  // Bot Avatar customization
   const updateBotAvatar = useCallback(
     (seed: string, patch: BotAvatarOverride) => {
       setBotAvatars((prev) => {
@@ -1783,7 +1796,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   const messages = useMemo(
-    () => (activeSessionId ? messagesBySession[activeSessionId] ?? [] : []),
+    () => (activeSessionId ? messagesBySession[activeSessionId] ?? EMPTY_MESSAGES : EMPTY_MESSAGES),
     [activeSessionId, messagesBySession]
   );
 
@@ -1821,6 +1834,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     restartLocalBackend,
     refreshAll,
     profiles,
+    profileSwitching,
     activeProfile,
     setActiveProfile,
     botAvatars,

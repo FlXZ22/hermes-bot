@@ -125,6 +125,7 @@ export interface HermesMessage {
   role: "user" | "assistant" | "system" | "tool";
   content: string;
   thinking?: string;
+  toolName?: string;
   timestamp?: string | number;
   model?: string;
   toolCalls?: HermesToolCall[];

@@ -19,6 +19,24 @@ Build prerequisites on Arch are Node.js, npm, Rust, pkgconf, a C/C++ toolchain, 
 
 For desktop development, run `npm run desktop:dev`. For the browser preview connected to the installed Hermes backend, run `npm run dev:connected`, then open `http://127.0.0.1:5173`. That command starts an owned gateway and a same-origin development proxy, and stops them on Ctrl+C. `npm run dev` starts the frontend alone.
 
+## Chat
+
+The transcript virtualizes variable-height messages and batches streamed updates.
+Scrolling up pauses following; **Jump to latest** resumes it. Responses support
+GFM tables, task lists, nested lists, and highlighted code with copy controls.
+Thinking and tool activity start collapsed, including saved tool messages.
+
+Use **Hermes Bots → +** to create a bot with separate conversations and memory,
+then click a bot to switch. The usage strip above the input shows context tokens
+and the gateway's reported limit; unavailable figures are labeled explicitly.
+The face animation is adapted from [mikeg0/grokbot-face](https://github.com/mikeg0/grokbot-face),
+loads separately, pauses during scrolling, and respects reduced motion.
+
+For the chat regression checks, start `npm run dev`, then run
+`npm run test:chat-ui` in another terminal. The standalone check uses the shared
+Playwright installation documented in AGENTS.md, deterministic HTTP/WebSocket
+fixtures, and a 1,000-message transcript. It does not send prompts to a live model.
+
 ## Connect your server
 
 Choose **Get started → Connect a server**, enter your Hermes dashboard URL (including any reverse-proxy path prefix), and give it a name. **Sign in with browser** opens your server’s password or SSO login in the system browser. The app verifies authenticated API access and a live WebSocket before saving the connection. It restores that server on relaunch and refreshes native sign-in credentials before expiry. Access tokens and session tokens are also supported.

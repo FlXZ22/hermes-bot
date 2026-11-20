@@ -10,6 +10,7 @@ import type {
   HermesLogEntry,
   HermesMcpServer,
   HermesMessage,
+  HermesToolCall,
   HermesMessagingPlatform,
   HermesModelOption,
   HermesOAuthProvider,
@@ -364,6 +365,19 @@ export class HermesClient {
       content: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? ""),
       timestamp: (m.timestamp ?? m.created_at) as string | number | undefined,
       model: m.model ? String(m.model) : undefined,
+      thinking: typeof m.thinking === "string" ? m.thinking : typeof m.reasoning_content === "string" ? m.reasoning_content : undefined,
+      toolName: typeof m.name === "string" ? m.name : undefined,
+      toolCalls: toArray<Record<string, unknown>>(m.toolCalls ?? m.tool_calls).map((tool, toolIndex): HermesToolCall => {
+        const fn = tool.function && typeof tool.function === "object" ? tool.function as Record<string, unknown> : tool;
+        return {
+          id: String(tool.id ?? `${m.id ?? idx}-tool-${toolIndex}`),
+          name: String(tool.name ?? fn.name ?? "tool"),
+          arguments: typeof fn.arguments === "string" || (fn.arguments != null && typeof fn.arguments === "object") ? fn.arguments as HermesToolCall["arguments"] : undefined,
+          output: typeof tool.output === "string" ? tool.output : undefined,
+          status: tool.status === "error" ? "error" : "done",
+          durationMs: typeof tool.durationMs === "number" ? tool.durationMs : undefined,
+        };
+      }),
     }));
   }
 

@@ -105,3 +105,19 @@ test('switching the visible chat cannot redirect a background response', () => {
   assert.equal(resolveStreamSessionId('stored-a', 'stored-b', ids), 'stored-a');
   assert.equal(resolveStreamSessionId(undefined, 'stored-b', ids), 'stored-b');
 });
+
+test('stored transcripts preserve reasoning and tool activity for collapsed rendering', async () => {
+  const client = new HermesClient(connection);
+  client.request = async () => ({ messages: [
+    { id: 'a', role: 'assistant', content: 'Done', reasoning_content: '**Checked** the result', tool_calls: [
+      { id: 'tc', function: { name: 'terminal', arguments: '{"command":"pwd"}' } },
+    ] },
+    { id: 't', role: 'tool', name: 'terminal', content: '/workspace' },
+  ] });
+  const messages = await client.getSessionMessages('session');
+  assert.equal(messages[0].thinking, '**Checked** the result');
+  assert.equal(messages[0].toolCalls[0].name, 'terminal');
+  assert.equal(messages[0].toolCalls[0].arguments, '{"command":"pwd"}');
+  assert.equal(messages[1].toolName, 'terminal');
+  assert.equal(messages[1].role, 'tool');
+});

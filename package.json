@@ -24,7 +24,8 @@
     "test:e2e": "npm run build:client && node scripts/hermes-e2e.mjs",
     "test:rust": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml",
     "desktop:diagnose": "cargo run --manifest-path apps/desktop/src-tauri/Cargo.toml -- --diagnose-backend",
-    "test:auth": "npm run build:client && node scripts/hermes-auth-e2e.mjs"
+    "test:auth": "npm run build:client && node scripts/hermes-auth-e2e.mjs",
+    "test:chat-ui": "node scripts/chat-ui-check.cjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.6",

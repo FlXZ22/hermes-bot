@@ -1,9 +1,10 @@
+import { UsageBar } from "./UsageBar";
+import { AnimatedBotFace } from "./AnimatedBotFace";
+import { ChatTranscript } from "./ChatTranscript";
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { ApprovalCard, BotMark, ClarifyCard, CursorIcon, resolveBotColor } from "@grok-bot/theme";
-import type { HermesToolCall } from "@grok-bot/hermes-client";
+import { BotMark, CursorIcon, resolveBotColor } from "@grok-bot/theme";
 import { useApp, type ReasoningEffort } from "../state/appStore";
-import { MarkdownBody } from "../lib/markdown";
-import { formatTokens, shortModelName } from "../lib/format";
+import { shortModelName } from "../lib/format";
 import { tauriBridge } from "../lib/tauriBridge";
 
 const SLASH_COMMANDS = [
@@ -46,73 +47,6 @@ const STARTER_PROMPTS = [
   },
 ];
 
-const ToolActivityCard: React.FC<{ tool: HermesToolCall }> = ({ tool }) => {
-  const [open, setOpen] = useState(tool.status === "running");
-  const argsText =
-    typeof tool.arguments === "string"
-      ? tool.arguments
-      : tool.arguments
-        ? JSON.stringify(tool.arguments, null, 2)
-        : "";
-
-  return (
-    <div className="gb-tool-card">
-      <button type="button" className="gb-tool-card__header" onClick={() => setOpen((v) => !v)}>
-        <CursorIcon
-          name={
-            tool.status === "running"
-              ? "spinner"
-              : tool.status === "error"
-                ? "x-circle"
-                : "check-circle"
-          }
-          size={14}
-          spin={tool.status === "running"}
-          style={{
-            color:
-              tool.status === "running"
-                ? "var(--grok-bot-text-accent)"
-                : tool.status === "error"
-                  ? "var(--grok-bot-text-danger)"
-                  : "var(--grok-bot-text-success)",
-          }}
-        />
-        <span className="gb-tool-card__name">{tool.name}</span>
-        <span className="gb-tool-card__detail">
-          {tool.preview || (argsText ? argsText.slice(0, 90) : tool.status === "running" ? "Running..." : "Completed")}
-        </span>
-        {tool.durationMs ? (
-          <span style={{ fontSize: 11, color: "var(--grok-bot-text-tertiary)" }}>
-            {(tool.durationMs / 1000).toFixed(1)}s
-          </span>
-        ) : null}
-        <CursorIcon name={open ? "chevron-down" : "chevron-right"} size={12} />
-      </button>
-      {open && (argsText || tool.output) && (
-        <div className="gb-tool-card__body">
-          {argsText ? `Input:\n${argsText}\n` : ""}
-          {tool.output ? `${argsText ? "\n" : ""}Output:\n${tool.output}` : ""}
-        </div>
-      )}
-    </div>
-  );
-};
-
-const ThinkingDisclosure: React.FC<{ text: string; streaming?: boolean }> = ({ text, streaming }) => {
-  const [open, setOpen] = useState(Boolean(streaming));
-  if (!text) return null;
-  return (
-    <div className="gb-thinking-card">
-      <button type="button" className="gb-thinking-card__head" onClick={() => setOpen((v) => !v)}>
-        <CursorIcon name={streaming ? "spinner" : "brain"} size={13} spin={Boolean(streaming)} />
-        <span>{streaming ? "Reasoning..." : "Thought process"}</span>
-        <CursorIcon name={open ? "chevron-down" : "chevron-right"} size={12} style={{ marginLeft: "auto" }} />
-      </button>
-      {open && <div className="gb-thinking-card__body">{text}</div>}
-    </div>
-  );
-};
-
 export const ChatView: React.FC = () => {
   const {
     isDesktop,
@@ -122,10 +56,8 @@ export const ChatView: React.FC = () => {
     activeSessionId,
     showToast,
     messages,
-    todos,
     sessionUsage,
     isStreaming,
-    liveStatusText,
     boards,
     activeBoardSlug,
     sessionBoards,
@@ -149,8 +81,6 @@ export const ChatView: React.FC = () => {
     renameSession,
     compressActiveSession,
     branchActiveSession,
-    respondApproval,
-    respondClarify,
   } = useApp();
 
   const { connection, setupOpen } = useApp();
@@ -171,15 +101,7 @@ export const ChatView: React.FC = () => {
   const [titleDraft, setTitleDraft] = useState("");
   const [boardMenuOpen, setBoardMenuOpen] = useState(false);
   const [slashIndex, setSlashIndex] = useState(0);
-  const transcriptRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-
-  // Auto-scroll transcript as deltas stream in
-  useEffect(() => {
-    const el = transcriptRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [messages.length, isStreaming, messages[messages.length - 1]?.content?.length, setupOpen]);
 
   // Auto-resize composer textarea
   useEffect(() => {
@@ -209,13 +131,6 @@ export const ChatView: React.FC = () => {
     const q = draft.toLowerCase();
     return SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q));
   }, [draft, setupOpen]);
-
-  const contextPercent = useMemo(() => {
-    const used = sessionUsage?.context_tokens ?? sessionUsage?.total_tokens ?? activeSession?.tokens_used ?? 0;
-    const limit = sessionUsage?.context_limit ?? activeSession?.context_limit ?? 200_000;
-    if (!used || !limit) return 0;
-    return Math.min(100, Math.round((used / limit) * 100));
-  }, [activeSession?.context_limit, activeSession?.tokens_used, sessionUsage]);
 
   const handleSubmit = async (customText?: string) => {
     const text = (customText ?? draft).trim();
@@ -353,7 +268,7 @@ export const ChatView: React.FC = () => {
               }}
               title="Click to rename session"
             >
-              <BotMark
+              <AnimatedBotFace
                 seed={botSeed}
                 shapeId={botAv?.shapeId}
                 colorId={botAv?.colorId}
@@ -418,7 +333,7 @@ export const ChatView: React.FC = () => {
             title="Customize Bot Avatar"
             style={{ borderRadius: 28, padding: 6 }}
           >
-            <BotMark seed={botSeed} shapeId={botAv?.shapeId} colorId={botAv?.colorId} size={76} />
+            <AnimatedBotFace seed={botSeed} shapeId={botAv?.shapeId} colorId={botAv?.colorId} size={76} />
           </button>
           <h1 className="gb-welcome__title">
             {botAv?.displayName || (activeProfile === "default" ? "Hermes" : activeProfile)}
@@ -445,132 +360,7 @@ export const ChatView: React.FC = () => {
           </div>
         </div>
       ) : (
-        <div className="gb-transcript" ref={transcriptRef}>
-          <div className="gb-transcript-inner">
-            {/* Live Agent Todo Checklist */}
-            {todos.length > 0 && (
-              <div className="gb-section-card" style={{ marginBottom: 4 }}>
-                <div className="gb-section-card__head" style={{ padding: "9px 13px" }}>
-                  <span className="gb-section-card__title" style={{ fontSize: 12.5, display: "flex", alignItems: "center", gap: 6 }}>
-                    <CursorIcon name="list-todo" size={13} />
-                    Agent Plan ({todos.filter((t) => t.status === "completed").length}/{todos.length})
-                  </span>
-                </div>
-                <div style={{ padding: "8px 13px", display: "flex", flexDirection: "column", gap: 5 }}>
-                  {todos.map((t, idx) => (
-                    <div key={t.id ?? idx} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12.5 }}>
-                      <CursorIcon
-                        name={
-                          t.status === "completed"
-                            ? "check-circle"
-                            : t.status === "in_progress"
-                              ? "spinner"
-                              : "circle"
-                        }
-                        size={13}
-                        spin={t.status === "in_progress"}
-                        style={{
-                          color:
-                            t.status === "completed"
-                              ? "var(--grok-bot-text-success)"
-                              : t.status === "in_progress"
-                                ? "var(--grok-bot-text-accent)"
-                                : "var(--grok-bot-text-tertiary)",
-                        }}
-                      />
-                      <span
-                        style={{
-                          textDecoration: t.status === "completed" ? "line-through" : undefined,
-                          color: t.status === "completed" ? "var(--grok-bot-text-tertiary)" : "var(--grok-bot-text-primary)",
-                        }}
-                      >
-                        {t.content}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {messages.map((msg) => {
-              if (msg.role === "user") {
-                return (
-                  <div key={msg.id} className="gb-entry gb-entry--user">
-                    <div className="gb-bubble-user">{msg.content}</div>
-                  </div>
-                );
-              }
-
-              return (
-                <div key={msg.id} className="gb-entry gb-entry--assistant" style={{ gap: 8 }}>
-                  {msg.thinking ? <ThinkingDisclosure text={msg.thinking} streaming={msg.streaming} /> : null}
-
-                  {msg.toolCalls && msg.toolCalls.length > 0 && (
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6, width: "100%" }}>
-                      {msg.toolCalls.map((tc) => (
-                        <ToolActivityCard key={tc.id} tool={tc} />
-                      ))}
-                    </div>
-                  )}
-
-                  {msg.approval && (
-                    <ApprovalCard
-                      title={msg.approval.title}
-                      detail={msg.approval.detail}
-                      settled={msg.approval.settled}
-                      onAllowOnce={() => void respondApproval(msg.approval!.id, "once")}
-                      onAllowAlways={() => void respondApproval(msg.approval!.id, "always")}
-                      onDeny={() => void respondApproval(msg.approval!.id, "deny")}
-                    />
-                  )}
-
-                  {msg.clarify && (
-                    <ClarifyCard
-                      question={msg.clarify.question}
-                      choices={msg.clarify.choices}
-                      answered={msg.clarify.answered}
-                      onAnswer={(ans) => void respondClarify(msg.clarify!.id, ans)}
-                    />
-                  )}
-
-                  {msg.content ? (
-                    <div className="gb-bubble-agent">
-                      <MarkdownBody content={msg.content} />
-                    </div>
-                  ) : null}
-
-                  {msg.content && !msg.streaming && (
-                    <div className="gb-msg-meta">
-                      {msg.model && <span>{shortModelName(msg.model)}</span>}
-                      <button
-                        type="button"
-                        className="gb-mini-icon-btn"
-                        title="Copy message"
-                        onClick={() => navigator.clipboard?.writeText(msg.content).catch(() => undefined)}
-                      >
-                        <CursorIcon name="copy" size={11} />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-
-            {isStreaming && (
-              <div className="gb-pending">
-                <BotMark seed={botSeed} shapeId={botAv?.shapeId} colorId={botAv?.colorId} size={22} working />
-                <span className="gb-pending__label">
-                  <span>{liveStatusText || "Hermes is thinking"}</span>
-                  <span className="gb-typing-dots">
-                    <span className="gb-typing-dot" />
-                    <span className="gb-typing-dot" />
-                    <span className="gb-typing-dot" />
-                  </span>
-                </span>
-              </div>
-            )}
-          </div>
-        </div>
+        <ChatTranscript key={activeSessionId ?? "new"} />
       )}
 
       {/* Floating Frosted Grok Bot Pill Composer + Hermes Controls Strip */}
@@ -691,17 +481,11 @@ export const ChatView: React.FC = () => {
                 </button>
               )}
 
-              {contextPercent > 0 && (
-                <div className="gb-context-meter" title={`Context usage: ${formatTokens(sessionUsage?.total_tokens)} tokens`}>
-                  <div className="gb-context-meter__bar">
-                    <div className="gb-context-meter__fill" style={{ width: `${contextPercent}%` }} />
-                  </div>
-                  <span>{contextPercent}%</span>
-                </div>
-              )}
+
             </div>
           </div>
 
+          <UsageBar usage={sessionUsage} contextLimit={activeSession?.context_limit} />
           <input ref={fileInputRef} type="file" multiple hidden onChange={event => {
             const selected = Array.from(event.target.files ?? []);
             if (selected.some(file => file.size > 50 * 1024 * 1024)) {
@@ -737,7 +521,7 @@ export const ChatView: React.FC = () => {
               ref={textareaRef}
               rows={1}
               className="gb-composer__textarea"
-              placeholder={`Message ${botAv?.displayName || "Hermes"}... (type / for commands)`}
+              placeholder={`Message ${botAv?.displayName || (activeProfile === "default" ? "Hermes" : activeProfile)}... (type / for commands)`}
               value={draft}
               onChange={(e) => {
                 setDraft(e.target.value);
