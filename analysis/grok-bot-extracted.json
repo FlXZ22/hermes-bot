@@ -1,0 +1,194 @@
+{
+  "cursorIconSnippets": [
+    {
+      "file": "3a0fz1o9-rxp3.js",
+      "offset": 2104,
+      "snippet": " strict\";var t=e.i(552184),r=e.i(122946);try{var n=window;n._sentryModuleMetadata=n._sentryModuleMetadata||{},n._sentryModuleMetadata[(new n.Error).stack]=Object.assign({},n._sentryModuleMetadata[(new n.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}let a=r.default.memo(function({codepoint:e,size:r=16,className:n,style:a}){return(0,t.jsx)(\"span\",{className:n,style:{fontFamily:\"CursorIcons16\",fontSize:`${r}px`,lineHeight:1,display:\"inline-flex\",width:`${r}px`,height:`${r}px`,alignItems:\"center\",justifyContent:\"center\",...a},children:String.fromCodePoint(parseInt(e,16))})});e.s([\"q\",0,a,\"m\",0,function(){return(0,t.jsx)(\"style\",{href:\"cursor-icons-16\",precedence:\"medium\",children:`\n      @font-face {\n        font-family: 'CursorIcons16';\n        src: url('/grok-bot-static/fonts/cursor-icons-16.woff2?v=2026-10-28') format('woff2');\n        font-weight: normal;\n        font-style: normal;\n        font-display: block;\n      }\n      @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }\n      @keyframes fadeSlideUp { from { opacity: 0; transform: translateY(2px) } to { opacity: 1; transform: translateY(0) } }\n      @keyframes fadeSlideRight { from { opacity: 0; tr"
+    },
+    {
+      "file": "3a0fz1o9-rxp3.js",
+      "offset": 2453,
+      "snippet": "rn(0,t.jsx)(\"span\",{className:n,style:{fontFamily:\"CursorIcons16\",fontSize:`${r}px`,lineHeight:1,display:\"inline-flex\",width:`${r}px`,height:`${r}px`,alignItems:\"center\",justifyContent:\"center\",...a},children:String.fromCodePoint(parseInt(e,16))})});e.s([\"q\",0,a,\"m\",0,function(){return(0,t.jsx)(\"style\",{href:\"cursor-icons-16\",precedence:\"medium\",children:`\n      @font-face {\n        font-family: 'CursorIcons16';\n        src: url('/grok-bot-static/fonts/cursor-icons-16.woff2?v=2026-10-28') format('woff2');\n        font-weight: normal;\n        font-style: normal;\n        font-display: block;\n      }\n      @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }\n      @keyframes fadeSlideUp { from { opacity: 0; transform: translateY(2px) } to { opacity: 1; transform: translateY(0) } }\n      @keyframes fadeSlideRight { from { opacity: 0; transform: translateX(-2px) } to { opacity: 1; transform: translateX(0) } }\n      @keyframes barGrow { from { transform: scaleY(0) } to { transform: scaleY(1) } }\n      @keyframes tilePopIn { from { opacity: 0; transform: scale(0.7) translateY(3px) } to { opacity: 1; transform: scale(1) translateY(0) } }\n    `})}],904884);var o=e.i(245799);try{var s"
+    }
+  ],
+  "agentThemes": [
+    {
+      "file": "2ruviwhb973r3.js",
+      "offset": 10682,
+      "snippet": "=z._sentryModuleMetadata||{},z._sentryModuleMetadata[(new z.Error).stack]=Object.assign({},z._sentryModuleMetadata[(new z.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}let E=\"var(--grok-bot-current-agent-coat, #885cf5)\",B={at:null,kind:\"ibeam\",press:!1,who:\"you\",screen:_};function C(e,t,a){return Array.from({length:t},(t,s)=>[e+45*s,{screen:{[a]:s+1}}])}let A=[[300,{at:\"email\"}],[800,{press:!0}],[900,{press:!1,screen:{focus:\"email\"}}],...C(1e3,f.length,\"emailChars\"),[1850,{at:\"password\"}],[2300,{press:!0}],[2400,{press:!1,screen:{focus:\"password\"}}],...C(2500,9,\"passwordChars\"),[3050,{at:\"submit\"}],[3200,{kind:\"pointer\"}],[3600,{press:!0}],[3700,{press:!1,who:\"bot\",scree"
+    },
+    {
+      "file": "1qjn-osn7_gob.js",
+      "offset": 59445,
+      "snippet": "data||{},t._sentryModuleMetadata[(new t.Error).stack]=Object.assign({},t._sentryModuleMetadata[(new t.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function(e){return{\"--grok-bot-current-agent-tint\":e.glassTint,\"--grok-bot-current-agent-bubble\":e.bubbleBackground,\"--grok-bot-current-agent-bubble-ink\":e.bubbleForeground,\"--grok-bot-current-agent-accent\":e.accent,\"--grok-bot-current-agent-coat\":e.avatar}}])},866871,e=>{\"use strict\";var t=e.i(552184);try{var a=window;a._sentryModuleMetadata=a._sentryModuleMetadata||{},a._sentryModuleMetadata[(new a.Error).stack]=Object.assign({},a._sentryModuleMetadata[(new a.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0"
+    },
+    {
+      "file": "1qjn-osn7_gob.js",
+      "offset": 59489,
+      "snippet": "r).stack]=Object.assign({},t._sentryModuleMetadata[(new t.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function(e){return{\"--grok-bot-current-agent-tint\":e.glassTint,\"--grok-bot-current-agent-bubble\":e.bubbleBackground,\"--grok-bot-current-agent-bubble-ink\":e.bubbleForeground,\"--grok-bot-current-agent-accent\":e.accent,\"--grok-bot-current-agent-coat\":e.avatar}}])},866871,e=>{\"use strict\";var t=e.i(552184);try{var a=window;a._sentryModuleMetadata=a._sentryModuleMetadata||{},a._sentryModuleMetadata[(new a.Error).stack]=Object.assign({},a._sentryModuleMetadata[(new a.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function({className:"
+    },
+    {
+      "file": "1qjn-osn7_gob.js",
+      "offset": 59542,
+      "snippet": "ew t.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function(e){return{\"--grok-bot-current-agent-tint\":e.glassTint,\"--grok-bot-current-agent-bubble\":e.bubbleBackground,\"--grok-bot-current-agent-bubble-ink\":e.bubbleForeground,\"--grok-bot-current-agent-accent\":e.accent,\"--grok-bot-current-agent-coat\":e.avatar}}])},866871,e=>{\"use strict\";var t=e.i(552184);try{var a=window;a._sentryModuleMetadata=a._sentryModuleMetadata||{},a._sentryModuleMetadata[(new a.Error).stack]=Object.assign({},a._sentryModuleMetadata[(new a.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function({className:e}){return(0,t.jsx)(\"svg\",{className:e,viewBox:\"-2.45"
+    },
+    {
+      "file": "1qjn-osn7_gob.js",
+      "offset": 59599,
+      "snippet": "!0})}catch(e){}e.s([\"f\",0,function(e){return{\"--grok-bot-current-agent-tint\":e.glassTint,\"--grok-bot-current-agent-bubble\":e.bubbleBackground,\"--grok-bot-current-agent-bubble-ink\":e.bubbleForeground,\"--grok-bot-current-agent-accent\":e.accent,\"--grok-bot-current-agent-coat\":e.avatar}}])},866871,e=>{\"use strict\";var t=e.i(552184);try{var a=window;a._sentryModuleMetadata=a._sentryModuleMetadata||{},a._sentryModuleMetadata[(new a.Error).stack]=Object.assign({},a._sentryModuleMetadata[(new a.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function({className:e}){return(0,t.jsx)(\"svg\",{className:e,viewBox:\"-2.45 0 2452.5 2452.5\",xmlns:\"http://www.w3.org/2000/svg\",chil"
+    },
+    {
+      "file": "1qjn-osn7_gob.js",
+      "offset": 59642,
+      "snippet": "n{\"--grok-bot-current-agent-tint\":e.glassTint,\"--grok-bot-current-agent-bubble\":e.bubbleBackground,\"--grok-bot-current-agent-bubble-ink\":e.bubbleForeground,\"--grok-bot-current-agent-accent\":e.accent,\"--grok-bot-current-agent-coat\":e.avatar}}])},866871,e=>{\"use strict\";var t=e.i(552184);try{var a=window;a._sentryModuleMetadata=a._sentryModuleMetadata||{},a._sentryModuleMetadata[(new a.Error).stack]=Object.assign({},a._sentryModuleMetadata[(new a.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function({className:e}){return(0,t.jsx)(\"svg\",{className:e,viewBox:\"-2.45 0 2452.5 2452.5\",xmlns:\"http://www.w3.org/2000/svg\",children:(0,t.jsxs)(\"g\",{clipRule:\"evenodd\",fil"
+    },
+    {
+      "file": "32sdt7g0j3wei.js",
+      "offset": 145854,
+      "snippet": "jsx)(\"span\",{className:\"mt-2.5 -ml-0.5 whitespace-nowrap rounded-full bg-black/50 px-2 py-0.5 text-[10px] font-medium text-white\",children:e})]})}),c=r.default.memo(function({className:e,color:r=\"var(--grok-bot-current-agent-coat, #885cf5)\"}){let{Mark:s}=(0,a.u)();return(0,t.jsxs)(\"div\",{className:(0,n.f)(\"relative h-[18px] w-[18px]\",e),children:[(0,t.jsx)(u,{fill:r}),(0,t.jsx)(\"span\",{className:\"absolute top-[12px] left-[11px] flex size-[16px] items-center justify-center overflow-hidden rounded-full border-[1.5px] border-white drop-shadow-[0_0.5px_1px_rgba(0,0,0,0.3)]\",style:{\"--fg\":r,\"--bg\":\"#fff\"},children:(0,t.jsx)(s,{className:\"grok-bot-mark--fill\"})})]})});e.s([\"j\",0,c,\"e\",0,function({"
+    },
+    {
+      "file": "0cf59cht7b050.js",
+      "offset": 13299,
+      "snippet": "ing\",label:\"Thinking\"}:e??z[r];return(0,t.jsxs)(\"div\",{className:\"baby-grok-bot-pending mt-3\",children:[(0,t.jsx)(\"span\",{\"aria-hidden\":!0,className:\"baby-grok-bot-pending__avatar\",style:{\"--fg\":\"var(--grok-bot-current-agent-coat)\",\"--bg\":\"var(--grok-bot-bg-editor)\"},children:(0,t.jsx)(a,{state:d})}),(0,t.jsx)(\"span\",{className:\"baby-grok-bot-pending__label\",children:c},c)]})}function K({beat:e}){return(0,t.jsx)(c.f,{closes:!0,fade:!0,duration:G,ease:f.v,children:(0,t.jsx)(R,{fixed:e})})}function F({label:e}){return(0,t.jsx)(\"div\",{className:\"flex items-center justify-center py-1 text-[12px] leading-4\",style:{color:\"var(--cursor-text-secondary)\"},children:e})}function H(e){return\"system\"===e"
+    },
+    {
+      "file": "0cf59cht7b050.js",
+      "offset": 34878,
+      "snippet": ",isSelected:s}){return(0,t.jsx)(\"span\",{\"aria-hidden\":!0,className:\"mt-px flex size-5 shrink-0 items-center justify-center rounded-[6px] text-[11px] leading-none font-medium\",style:s?{background:\"var(--grok-bot-current-agent-accent)\",color:\"#fff\"}:{background:\"var(--grok-bot-fill-secondary)\",color:\"var(--cursor-text-tertiary)\"},children:s?(0,t.jsx)(a.W,{name:\"check\",size:11}):\"ABCDEFGH\"[e]??String(e+1)})}function u({entry:e}){return(0,t.jsxs)(\"div\",{className:\"baby-grok-bot-card\",children:[(0,t.jsx)(\"p\",{children:e.question}),(0,t.jsx)(\"p\",{className:\"mt-0.5\",style:{color:\"var(--cursor-text-tertiary)\"},children:null==e.answer?\"Skipped\":(0,o.f)(e.answer,e.options)})]})}e.s([\"f\",0,function({en"
+    }
+  ],
+  "classUsages": [
+    "baby-grok-bot",
+    "baby-grok-bot-agent-title-pill",
+    "baby-grok-bot-approval",
+    "baby-grok-bot-approval__actions",
+    "baby-grok-bot-approval__detail",
+    "baby-grok-bot-approval__label",
+    "baby-grok-bot-approval__title",
+    "baby-grok-bot-card",
+    "baby-grok-bot-card-action",
+    "baby-grok-bot-card-badge",
+    "baby-grok-bot-card-badge__dot",
+    "baby-grok-bot-card-meta",
+    "baby-grok-bot-card-secondary",
+    "baby-grok-bot-card-title",
+    "baby-grok-bot-choice-confirm",
+    "baby-grok-bot-choice-input",
+    "baby-grok-bot-choice-option",
+    "baby-grok-bot-compose-result",
+    "baby-grok-bot-compose-results",
+    "baby-grok-bot-composer-field-input",
+    "baby-grok-bot-entry-enter",
+    "baby-grok-bot-flight__airport",
+    "baby-grok-bot-flight__dot",
+    "baby-grok-bot-flight__highlight",
+    "baby-grok-bot-flight__leg",
+    "baby-grok-bot-flight__line",
+    "baby-grok-bot-flight__lines",
+    "baby-grok-bot-flight__mark",
+    "baby-grok-bot-flight__price",
+    "baby-grok-bot-flight__route",
+    "baby-grok-bot-flight__time",
+    "baby-grok-bot-flight__title",
+    "baby-grok-bot-md",
+    "baby-grok-bot-mention",
+    "baby-grok-bot-mention-popover",
+    "baby-grok-bot-message-at",
+    "baby-grok-bot-message-body",
+    "baby-grok-bot-message-mention",
+    "baby-grok-bot-message-mention__face",
+    "baby-grok-bot-message-panel",
+    "baby-grok-bot-message-row",
+    "baby-grok-bot-mount-fade",
+    "baby-grok-bot-notched",
+    "baby-grok-bot-pending",
+    "baby-grok-bot-pending__avatar",
+    "baby-grok-bot-pending__label",
+    "baby-grok-bot-portal-agent-cursor",
+    "baby-grok-bot-reaction",
+    "baby-grok-bot-reactions",
+    "baby-grok-bot-reactions--",
+    "baby-grok-bot-receipt-check",
+    "baby-grok-bot-rich",
+    "baby-grok-bot-rich-amount",
+    "baby-grok-bot-rich-arrive",
+    "baby-grok-bot-rich-button",
+    "baby-grok-bot-rich-button__spinner",
+    "baby-grok-bot-rich-card-number",
+    "baby-grok-bot-rich-charges",
+    "baby-grok-bot-rich-check",
+    "baby-grok-bot-rich-choice",
+    "baby-grok-bot-rich-choice--media",
+    "baby-grok-bot-rich-choice__body",
+    "baby-grok-bot-rich-choice__description",
+    "baby-grok-bot-rich-choice__placeholder",
+    "baby-grok-bot-rich-choices",
+    "baby-grok-bot-rich-choices--media",
+    "baby-grok-bot-rich-choices__divider",
+    "baby-grok-bot-rich-collapse",
+    "baby-grok-bot-rich-collapse__body",
+    "baby-grok-bot-rich-field",
+    "baby-grok-bot-rich-field__label",
+    "baby-grok-bot-rich-field__value",
+    "baby-grok-bot-rich-fields",
+    "baby-grok-bot-rich-keycap",
+    "baby-grok-bot-rich-logo",
+    "baby-grok-bot-rich-mark",
+    "baby-grok-bot-rich-markstack",
+    "baby-grok-bot-rich-message",
+    "baby-grok-bot-rich-muted",
+    "baby-grok-bot-rich-network",
+    "baby-grok-bot-rich-network__visa",
+    "baby-grok-bot-rich-payment",
+    "baby-grok-bot-rich-payment__dots",
+    "baby-grok-bot-rich-route",
+    "baby-grok-bot-rich-site",
+    "baby-grok-bot-rich__actions",
+    "baby-grok-bot-rich__actions--split",
+    "baby-grok-bot-rich__actions-trailing",
+    "baby-grok-bot-rich__header",
+    "baby-grok-bot-rich__header-copy",
+    "baby-grok-bot-rich__header-leading",
+    "baby-grok-bot-rich__item",
+    "baby-grok-bot-rich__item-content",
+    "baby-grok-bot-rich__item-label",
+    "baby-grok-bot-rich__items",
+    "baby-grok-bot-rich__subtitle",
+    "baby-grok-bot-rich__title",
+    "baby-grok-bot-rich__titlebar",
+    "baby-grok-bot-rich__titlebar-icon",
+    "baby-grok-bot-rich__titlebar-label",
+    "baby-grok-bot-rich__titlebar-summary",
+    "baby-grok-bot-rich__titlebar-text",
+    "baby-grok-bot-rich__titlebar-trailing",
+    "baby-grok-bot-spinner",
+    "baby-grok-bot-system-agent",
+    "baby-grok-bot-system-pill",
+    "baby-grok-bot-transcript",
+    "baby-grok-bot-window-action"
+  ],
+  "uiStrings": [],
+  "componentExcerpts": {
+    "baby-grok-bot-agent-title-pill": {
+      "file": "32sdt7g0j3wei.js",
+      "offset": 110965,
+      "snippet": "r,onScreenClick:a,screenOpen:o}){return(0,t.jsxs)(\"div\",{className:\"absolute inset-x-3 top-0 z-20 flex h-12 items-center justify-between gap-2\",children:[(0,t.jsx)(s,{\"aria-label\":\"Back to chats\",onClick:r,children:(0,t.jsx)(l.W,{name:\"chevron-left\",size:15})}),(0,t.jsx)(\"div\",{className:\"ios-glass baby-grok-bot-agent-title-pill flex h-8 min-w-0 items-center gap-2 rounded-full pr-3 pl-1\",children:(0,t.jsxs)(\"span\",{className:\"relative z-10 flex min-w-0 items-center gap-2\",children:[(0,t.jsx)(i.F,{agent:e,members:(0,i.s)(e,n),size:22,working:e.isRunning||e.isComposingMessage}),(0,t.jsx)(\"span\",{className:\"truncate text-[13px] leading-4 font-medium tracking-[-0.15px]\",style:{color:\"var(--cursor-text-primary)\"},children:e.name})]})}),e.isGroup?(0,t.jsx)(\"span\",{className:\"size-8 shrink-0\"}):(0,t.jsx)(s,{\"aria-label\":`Open ${e.name}'s screen`,\"aria-pressed\":o,onClick:a,children:(0,t.jsx)(l.W,{name:\"device-desktop\",size:15})})]})}],466224);var f=e.i(122946),g=e.i(440976);try{var y=window;y._sentryModuleMetadata=y._sentryModuleMetadata||{},y._sentryModuleMetadata[(new y.Error).stack]=Object.assign({},y._sentryModuleMetadata[(new y.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}let x=\"Message\";e.s([\"M\",0,function({agents:e,onOpenAttachments:n,onSubmit:r}){let a=(0,f.useRef)(null),[s,i]=(0,f.useState)(!0);return(0,t.jsxs)(\"form\",{className:\"absolute inset-x-3 bottom-3 z-20 flex items-end gap-2\",onSubmit:e=>{e.preventDefault(),a.current?.submit()},children:[(0,t.jsx)(\"button\",{\"aria-label\":\"Add context\",className:\"ios-glass flex size-10 shrink-0 items-center justify-center rounded-full text-[color:var(--mobile-phone-control-text)]\",onClick:n,type:\"button\",children:(0,t.jsx)(\"span\",{className:\"relative z-10 flex items-center justify-center\",children:(0,t.jsx)("
+    },
+    "baby-grok-bot-composer": {
+      "file": "32sdt7g0j3wei.js",
+      "offset": 121973,
+      "snippet": ":t.textContent=e,i(0===e.trim().length))}})),(0,t.jsxs)(\"div\",{className:\"relative min-w-0 flex-1\",children:[null==h?null:(0,t.jsx)(g,{agents:M,allAgents:e,highlightIndex:y,listRef:p,onHighlight:v,onSelect:E,query:h}),(0,t.jsx)(\"div\",{\"aria-multiline\":!0,\"aria-readonly\":u||void 0,className:(0,n.f)(\"baby-grok-bot-composer-field-input\",a),contentEditable:!u,\"data-empty\":s?\"\":void 0,\"data-placeholder\":l,onBlur:u?void 0:_,onInput:u?void 0:N,onKeyDown:u?void 0:e=>{if(null!=h&&M.length>0)switch(e.key){case\"ArrowDown\":e.preventDefault(),C(1);return;case\"ArrowUp\":e.preventDefault(),C(-1);return;case\"Enter\":case\"Tab\":{e.preventDefault();let t=M[y];null!=t&&E(t);return}}if(null!=h&&\"Escape\"===e.key){e.preventDefault(),_();return}\"Enter\"!==e.key||e.shiftKey||(e.preventDefault(),A())},onKeyUp:u?void 0:N,onPaste:u?void 0:e=>{e.preventDefault();let t=e.clipboardData.getData(\"text/plain\");if(0===t.length)return;let n=window.getSelection();if(null==n||0===n.rangeCount)return;let r=n.getRangeAt(0);r.deleteContents();let a=document.createTextNode(t);r.insertNode(a),w(a,a.length),N()},ref:m,role:\"textbox\",suppressContentEditableWarning:!0})]})}],440976)},597171,e=>{\"use strict\";try{var t=window;t._sentryModuleMetadata=t._sentryModuleMetadata||{},t._sentryModuleMetadata[(new t.Error).stack]=Object.assign({},t._sentryModuleMetadata[(new t.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}let n=[{triggers:[\"screenshot\"],steps:[{kind:\"pause\",ms:1400},{kind:\"message\",content:\"here you go, saved a fresh capture. anything you want me to change on that screen while i'm in there?\"}]},{triggers:[\"draft\"],steps:[{kind:\"pause\",ms:1400},{kind:\"outbound-message\",channel:\"email\",from:\"sam@x.ai\",to:\"vicky@acme.co\",subject:\"Re: Q3 numbers for the vendor brief\",body:[\"Hi Vicky,\",\"Last quar"
+    },
+    "baby-grok-bot-approval": {
+      "file": "0cf59cht7b050.js",
+      "offset": 40228,
+      "snippet": ";try{var x=window;x._sentryModuleMetadata=x._sentryModuleMetadata||{},x._sentryModuleMetadata[(new x.Error).stack]=Object.assign({},x._sentryModuleMetadata[(new x.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function({entry:e}){return(0,t.jsxs)(\"section\",{className:\"baby-grok-bot-approval\",children:[(0,t.jsx)(\"p\",{className:\"baby-grok-bot-approval__label\",children:\"Needs your OK\"}),(0,t.jsx)(\"p\",{className:\"baby-grok-bot-approval__title\",children:e.title}),(0,t.jsx)(\"p\",{className:\"baby-grok-bot-approval__detail\",children:e.detail}),(0,t.jsxs)(\"div\",{className:\"baby-grok-bot-approval__actions\",children:[(0,t.jsx)(\"span\",{className:\"baby-grok-bot-card-action\",\"data-variant\":\"primary\",children:e.primary}),(0,t.jsx)(\"span\",{className:\"baby-grok-bot-card-action\",\"data-variant\":\"secondary\",children:e.secondary})]})]})}],814861);var y=e.i(602992);try{var k=window;k._sentryModuleMetadata=k._sentryModuleMetadata||{},k._sentryModuleMetadata[(new k.Error).stack]=Object.assign({},k._sentryModuleMetadata[(new k.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function({entry:e}){let{PullRequestSecondaryAction:s}=(0,y.u)(),n=\"creating\"===e.status;return(0,t.jsxs)(\"div\",{className:\"baby-grok-bot-card\",children:[(0,t.jsxs)(\"div\",{className:\"flex items-start gap-2\",children:[(0,t.jsx)(\"span\",{className:\"baby-grok-bot-card-title\",children:e.title}),(0,t.jsx)(\"span\",{className:\"flex-1\"}),(0,t.jsx)(p.f,{label:n?\"Creating\":\"Done\",spinner:n,tone:n?\"info\":\"success\"})]}),(0,t.jsx)(\"p\",{className:\"mt-0.5\",children:e.description}),(0,t.jsxs)(\"div\",{className:\"baby-grok-bot-card-secondary baby-grok-bot-card-meta mt-1\",children:[(0,t.jsx)(a.W,{name:\"git-branch\",size:13}),e.branch]}),(0,t.jsxs)(\"div\",{className:\"baby-grok-bot-card-secon"
+    },
+    "baby-grok-bot-rich": {
+      "file": "0cf59cht7b050.js",
+      "offset": 3635,
+      "snippet": "a[(new y.Error).stack],{\"_sentryBundlerPluginAppKey:website\":!0})}catch(e){}e.s([\"f\",0,function({entry:e}){let a=(0,u.k)()?.actions??null,[s,n]=(0,b.useState)(null),r=null!=e.selectedId,i=e.selectedId??s,l=r||null!=s;return(0,t.jsxs)(x.E,{children:[(0,t.jsx)(x.k,{title:(0,t.jsxs)(\"span\",{className:\"baby-grok-bot-rich-route\",children:[e.from,(0,t.jsx)(\"span\",{\"aria-hidden\":!0,children:\"→\"}),e.to]}),subtitle:e.meta,settled:r}),(0,t.jsx)(\"div\",{className:\"baby-grok-bot-rich-choices baby-grok-bot-rich-choices--media\",children:e.options.map((s,o)=>{let d=s.id===i;return(0,t.jsxs)(x.O,{open:!r||d,children:[o>0?(0,t.jsx)(x.O,{open:!r,children:(0,t.jsx)(\"div\",{\"aria-hidden\":!0,className:\"baby-grok-bot-rich-choices__divider\"})}):null,(0,t.jsxs)(\"button\",{type:\"button\",className:\"baby-grok-bot-rich-choice baby-grok-bot-rich-choice--media\",\"aria-pressed\":d,\"aria-label\":`${s.airline} ${s.departs}, ${s.price}`,\"data-selected\":d||void 0,\"data-static\":l||void 0,\"data-demo-target\":l?void 0:`flight-${s.id}`,disabled:null==a||r,onClick:()=>{var t;return t=s.id,void(null!=a&&!l&&(n(t),window.setTimeout(()=>a.selectFlight(e.id,t),280)))},children:[(0,t.jsx)(\"span\",{className:\"baby-grok-bot-flight__mark\",children:(0,t.jsx)(x.A,{mark:s.mark,selected:d})}),(0,t.jsxs)(\"span\",{className:\"baby-grok-bot-flight__lines\",children:[(0,t.jsxs)(\"span\",{className:\"baby-grok-bot-flight__line baby-grok-bot-flight__title\",children:[(0,t.jsxs)(\"span\",{className:\"truncate\",children:[s.airline,\" \",s.fare]}),null==s.highlight?null:(0,t.jsx)(\"span\",{className:\"baby-grok-bot-flight__highlight\",children:s.highlight})]}),(0,t.jsxs)(\"span\",{className:\"baby-grok-bot-flight__line baby-grok-bot-flight__leg\",children:[(0,t.jsxs)(\"span\",{className:\"baby-grok-bot-flight__route\",children:[(0,t.jsxs)(\"span\",{className:\"bab"
+    }
+  }
+}

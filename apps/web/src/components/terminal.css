@@ -1,0 +1,18 @@
+.gb-terminal-workspace { display:flex; flex-direction:column; flex:1; min-height:0; width:100%; overflow:hidden; }
+.gb-terminal-tabs { display:flex; align-items:center; gap:3px; padding:2px 0 8px; min-height:30px; overflow-x:auto; flex-shrink:0; }
+.gb-terminal-tab { display:flex; align-items:center; gap:3px; border-radius:7px; flex-shrink:0; padding:0 4px; color:var(--grok-bot-text-secondary); }
+.gb-terminal-tab[data-active] { background:var(--grok-bot-bg-active); color:var(--grok-bot-text-primary); }
+.gb-terminal-tab > button[role=tab] { display:flex; align-items:center; gap:6px; font-size:11px; padding:5px; max-width:140px; overflow:hidden; white-space:nowrap; }
+.gb-terminal-name { width:100px; font-size:11px; background:transparent; border:0; padding:4px; outline:1px solid var(--sand-border-primary); border-radius:4px; }
+.gb-terminal-session { flex:1; min-height:0; flex-direction:column; }
+.gb-terminal-status { display:flex; align-items:center; gap:7px; padding:2px 0 8px; color:var(--grok-bot-text-tertiary); font-size:10px; flex-shrink:0; }
+.gb-terminal-status > span { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.gb-terminal-screen { flex:1; min-height:0; width:100%; overflow:hidden; padding:3px; background:var(--grok-bot-bg-editor); border-radius:5px; }
+.gb-terminal-screen .xterm { height:100%; padding:0; }
+.gb-terminal-screen .xterm-viewport { scrollbar-width:thin; }
+.gb-terminal-screen .xterm .xterm-screen { margin:0; }
+.gb-terminal-error { padding:8px; margin-bottom:8px; background:var(--sand-danger-soft); color:var(--sand-danger-text); font-size:11px; border-radius:6px; line-height:1.5; }
+.gb-terminal-empty { display:flex; flex:1; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:28px 14px; text-align:center; color:var(--grok-bot-text-secondary); }
+.gb-terminal-empty strong { font-size:13px; font-weight:500; }
+.gb-terminal-empty p { margin:0; font-size:12px; line-height:1.65; }
+.gb-terminal-empty > .gb-icon { color:var(--grok-bot-text-tertiary); }

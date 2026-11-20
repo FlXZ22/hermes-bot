@@ -1,0 +1,62 @@
+{
+  "source": "https://x.ai/bot",
+  "fetchedAt": "2026-11-19T15:00:32.721Z",
+  "cssFiles": [
+    "43v5qllpzkkpq.css",
+    "08fnkw7cez5q7.css",
+    "44-eg3zki5ko8.css",
+    "0tg00au57e2ry.css",
+    "2ap6kq99grgus.css",
+    "1t-q8mt3it8fo.css"
+  ],
+  "jsCount": 41,
+  "relevantThemeChunks": [
+    {
+      "name": "30bechs5m37tr.js",
+      "length": 86825
+    },
+    {
+      "name": "3a0fz1o9-rxp3.js",
+      "length": 10033
+    },
+    {
+      "name": "2ruviwhb973r3.js",
+      "length": 32518
+    },
+    {
+      "name": "1qjn-osn7_gob.js",
+      "length": 63358
+    },
+    {
+      "name": "32sdt7g0j3wei.js",
+      "length": 146782
+    },
+    {
+      "name": "0cf59cht7b050.js",
+      "length": 65124
+    }
+  ],
+  "fonts": [
+    {
+      "name": "GeistMono_Variable.p.42jdkyb02hb3d.woff2",
+      "url": "https://x.ai/_next/static/media/GeistMono_Variable.p.42jdkyb02hb3d.woff2?dpl=7e4ac1a613528a63d6bc1cbc3cbac42783ebee5a",
+      "bytes": 71004
+    },
+    {
+      "name": "XVF_Variable-s.p.2_a5y-slrzff6.woff2",
+      "url": "https://x.ai/_next/static/media/XVF_Variable-s.p.2_a5y-slrzff6.woff2?dpl=7e4ac1a613528a63d6bc1cbc3cbac42783ebee5a",
+      "bytes": 69264
+    },
+    {
+      "name": "cursor-icons-16.woff2",
+      "url": "https://x.ai/grok-bot-static/fonts/cursor-icons-16.woff2?v=2026-10-28",
+      "bytes": 126980
+    },
+    {
+      "name": "CursorGothic_Regular.0jb6823hufonw.woff2",
+      "url": "https://x.ai/_next/static/media/CursorGothic_Regular.0jb6823hufonw.woff2?dpl=7e4ac1a613528a63d6bc1cbc3cbac42783ebee5a",
+      "bytes": 45436
+    }
+  ],
+  "uniqueBotMarkShapes": 9
+}

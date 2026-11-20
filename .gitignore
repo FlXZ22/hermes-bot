@@ -1,0 +1,14 @@
+node_modules/
+**/node_modules/
+**/target/
+**/dist/
+.env
+.env.*
+*.log
+analysis/grok-bot-deb/
+analysis/grok-bot-asar/
+analysis/grok-bot-web/
+analysis/rea-*-verification
+analysis/rea-*-evidence.json
+*.deb
+tools/rea/

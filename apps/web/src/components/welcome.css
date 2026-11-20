@@ -1,0 +1,59 @@
+.gb-onboarding { width:100%; height:100%; overflow-y:auto; background:var(--grok-bot-shared-substrate); color:var(--grok-bot-text-primary); display:flex; flex-direction:column; }
+.gb-welcome__bar { height:52px; padding:0 22px; display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
+.gb-welcome__wordmark { font-size:15px; font-weight:600; letter-spacing:-.35px; }
+.gb-welcome__bar-actions { display:flex; align-items:center; gap:12px; }
+.gb-welcome__stage { position:relative; width:min(100% - 48px, 460px); margin:auto; padding:32px 0 48px; text-align:center; animation:gb-welcome-in .35s ease-out; }
+.gb-welcome__stage h1 { margin:14px -30px 12px; font-size:36px; line-height:1.12; letter-spacing:-1.15px; font-weight:500; outline:none; }
+.gb-welcome__subtitle { margin:0 auto 28px; max-width:390px; color:var(--grok-bot-text-secondary); font-size:15px; line-height:1.55; }
+.gb-welcome__hero { position:relative; height:112px; display:flex; align-items:center; justify-content:center; margin:0 auto; width:250px; }
+.gb-welcome__hero-bot { animation:gb-welcome-float 6s ease-in-out infinite; }
+.gb-welcome__friend { position:absolute; animation:gb-welcome-float 7.3s ease-in-out infinite; }
+.gb-welcome__friend--one { left:18px; top:9px; transform:rotate(-15deg); animation-delay:-2s; }
+.gb-welcome__friend--two { right:18px; top:62px; transform:rotate(12deg); animation-delay:-4s; }
+.gb-welcome__stage--remote .gb-welcome__friend, .gb-welcome__stage--ready .gb-welcome__friend { opacity:0; }
+.gb-welcome__stage--remote { padding-top:12px; padding-bottom:24px; }
+.gb-welcome__stage--remote .gb-welcome__hero { height:80px; }
+.gb-welcome__stage--remote h1 { font-size:32px; }
+.gb-welcome__stage--remote .gb-welcome__subtitle { margin-bottom:24px; }
+.gb-welcome__landing { display:flex; flex-direction:column; align-items:center; gap:20px; }
+.gb-welcome__landing > p { font-size:14px; color:var(--grok-bot-text-secondary); margin:4px 0 12px; }
+.gb-welcome__continue { min-width:180px; height:42px; border-radius:999px; justify-content:center; gap:14px; }
+.gb-welcome__link { color:var(--grok-bot-text-secondary); font-size:12px; text-decoration:none; line-height:1.5; }
+.gb-welcome__link:hover { color:var(--grok-bot-text-primary); text-decoration:underline; }
+.gb-welcome__back { display:flex; align-items:center; gap:7px; font-size:12px; color:var(--grok-bot-text-secondary); margin-bottom:20px; }
+.gb-welcome__choices { display:flex; flex-direction:column; gap:12px; }
+.gb-welcome__choice { display:flex; align-items:center; text-align:left; padding:22px; gap:18px; border:1px solid var(--grok-bot-border-default); background:var(--grok-bot-bg-editor); border-radius:16px; transition:background .15s,border-color .15s,transform .15s; }
+.gb-welcome__choice:hover:not(:disabled) { background:var(--grok-bot-bg-hover); border-color:var(--sand-border-primary); transform:translateY(-1px); }
+.gb-welcome__choice > span:nth-child(2) { flex:1; }
+.gb-welcome__choice strong { font-size:15px; font-weight:550; display:block; margin-bottom:7px; }
+.gb-welcome__choice small { font-size:12px; line-height:1.6; color:var(--grok-bot-text-secondary); }
+.gb-welcome__choice-icon { width:42px; height:42px; background:var(--grok-bot-bg-card); border-radius:12px; display:flex; align-items:center; justify-content:center; }
+.gb-welcome__form { text-align:left; }
+.gb-welcome__form fieldset { margin:0; padding:0; border:0; display:flex; flex-direction:column; gap:16px; min-width:0; }
+.gb-welcome__form .gb-field { display:flex; flex-direction:column; gap:7px; }
+.gb-welcome__form .gb-input, .gb-welcome__form .gb-select { height:40px; width:100%; border-radius:10px; }
+.gb-welcome__form small, .gb-welcome__hint { font-size:12px; line-height:1.6; color:var(--grok-bot-text-tertiary); margin:0; }
+.gb-welcome__optional { font-size:11px; color:var(--grok-bot-text-tertiary); font-weight:400; margin-left:4px; }
+.gb-welcome__submit { width:100%; justify-content:center; height:42px; border-radius:999px; gap:12px; }
+.gb-welcome__storage { font-size:11px; color:var(--grok-bot-text-tertiary); text-align:center; line-height:1.5; margin:-5px 0 0; }
+.gb-welcome__help { font-size:12px; margin:20px 0 0; line-height:1.65; color:var(--grok-bot-text-secondary); }
+.gb-welcome__help summary { cursor:pointer; text-align:center; }
+.gb-welcome__help a { color:var(--grok-bot-text-accent); }
+.gb-welcome__help code { font-family:var(--cursor-font-family-mono); font-size:11px; overflow-wrap:anywhere; }
+.gb-welcome__command { display:block; padding:12px; background:var(--grok-bot-bg-card); border-radius:8px; user-select:all; }
+.gb-welcome__progress { display:flex; justify-content:center; align-items:center; gap:10px; font-size:13px; margin:22px 0 0; color:var(--grok-bot-text-secondary); }
+.gb-welcome__login-actions { display:flex; justify-content:center; gap:24px; margin-top:14px; }
+.gb-welcome__error { display:flex; align-items:flex-start; gap:10px; margin:20px 0 0; padding:14px; border-radius:10px; background:var(--sand-danger-soft); color:var(--sand-danger-text); font-size:12px; line-height:1.65; text-align:left; }
+.gb-welcome__error .gb-icon { margin-top:2px; }
+.gb-welcome__ready { display:flex; flex-direction:column; gap:18px; text-align:left; }
+.gb-welcome__check, .gb-welcome__model { display:flex; align-items:center; gap:12px; font-size:13px; line-height:1.5; }
+.gb-welcome__check .gb-icon { color:var(--grok-bot-text-success); }
+.gb-welcome__model { color:var(--grok-bot-text-secondary); }
+.gb-welcome__ready .gb-welcome__submit { margin-top:10px; }
+.gb-welcome__ready > .gb-welcome__link { text-align:center; }
+.gb-welcome__footer { margin-top:auto; padding:18px 24px; display:flex; justify-content:space-between; gap:16px; color:var(--grok-bot-text-tertiary); font-size:11px; flex-shrink:0; }
+.gb-onboarding button:focus-visible, .gb-onboarding summary:focus-visible { outline:2px solid var(--sand-accent-primary); outline-offset:4px; }
+@keyframes gb-welcome-float { 0%,100% { translate:0 0; } 50% { translate:0 -5px; } }
+@keyframes gb-welcome-in { from { opacity:0; transform:translateY(7px); } to { opacity:1; transform:translateY(0); } }
+@media(max-width:600px) { .gb-welcome__stage h1 { margin-left:0; margin-right:0; font-size:30px; } .gb-welcome__footer { flex-direction:column; align-items:center; gap:6px; } .gb-welcome__choice { padding:18px; } }
+@media(prefers-reduced-motion:reduce) { .gb-welcome__stage, .gb-welcome__hero-bot, .gb-welcome__friend { animation:none; } }

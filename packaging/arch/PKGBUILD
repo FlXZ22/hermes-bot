@@ -1,0 +1,34 @@
+# Build from a prepared source directory: makepkg --noextract
+pkgname=hermes-grok-bot
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Hermes Agent desktop with the Grok Bot interface and Rust host'
+arch=('x86_64' 'aarch64')
+license=('custom')
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3')
+makedepends=('rust' 'nodejs' 'npm')
+options=('!lto')
+
+build() {
+  cd "$startdir/../.."
+  npm ci
+  npm run desktop:build
+}
+
+package() {
+  cd "$startdir/../.."
+  install -Dm755 apps/desktop/src-tauri/target/release/hermes-grok-bot "$pkgdir/usr/bin/hermes-grok-bot"
+  install -Dm644 packages/grok-bot-theme/assets/icons/grok-bot-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/hermes-grok-bot.png"
+  install -dm755 "$pkgdir/usr/share/applications"
+  cat > "$pkgdir/usr/share/applications/hermes-grok-bot.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Hermes Grok Bot
+Comment=Hermes Agent with the Grok Bot interface
+Exec=hermes-grok-bot
+Icon=hermes-grok-bot
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=ai.nousresearch.hermes.grokbot
+DESKTOP
+}

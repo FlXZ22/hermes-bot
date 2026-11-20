@@ -1,0 +1,254 @@
+/* Grok Bot Sand Light & Sand Dark + Baby Grok Bot Glass Design Tokens */
+
+:root {
+  color-scheme: light;
+
+  /* Typography (exact Grok Bot XVF scale) */
+  --cursor-font-family-sans: "XVF", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --cursor-font-family-mono: "XVF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --sand-font-size-xxs: 11px;
+  --sand-font-size-xs: 12px;
+  --sand-font-size-sm: 13px;
+  --sand-font-size-base: 14px;
+  --sand-font-size-lg: 15px;
+  --sand-font-size-xl: 17px;
+  --sand-font-size-xxl: 22px;
+  --sand-font-size-xxxl: 26px;
+  --sand-line-height-xxs: 16px;
+  --sand-line-height-xs: 16px;
+  --sand-line-height-sm: 18px;
+  --sand-line-height-base: 20px;
+  --sand-line-height-lg: 22px;
+  --sand-line-height-xl: 24px;
+  --sand-line-height-xxl: 28px;
+  --sand-line-height-xxxl: 32px;
+  --sand-font-weight-regular: 400;
+  --sand-font-weight-medium: 500;
+  --sand-font-weight-semibold: 600;
+  --cursor-font-weight-medium: 500;
+  --cursor-font-weight-semibold: 600;
+
+  /* Radii (exact desktop overrides) */
+  --cursor-radius-sm: 4px;
+  --cursor-radius-base: 8px;
+  --cursor-radius-lg: 10px;
+  --cursor-radius-xl: 14px;
+  --cursor-radius-2xl: 16px;
+  --cursor-radius-3xl: 18px;
+  --cursor-radius-4xl: 24px;
+  --cursor-radius-full: 9999px;
+
+  /* Sand Light Neutral Surfaces */
+  --sand-bg-pane: #ffffff;
+  --sand-bg-chrome: #fcfcfc;
+  --sand-bg-sidebar: #f5f5f5;
+  --sand-bg-elevated: #ffffff;
+  --sand-bg-elevated-hover: #f1f1f1;
+  --sand-bg-luminous: #ffffff;
+  --sand-bg-scrim: rgba(0, 0, 0, 0.42);
+  --sand-bg-hover: rgba(28, 28, 28, 0.06);
+  --sand-bg-active: rgba(28, 28, 28, 0.09);
+  --sand-bg-primary: #1c1c1c;
+  --sand-bg-primary-hover: #363636;
+  --sand-bg-primary-disabled: rgba(28, 28, 28, 0.15);
+  --sand-bg-secondary: rgba(28, 28, 28, 0.06);
+  --sand-bg-secondary-hover: rgba(28, 28, 28, 0.1);
+  --sand-bg-tertiary: rgba(28, 28, 28, 0.05);
+  --sand-bg-quaternary: rgba(28, 28, 28, 0.035);
+
+  /* Sand Light Text & Icons */
+  --sand-text-primary: #1c1c1c;
+  --sand-text-secondary: rgba(28, 28, 28, 0.68);
+  --sand-text-tertiary: rgba(28, 28, 28, 0.56);
+  --sand-text-quaternary: rgba(28, 28, 28, 0.4);
+  --sand-text-on-primary: #ffffff;
+  --sand-text-inverted: #fcfcfc;
+  --sand-icon-primary: rgba(28, 28, 28, 0.92);
+  --sand-icon-secondary: rgba(28, 28, 28, 0.66);
+  --sand-icon-tertiary: rgba(28, 28, 28, 0.52);
+
+  /* Sand Light Borders & Shadows */
+  --sand-border-primary: rgba(28, 28, 28, 0.24);
+  --sand-border-secondary: rgba(28, 28, 28, 0.12);
+  --sand-border-tertiary: rgba(28, 28, 28, 0.08);
+  --sand-border-quaternary: rgba(28, 28, 28, 0.06);
+  --sand-shadow-control: 0 1px 3px 0 rgba(28, 28, 28, 0.12);
+  --sand-shadow-card: 0 2px 8px rgba(28, 28, 28, 0.05);
+  --sand-shadow-popover: 0 10px 24px -4px rgba(28, 28, 28, 0.14), 0 4px 8px -4px rgba(28, 28, 28, 0.1);
+  --sand-shadow-modal: 0 20px 44px -8px rgba(28, 28, 28, 0.22), 0 8px 14px -6px rgba(28, 28, 28, 0.12);
+
+  /* Semantic Roles (Light) */
+  --sand-accent-primary: #1680f3;
+  --sand-accent-soft: rgba(30, 134, 252, 0.1);
+  --sand-accent-text: #0b6dd3;
+  --sand-danger-primary: #e72e3b;
+  --sand-danger-soft: rgba(251, 43, 62, 0.1);
+  --sand-danger-text: #cd2834;
+  --sand-success-primary: #10ab61;
+  --sand-success-soft: rgba(20, 193, 111, 0.1);
+  --sand-success-text: #00854a;
+  --sand-warn-primary: #da830e;
+  --sand-warn-soft: rgba(245, 147, 18, 0.12);
+  --sand-warn-text: #aa6300;
+
+  /* Grok Bot Shell Aliases (100% parity with baby-grok-bot) */
+  --grok-bot-text-primary: var(--sand-text-primary);
+  --grok-bot-text-secondary: var(--sand-text-secondary);
+  --grok-bot-text-tertiary: var(--sand-text-tertiary);
+  --grok-bot-text-accent: var(--sand-accent-text);
+  --grok-bot-text-danger: var(--sand-danger-text);
+  --grok-bot-text-success: var(--sand-success-text);
+  --grok-bot-text-warning: var(--sand-warn-text);
+
+  --grok-bot-bg-editor: var(--sand-bg-pane);
+  --grok-bot-bg-chrome: var(--sand-bg-chrome);
+  --grok-bot-bg-elevated: var(--sand-bg-elevated);
+  --grok-bot-bg-card: var(--sand-bg-tertiary);
+  --grok-bot-bg-tertiary: var(--sand-bg-tertiary);
+  --grok-bot-bg-active: var(--sand-bg-active);
+  --grok-bot-bg-hover: var(--sand-bg-hover);
+  --grok-bot-border-default: var(--sand-border-secondary);
+
+  --grok-bot-fill-emphasis: var(--sand-bg-primary);
+  --grok-bot-fill-secondary: var(--sand-bg-secondary);
+  --grok-bot-bubble-user: #1c1c1c;
+  --grok-bot-bubble-user-ink: #ffffff;
+  --grok-bot-bubble-agent: rgba(28, 28, 28, 0.055);
+
+  --grok-bot-sidebar-width: 280px;
+  --grok-bot-toolbar-height: 44px;
+  --grok-bot-sidebar-tint: #f5f5f5;
+  --grok-bot-sidebar-text-primary: #1c1c1c;
+  --grok-bot-sidebar-text-secondary: rgba(28, 28, 28, 0.64);
+  --grok-bot-sidebar-text-tertiary: rgba(28, 28, 28, 0.44);
+  --grok-bot-sidebar-separator: rgba(28, 28, 28, 0.1);
+  --grok-bot-sidebar-hover: rgba(28, 28, 28, 0.05);
+  --grok-bot-sidebar-selected: rgba(28, 28, 28, 0.085);
+
+  --grok-bot-shared-substrate: #fcfcfc;
+  --grok-bot-chat-fill: #ffffff;
+  --grok-bot-raised-fill: color-mix(in srgb, var(--grok-bot-bg-elevated) 84%, transparent);
+  --grok-bot-raised-backdrop-filter: blur(20px) saturate(160%);
+  --grok-bot-agent-title-fill: color-mix(in srgb, var(--grok-bot-bg-elevated) 82%, transparent);
+  --grok-bot-agent-title-backdrop-filter: blur(28px) saturate(165%);
+
+  --grok-bot-rich-ink: #1c1c1c;
+  --grok-bot-rich-ink-2: rgba(28, 28, 28, 0.68);
+  --grok-bot-rich-ink-3: rgba(28, 28, 28, 0.56);
+  --grok-bot-rich-ink-4: rgba(28, 28, 28, 0.4);
+  --grok-bot-rich-surface: #ffffff;
+  --grok-bot-rich-ring: rgba(28, 28, 28, 0.12);
+  --grok-bot-rich-divider: rgba(28, 28, 28, 0.08);
+  --grok-bot-rich-hairline: rgba(28, 28, 28, 0.06);
+  --grok-bot-rich-shadow: rgba(28, 28, 28, 0.05);
+  --grok-bot-rich-fill: rgba(28, 28, 28, 0.06);
+  --grok-bot-rich-fill-hover: rgba(28, 28, 28, 0.1);
+  --grok-bot-rich-primary: #1c1c1c;
+  --grok-bot-rich-primary-hover: #363636;
+  --grok-bot-rich-on-primary: #ffffff;
+
+  /* Dynamic per-bot accent defaults */
+  --grok-bot-current-agent-tint: #1084fe;
+  --grok-bot-current-agent-bubble: #126fd4;
+  --grok-bot-current-agent-bubble-ink: #ffffff;
+  --grok-bot-current-agent-accent: #0b6dd3;
+  --grok-bot-current-agent-coat: #1084fe;
+
+  /* Dataviz categorical colors */
+  --sand-dataviz-0: #1084fe;
+  --sand-dataviz-1: #ff6700;
+  --sand-dataviz-2: #9159fe;
+  --sand-dataviz-3: #00c972;
+  --sand-dataviz-4: #ff309b;
+  --sand-dataviz-5: #ff9800;
+  --sand-dataviz-6: #00bca6;
+  --sand-dataviz-7: #936439;
+}
+
+/* Sand Dark (exact Grok Bot 1.2.3 dark neutrals + tokens) */
+:root[data-theme="cursor-dark"],
+.grok-bot-root[data-theme="cursor-dark"] {
+  color-scheme: dark;
+
+  --sand-bg-pane: #161616;
+  --sand-bg-chrome: #121212;
+  --sand-bg-sidebar: #0e0e0e;
+  --sand-bg-elevated: #1f1f1f;
+  --sand-bg-elevated-hover: #292929;
+  --sand-bg-luminous: #262626;
+  --sand-bg-scrim: rgba(0, 0, 0, 0.65);
+  --sand-bg-hover: rgba(245, 245, 245, 0.06);
+  --sand-bg-active: rgba(245, 245, 245, 0.11);
+  --sand-bg-primary: #f5f5f5;
+  --sand-bg-primary-hover: #dbdbdb;
+  --sand-bg-primary-disabled: rgba(245, 245, 245, 0.18);
+  --sand-bg-secondary: rgba(245, 245, 245, 0.07);
+  --sand-bg-secondary-hover: rgba(245, 245, 245, 0.12);
+  --sand-bg-tertiary: rgba(245, 245, 245, 0.06);
+  --sand-bg-quaternary: rgba(245, 245, 245, 0.04);
+
+  --sand-text-primary: #f5f5f5;
+  --sand-text-secondary: rgba(245, 245, 245, 0.68);
+  --sand-text-tertiary: rgba(245, 245, 245, 0.48);
+  --sand-text-quaternary: rgba(245, 245, 245, 0.34);
+  --sand-text-on-primary: #121212;
+  --sand-text-inverted: #121212;
+  --sand-icon-primary: rgba(245, 245, 245, 0.92);
+  --sand-icon-secondary: rgba(245, 245, 245, 0.64);
+  --sand-icon-tertiary: rgba(245, 245, 245, 0.46);
+
+  --sand-border-primary: rgba(245, 245, 245, 0.22);
+  --sand-border-secondary: rgba(245, 245, 245, 0.11);
+  --sand-border-tertiary: rgba(245, 245, 245, 0.075);
+  --sand-border-quaternary: rgba(245, 245, 245, 0.05);
+  --sand-shadow-control: 0 1px 3px 0 rgba(0, 0, 0, 0.4);
+  --sand-shadow-card: 0 2px 10px rgba(0, 0, 0, 0.32);
+  --sand-shadow-popover: 0 12px 32px -6px rgba(0, 0, 0, 0.55), 0 4px 10px -4px rgba(0, 0, 0, 0.4);
+  --sand-shadow-modal: 0 24px 56px -10px rgba(0, 0, 0, 0.72), 0 8px 18px -6px rgba(0, 0, 0, 0.5);
+
+  --sand-accent-primary: #1884fc;
+  --sand-accent-soft: rgba(24, 132, 252, 0.18);
+  --sand-accent-text: #4d9bff;
+  --sand-danger-primary: #cf2b35;
+  --sand-danger-soft: rgba(252, 44, 62, 0.16);
+  --sand-danger-text: #ff6463;
+  --sand-success-primary: #0e9f5a;
+  --sand-success-soft: rgba(20, 195, 112, 0.15);
+  --sand-success-text: #29cb78;
+  --sand-warn-primary: #c8770c;
+  --sand-warn-soft: rgba(246, 148, 18, 0.16);
+  --sand-warn-text: #fb9500;
+
+  --grok-bot-bubble-user: #ecece8;
+  --grok-bot-bubble-user-ink: #121212;
+  --grok-bot-bubble-agent: rgba(245, 245, 245, 0.065);
+
+  --grok-bot-sidebar-tint: #0e0e0e;
+  --grok-bot-sidebar-text-primary: rgba(245, 245, 245, 0.94);
+  --grok-bot-sidebar-text-secondary: rgba(245, 245, 245, 0.56);
+  --grok-bot-sidebar-text-tertiary: rgba(245, 245, 245, 0.36);
+  --grok-bot-sidebar-separator: rgba(245, 245, 245, 0.09);
+  --grok-bot-sidebar-hover: rgba(245, 245, 245, 0.055);
+  --grok-bot-sidebar-selected: rgba(245, 245, 245, 0.095);
+
+  --grok-bot-shared-substrate: #121212;
+  --grok-bot-chat-fill: #161616;
+  --grok-bot-raised-fill: color-mix(in srgb, var(--grok-bot-bg-elevated) 82%, transparent);
+  --grok-bot-agent-title-fill: color-mix(in srgb, var(--grok-bot-bg-elevated) 78%, transparent);
+  --grok-bot-agent-title-backdrop-filter: blur(28px) saturate(150%);
+
+  --grok-bot-rich-ink: #f5f5f5;
+  --grok-bot-rich-ink-2: rgba(245, 245, 245, 0.68);
+  --grok-bot-rich-ink-3: rgba(245, 245, 245, 0.52);
+  --grok-bot-rich-ink-4: rgba(245, 245, 245, 0.36);
+  --grok-bot-rich-surface: #1f1f1f;
+  --grok-bot-rich-ring: rgba(245, 245, 245, 0.11);
+  --grok-bot-rich-divider: rgba(245, 245, 245, 0.08);
+  --grok-bot-rich-hairline: rgba(245, 245, 245, 0.065);
+  --grok-bot-rich-shadow: rgba(0, 0, 0, 0.36);
+  --grok-bot-rich-fill: rgba(245, 245, 245, 0.07);
+  --grok-bot-rich-fill-hover: rgba(245, 245, 245, 0.12);
+  --grok-bot-rich-primary: #f5f5f5;
+  --grok-bot-rich-primary-hover: #dbdbdb;
+  --grok-bot-rich-on-primary: #121212;
+}

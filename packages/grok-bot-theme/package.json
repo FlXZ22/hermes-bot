@@ -1,0 +1,31 @@
+{
+  "name": "@grok-bot/theme",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Reusable Grok Bot theme, icons, organic bot marks, and UI primitives for Hermes Agent web and desktop apps",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./src/index.ts"
+    },
+    "./styles/fonts.css": "./src/styles/fonts.css",
+    "./styles/tokens.css": "./src/styles/tokens.css",
+    "./styles/grok-bot.css": "./src/styles/grok-bot.css",
+    "./styles": "./src/styles/index.css"
+  },
+  "files": [
+    "dist",
+    "src/styles",
+    "assets"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-dom": ">=18.0.0"
+  }
+}
