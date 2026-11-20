@@ -28,6 +28,7 @@ pub struct GitFileChange {
     pub path: String,
 }
 
+#[cfg(feature = "tauri-host")]
 #[derive(Debug, Serialize)]
 pub struct ShellExecResult {
     pub stdout: String,
@@ -162,6 +163,7 @@ pub async fn git_workspace_status(dir_path: &str, ssh: Option<&crate::ssh::SshTa
     })
 }
 
+#[cfg(feature = "tauri-host")]
 pub async fn run_shell_command(cwd: &str, command: &str) -> Result<ShellExecResult, String> {
     let dir = expand_dir(cwd);
     let working_dir = if dir.is_dir() {

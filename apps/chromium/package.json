@@ -1,0 +1,7 @@
+{
+  "name": "hermes-grok-bot-chromium",
+  "productName": "Hermes Grok Bot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.cjs"
+}

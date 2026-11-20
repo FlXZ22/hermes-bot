@@ -11,7 +11,18 @@ use std::{
         Arc, Condvar, Mutex,
     },
 };
-use tauri::ipc::Channel;
+#[derive(Clone)]
+pub struct EventSink(Arc<dyn Fn(TerminalEvent) -> Result<(), ()> + Send + Sync>);
+
+impl EventSink {
+    pub fn new(send: impl Fn(TerminalEvent) -> Result<(), ()> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(send))
+    }
+
+    fn send(&self, event: TerminalEvent) -> Result<(), ()> {
+        (self.0)(event)
+    }
+}
 
 const MAX_SESSIONS: usize = 16;
 const BUFFER_BYTES: usize = 1024 * 1024;
@@ -38,7 +49,7 @@ pub struct TerminalInfo {
 
 struct OutputState {
     buffer: VecDeque<u8>,
-    channel: Option<Channel<TerminalEvent>>,
+    channel: Option<EventSink>,
     exit_code: Option<u32>,
     generation: String,
     in_flight: usize,
@@ -140,7 +151,7 @@ impl TerminalManager {
         cols: u16,
         rows: u16,
         ssh: Option<SshTarget>,
-        channel: Channel<TerminalEvent>,
+        channel: EventSink,
     ) -> Result<TerminalInfo, String> {
         if id.is_empty() || id.len() > 160 {
             return Err("Invalid terminal identifier".into());
@@ -158,13 +169,13 @@ impl TerminalManager {
                     reused: true,
                     generation: output.generation.clone(),
                 })
-                .map_err(|e| e.to_string())?;
+                .map_err(|_| "Terminal output channel closed".to_owned())?;
             if !output.buffer.is_empty() {
                 channel
                     .send(TerminalEvent::Output {
                         data: STANDARD.encode(output.buffer.make_contiguous()),
                     })
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|_| "Terminal output channel closed".to_owned())?;
             }
             if let Some(code) = output.exit_code {
                 let _ = channel.send(TerminalEvent::Exit { code });
@@ -407,7 +418,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn channel() -> (
-        Channel<TerminalEvent>,
+        EventSink,
         Arc<Mutex<String>>,
         Arc<Mutex<Vec<serde_json::Value>>>,
     ) {
@@ -415,9 +426,9 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let output = text.clone();
         let frames = events.clone();
-        let channel = Channel::new(move |body| {
-            if let tauri::ipc::InvokeResponseBody::Json(body) = body {
-                let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let channel = EventSink::new(move |body| {
+            {
+                let value: serde_json::Value = serde_json::to_value(body).unwrap();
                 if let Some(data) = value.get("data").and_then(|value| value.as_str()) {
                     output
                         .lock()
@@ -593,9 +604,9 @@ mod ssh_integration {
         let manager = TerminalManager::default();
         let text = Arc::new(Mutex::new(String::new()));
         let output = text.clone();
-        let channel = Channel::new(move |body| {
-            if let tauri::ipc::InvokeResponseBody::Json(body) = body {
-                let event: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let channel = EventSink::new(move |body| {
+            {
+                let event: serde_json::Value = serde_json::to_value(body).unwrap();
                 if let Some(data) = event["data"].as_str() {
                     output
                         .lock()
@@ -672,9 +683,9 @@ mod flow_tests {
         let count = received.clone();
         let stream = generation.clone();
         let completed = done.clone();
-        let channel = Channel::new(move |body| {
-            if let tauri::ipc::InvokeResponseBody::Json(body) = body {
-                let event: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let channel = EventSink::new(move |body| {
+            {
+                let event: serde_json::Value = serde_json::to_value(body).unwrap();
                 if let Some(value) = event["generation"].as_str() {
                     *stream.lock().unwrap() = value.into();
                 }

@@ -3,7 +3,7 @@ import { AnimatedBotFace } from "./AnimatedBotFace";
 import { ChatTranscript } from "./ChatTranscript";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { BotMark, CursorIcon, resolveBotColor } from "@grok-bot/theme";
-import { useApp, type ReasoningEffort } from "../state/appStore";
+import { useApp, useChatSlice, type ReasoningEffort } from "../state/appStore";
 import { shortModelName } from "../lib/format";
 import { tauriBridge } from "../lib/tauriBridge";
 
@@ -55,9 +55,6 @@ export const ChatView: React.FC = () => {
     activeSession,
     activeSessionId,
     showToast,
-    messages,
-    sessionUsage,
-    isStreaming,
     boards,
     activeBoardSlug,
     sessionBoards,
@@ -84,6 +81,10 @@ export const ChatView: React.FC = () => {
   } = useApp();
 
   const { connection, setupOpen } = useApp();
+  const loadingHistory = useChatSlice(chat => chat.loadingHistory);
+  const hasMessages = useChatSlice(chat => chat.messages.length > 0);
+  const isStreaming = useChatSlice(chat => chat.isStreaming);
+  const sessionUsage = useChatSlice(chat => chat.sessionUsage);
   const draftKey = `${connection.id}:${connection.id.startsWith("local-") ? "local" : connection.url}:${activeProfile}:${activeSessionId ?? "new"}`;
   const [drafts, setDrafts] = useState<Record<string, string>>(() => {
     try { return JSON.parse(localStorage.getItem("hermes-grok-bot:drafts") ?? "{}"); } catch { return {}; }
@@ -92,7 +93,19 @@ export const ChatView: React.FC = () => {
   const setDraft = (value: React.SetStateAction<string>) => setDrafts(prev => ({
     ...prev, [draftKey]: typeof value === "function" ? value(prev[draftKey] ?? "") : value,
   }));
-  useEffect(() => { try { localStorage.setItem("hermes-grok-bot:drafts", JSON.stringify(drafts)); } catch { /* Storage may be full. */ } }, [drafts]);
+  const latestDrafts = useRef(drafts);
+  latestDrafts.current = drafts;
+  const saveDrafts = () => {
+    try { localStorage.setItem("hermes-grok-bot:drafts", JSON.stringify(latestDrafts.current)); } catch { /* Storage may be full. */ }
+  };
+  useEffect(() => {
+    const timer = setTimeout(saveDrafts, 400);
+    return () => clearTimeout(timer);
+  }, [drafts]);
+  useEffect(() => {
+    window.addEventListener("pagehide", saveDrafts);
+    return () => { window.removeEventListener("pagehide", saveDrafts); saveDrafts(); };
+  }, []);
   const [filesBySession, setFilesBySession] = useState<Record<string, File[]>>({});
   const attachments = filesBySession[draftKey] ?? [];
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -106,7 +119,7 @@ export const ChatView: React.FC = () => {
   // Auto-resize composer textarea
   useEffect(() => {
     const ta = textareaRef.current;
-    if (!ta) return;
+    if (!ta || CSS.supports("field-sizing", "content")) return;
     ta.style.height = "auto";
     ta.style.height = `${Math.min(140, Math.max(24, ta.scrollHeight))}px`;
   }, [draft, setupOpen]);
@@ -325,7 +338,9 @@ export const ChatView: React.FC = () => {
       </header>
 
       {/* Transcript or Authentic Grok Bot Welcome Hero */}
-      {messages.length === 0 ? (
+      {!hasMessages && loadingHistory ? (
+        <div className="gb-welcome" role="status"><CursorIcon name="spinner" spin size={18} /><span>Loading conversation…</span></div>
+      ) : !hasMessages ? (
         <div className="gb-welcome">
           <button
             type="button"

@@ -1,6 +1,11 @@
 # Hermes Grok Bot for Linux
 
-A Tauri 2 desktop host written in Rust, with a React interface based on the Grok Bot Linux package. The installed Hermes Agent supplies inference, tools, memory, profiles, and scheduling. The Rust host manages that process, authenticated HTTP requests, local SQLite reads, files, Git, shell commands, and the desktop window.
+A Linux desktop application with a Rust backend and a React interface based on the Grok Bot Linux package. Two desktop hosts share the same Rust service layer (`HermesSupervisor`, authenticated HTTP proxy, PKCE remote login, local SQLite reads, workspace/Git inspection, and interactive PTY/SSH terminals):
+
+- **Chromium desktop host** (`apps/chromium` + `hermes-native` Rust subprocess): sandboxed, context-isolated Chromium window served over `hermes-desktop://app` for low-latency streaming and scrolling on Wayland/X11.
+- **Tauri 2 WebKitGTK host** (`apps/desktop`): single-binary system WebKitGTK build retained as `hermes-grok-bot-webkit`.
+
+The installed Hermes Agent supplies inference, tools, memory, profiles, and scheduling.
 
 ## Run the Linux app
 
@@ -10,18 +15,20 @@ On first launch, choose **This computer** or **Connect a server**. A server conn
 npm ci
 npm run desktop:build
 npm run desktop:install
+npm run desktop:chromium:build
+npm run desktop:chromium:install
 hermes-grok-bot
 ```
 
-The installer writes only to `~/.local/share/hermes-grok-bot`, `~/.local/share/applications`, and `~/.local/bin`. It does not require root. The app appears as **Hermes Grok Bot** in the application launcher. An optional local Arch package recipe is in `packaging/arch/PKGBUILD`.
+The installer writes only to `~/.local/share/hermes-grok-bot`, `~/.local/share/applications`, and `~/.local/bin`. It does not require root. `hermes-grok-bot` launches the Chromium release, while `hermes-grok-bot-webkit` launches the WebKitGTK binary. The app appears as **Hermes Grok Bot** in the application launcher. An optional local Arch package recipe is in `packaging/arch/PKGBUILD`.
 
-Build prerequisites on Arch are Node.js, npm, Rust, pkgconf, a C/C++ toolchain, GTK 3, WebKitGTK 4.1, and libsoup 3. The release binary uses system WebKitGTK rather than bundling Chromium. Wayland starts with the existing WebKit DMABUF workaround unless the user has explicitly configured it.
+Build prerequisites on Arch are Node.js, npm, Rust, pkgconf, a C/C++ toolchain, GTK 3, WebKitGTK 4.1, and libsoup 3.
 
-For desktop development, run `npm run desktop:dev`. For the browser preview connected to the installed Hermes backend, run `npm run dev:connected`, then open `http://127.0.0.1:5173`. That command starts an owned gateway and a same-origin development proxy, and stops them on Ctrl+C. `npm run dev` starts the frontend alone.
+For desktop development, run `npm run desktop:chromium` (after `npm run desktop:chromium:build`) or `npm run desktop:dev` (Tauri/WebKitGTK). For the browser preview connected to the installed Hermes backend, run `npm run dev:connected`, then open `http://127.0.0.1:5173`. That command starts an owned gateway and a same-origin development proxy, and stops them on Ctrl+C. `npm run dev` starts the frontend alone.
 
 ## Chat
 
-The transcript virtualizes variable-height messages and batches streamed updates.
+The transcript virtualizes variable-height messages (`react-virtuoso`), isolates per-message subscriptions in `ChatStore`, parses large Markdown responses and syntax highlighting in a Web Worker, paginates older session history on demand, and gates external images behind explicit opt-in.
 Scrolling up pauses following; **Jump to latest** resumes it. Responses support
 GFM tables, task lists, nested lists, and highlighted code with copy controls.
 Thinking and tool activity start collapsed, including saved tool messages.
@@ -82,6 +89,9 @@ npm run test:rust
 npm run test:integration
 npm run test:e2e
 npm run test:auth
+npm run test:chromium:smoke
+npm run test:chromium:perf
+npm run test:desktop-perf
 npm run desktop:diagnose
 ```
 

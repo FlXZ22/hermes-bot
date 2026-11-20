@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from "react";
 import { BotMark, CursorIcon, Modal, resolveBotColor, type CursorIconName } from "@grok-bot/theme";
-import { useApp, type AppViewId } from "../state/appStore";
+import { useApp, useChatSlice, type AppViewId } from "../state/appStore";
 import { tauriBridge } from "../lib/tauriBridge";
 import { formatRelativeTime } from "../lib/format";
 
@@ -43,7 +43,6 @@ export const Sidebar: React.FC = () => {
     createBoard,
     sessions,
     activeSessionId,
-    isStreaming,
     selectSession,
     createNewSession,
     renameSession,
@@ -52,6 +51,7 @@ export const Sidebar: React.FC = () => {
     togglePinSession,
   } = useApp();
 
+  const isStreaming = useChatSlice(chat => chat.isStreaming);
   const [newBotOpen, setNewBotOpen] = useState(false);
   const [botName, setBotName] = useState("");
   const [botDescription, setBotDescription] = useState("");

@@ -10,7 +10,7 @@ Authoritative references inspected:
 
 | Requirement / feature family | Current authoritative evidence | Status / remaining work |
 | --- | --- | --- |
-| Linux app with Rust application backend | Tauri binary, Rust supervisor/HTTP/files/Git/PTY/credential commands; native build and diagnostic | Working covered paths. Agent inference/tools still use Hermes's external Python runtime. |
+| Linux app with Rust application backend | Chromium desktop host (`apps/chromium`) + `hermes-native` Rust subprocess and Tauri WebKitGTK binary; Rust supervisor/HTTP/files/Git/PTY/credential commands; native build, smoke test, and diagnostic | Working covered paths on both Chromium and WebKitGTK hosts. Agent inference/tools still use Hermes's external Python runtime. |
 | Exact Grok typography, glyphs, marks, semantic colors | Extracted XVF/XVF Mono/CursorIcons16 assets, SVG paths and tokens; REA evidence | Assets used. All authenticated screens and responsive states have not been compared visually at runtime. Exact overall parity is unproven. |
 | Welcome and server connection | Native PKCE listener tests; real gateway auth/refresh/restart tests; browser setup/reload/error checks | Working covered flow. Full multi-connection registry, managed SSH dashboard tunnels and account provisioning are not reproduced. |
 | Chat, sessions, boards, model selection | Real isolated gateway/model E2E covers streaming, durable sessions, rename, resume/branch, attachments, archive/pin, board/task status, cron | Working covered core. Audit advanced message editing, retries, search/export/bulk operations, session comparison/context attachment and all tool-card types against Hermes source. |

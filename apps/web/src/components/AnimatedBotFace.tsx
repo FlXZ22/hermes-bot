@@ -7,6 +7,7 @@ export const AnimatedBotFace = memo(function AnimatedBotFace({ seed, shapeId, co
 }) {
   const host = useRef<HTMLSpanElement>(null);
   const renderer = useRef<FaceRenderer | null>(null);
+  const wake = useRef<() => void>(() => {});
   const selectedShape = getBotMarkShape(shapeId, seed).id;
   const shape = selectedShape === "clover" ? "cloud" : selectedShape;
   const color = resolveBotColor(seed, colorId).hex;
@@ -16,23 +17,50 @@ export const AnimatedBotFace = memo(function AnimatedBotFace({ seed, shapeId, co
   useEffect(() => {
     const mount = host.current;
     if (!mount) return;
-    let disposed = false, visible = true, frame = 0, previous = 0;
+    let disposed = false, visible = true, frame = 0, previous = 0, playUntil = 0;
     let resume: ReturnType<typeof setTimeout> | undefined;
+    let blink: ReturnType<typeof setTimeout> | undefined;
+    let scrolling = false;
     const motion = matchMedia("(prefers-reduced-motion: reduce)");
-    const stop = () => { cancelAnimationFrame(frame); frame = 0; previous = 0; };
+    const canAnimate = () => !disposed && visible && !document.hidden && !motion.matches && !scrolling;
+    const stop = () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(blink);
+      frame = 0;
+      previous = 0;
+    };
+    const scheduleBlink = () => {
+      if (size < 40 || !canAnimate() || latest.current.state !== "idle") return;
+      blink = setTimeout(() => {
+        if (!canAnimate() || !renderer.current) return;
+        renderer.current.action("blink");
+        play(300);
+      }, 9000);
+    };
     const tick = (time: number) => {
-      if (disposed || !visible || document.hidden || motion.matches) { stop(); return; }
+      frame = 0;
+      if (!canAnimate()) return;
       if (!previous) previous = time;
       if (time - previous >= 1000 / 30) {
-        renderer.current?.advance(Math.min(50, time - previous)); previous = time;
+        renderer.current?.advance(Math.min(50, time - previous));
+        previous = time;
       }
-      frame = requestAnimationFrame(tick);
+      if (time < playUntil) frame = requestAnimationFrame(tick);
+      else { previous = 0; scheduleBlink(); }
     };
-    const sync = () => {
-      stop();
-      if (renderer.current && visible && !document.hidden && !motion.matches) frame = requestAnimationFrame(tick);
+    const play = (duration: number) => {
+      if (!canAnimate() || !renderer.current) return;
+      clearTimeout(blink);
+      playUntil = performance.now() + duration;
+      if (!frame) frame = requestAnimationFrame(tick);
     };
-    const onScroll = () => { stop(); clearTimeout(resume); resume = setTimeout(sync, 160); };
+    const sync = () => { stop(); scheduleBlink(); };
+    wake.current = () => play(750);
+    const onScroll = () => {
+      if (!scrolling) { scrolling = true; stop(); }
+      clearTimeout(resume);
+      resume = setTimeout(() => { scrolling = false; sync(); }, 160);
+    };
     const observer = new IntersectionObserver(([entry]) => { visible = entry.isIntersecting; sync(); });
     observer.observe(mount);
     document.addEventListener("visibilitychange", sync);
@@ -47,14 +75,18 @@ export const AnimatedBotFace = memo(function AnimatedBotFace({ seed, shapeId, co
       sync();
     }).catch(() => { /* Keep the static avatar when the animation chunk is unavailable. */ });
     return () => {
-      disposed = true; stop(); clearTimeout(resume); observer.disconnect();
+      disposed = true; wake.current = () => {}; stop(); clearTimeout(resume); observer.disconnect();
       document.removeEventListener("visibilitychange", sync);
       document.removeEventListener("scroll", onScroll, true);
       motion.removeEventListener("change", sync);
       renderer.current?.destroy(); renderer.current = null;
     };
-  }, [seed]);
-  useEffect(() => { renderer.current?.update({ shape, state }); renderer.current?.advance(1); }, [shape, state]);
+  }, [seed, size]);
+  useEffect(() => {
+    renderer.current?.update({ shape, state });
+    renderer.current?.advance(1);
+    wake.current();
+  }, [shape, state]);
   return <span className="gb-animated-face" role="img" aria-label={`${seed}, ${working ? "thinking" : "ready"}`} style={{ width: size, height: size, "--fg": color, "--bg": "#ffffff" } as React.CSSProperties}>
     <span className="gb-animated-face__fallback"><BotMark seed={seed} shapeId={shapeId} colorId={colorId} size={size} /></span>
     <span className="gb-animated-face__renderer" ref={host} />

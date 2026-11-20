@@ -1,8 +1,9 @@
-import React, { memo, useCallback, useId, useMemo, useRef, useState } from "react";
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import type { ChatSnapshot } from "../state/chatStore";
+import React, { memo, useEffect, useCallback, useDeferredValue, useId, useMemo, useRef, useState } from "react";
+import { Virtuoso } from "react-virtuoso";
 import { ApprovalCard, BotMark, ClarifyCard, CursorIcon } from "@grok-bot/theme";
 import type { HermesMessage, HermesToolCall } from "@grok-bot/hermes-client";
-import { useApp } from "../state/appStore";
+import { useApp, useChatMessage, useChatSlice } from "../state/appStore";
 import { CodeBlock, MarkdownBody } from "../lib/markdown";
 import { shortModelName } from "../lib/format";
 
@@ -53,6 +54,8 @@ const MessageItem = memo(function MessageItem({ msg, respondApproval, respondCla
   respondApproval: ReturnType<typeof useApp>["respondApproval"];
   respondClarify: ReturnType<typeof useApp>["respondClarify"];
 }) {
+  const deferredContent = useDeferredValue(msg.content);
+  const renderedContent = msg.streaming ? deferredContent : msg.content;
   if (msg.role === "tool") {
     return <div className="gb-entry gb-entry--assistant"><ToolActivityCard tool={{ id: msg.id, name: msg.toolName ?? "tool", output: msg.content, status: "done" }} /></div>;
   }
@@ -98,7 +101,7 @@ const MessageItem = memo(function MessageItem({ msg, respondApproval, respondCla
 
       {msg.content ? (
         <div className="gb-bubble-agent">
-          <MarkdownBody content={msg.content} streaming={msg.streaming} />
+          <MarkdownBody content={renderedContent} streaming={msg.streaming} />
         </div>
       ) : null}
 
@@ -120,20 +123,48 @@ const MessageItem = memo(function MessageItem({ msg, respondApproval, respondCla
 
 });
 
+const SubscribedMessage = memo(function SubscribedMessage({ id, ...actions }: Pick<React.ComponentProps<typeof MessageItem>, "respondApproval" | "respondClarify"> & { id: string }) {
+  const msg = useChatMessage(id);
+  return msg ? <MessageItem msg={msg} {...actions} /> : null;
+});
+
 const TranscriptHeader = ({ context }: { context?: { plan: React.ReactNode; pending: React.ReactNode } }) => <div className="gb-transcript-top">{context?.plan}</div>;
 const TranscriptFooter = ({ context }: { context?: { plan: React.ReactNode; pending: React.ReactNode } }) => <div className="gb-transcript-bottom">{context?.pending}</div>;
 const components = { Header: TranscriptHeader, Footer: TranscriptFooter };
 
 // Separate boundary: typing a draft never reconciles the message list.
-type TranscriptProps = Pick<ReturnType<typeof useApp>, "messages" | "todos" | "isStreaming" | "liveStatusText" | "activeProfile" | "activeSession" | "botAvatars" | "respondApproval" | "respondClarify">;
-export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, todos, isStreaming, liveStatusText, activeProfile, activeSession,
+type TranscriptProps = Pick<ChatSnapshot, "todos" | "isStreaming" | "liveStatusText"> & {
+  messages?: HermesMessage[];
+  messageIds?: string[];
+  firstItemIndex?: number;
+  loadOlder?: () => Promise<void>;
+  loadingHistory?: boolean;
+} & Pick<ReturnType<typeof useApp>, "activeProfile" | "activeSession" | "botAvatars" | "respondApproval" | "respondClarify">;
+export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, messageIds, firstItemIndex = 0, loadOlder, loadingHistory, todos, isStreaming, liveStatusText, activeProfile, activeSession,
     botAvatars, respondApproval, respondClarify }: TranscriptProps) {
   const botSeed = activeSession?.profile || activeProfile || "default";
   const botAv = botAvatars[botSeed];
-  const list = useRef<VirtuosoHandle>(null);
+  const scroller = useRef<HTMLElement | null>(null);
+  const setScroller = useCallback((element: HTMLElement | Window | null) => {
+    scroller.current = element instanceof HTMLElement ? element : null;
+  }, []);
   const pinned = useRef(true);
+  const followFrame = useRef<number | null>(null);
+  const goToBottom = useCallback(() => {
+    if (followFrame.current !== null) return;
+    followFrame.current = requestAnimationFrame(() => {
+      followFrame.current = null;
+      const element = scroller.current;
+      if (element && pinned.current) element.scrollTop = element.scrollHeight;
+    });
+  }, []);
+  useEffect(() => () => {
+    if (followFrame.current !== null) cancelAnimationFrame(followFrame.current);
+  }, []);
   const [atBottom, setAtBottom] = useState(true);
   const plan = <>
+    {loadOlder && <button type="button" className="gb-btn gb-history-more" disabled={loadingHistory}
+      onClick={() => void loadOlder()}>{loadingHistory ? "Loading…" : "Load older messages"}</button>}
     {/* Live Agent Todo Checklist */}
     {todos.length > 0 && (
       <div className="gb-section-card" style={{ marginBottom: 4 }}>
@@ -194,15 +225,21 @@ export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, t
         </span>
       </div>
     )}</>;
-  const renderMessage = useCallback((_: number, msg: HermesMessage) => (
-    <div className="gb-transcript-row"><MessageItem msg={msg} respondApproval={respondApproval} respondClarify={respondClarify} /></div>
+  const renderMessage = useCallback((_: number, entry: string | HermesMessage) => (
+    <div className="gb-transcript-row">
+      {typeof entry === "string"
+        ? <SubscribedMessage id={entry} respondApproval={respondApproval} respondClarify={respondClarify} />
+        : <MessageItem msg={entry} respondApproval={respondApproval} respondClarify={respondClarify} />}
+    </div>
   ), [respondApproval, respondClarify]);
+  const rows = messageIds ?? messages ?? [];
   return <div className="gb-transcript-shell">
-    <Virtuoso ref={list} className="gb-transcript" data={messages}
-      computeItemKey={(_, message) => message.id}
-      initialTopMostItemIndex={messages.length - 1}
+    <Virtuoso scrollerRef={setScroller} className="gb-transcript" data={rows}
+      computeItemKey={(_, entry) => typeof entry === "string" ? entry : entry.id}
+      firstItemIndex={firstItemIndex}
+      initialTopMostItemIndex={rows.length - 1}
       increaseViewportBy={400} defaultItemHeight={120}
-      followOutput="auto" atBottomThreshold={48}
+      atBottomThreshold={48}
       atBottomStateChange={setAtBottom}
       onScrollCapture={event => {
         // Nested code/table scrollers must not change transcript following.
@@ -211,17 +248,24 @@ export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, t
         pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
       }}
       onWheelCapture={event => { if (event.deltaY < 0) pinned.current = false; }}
-      totalListHeightChanged={() => { if (pinned.current) list.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" }); }}
+      totalListHeightChanged={() => { if (pinned.current) goToBottom(); }}
       components={components} context={{ plan, pending }} itemContent={renderMessage}
     />
-    {!atBottom && <button className="gb-jump-latest gb-btn" onClick={() => { pinned.current = true; list.current?.scrollToIndex({ index: "LAST", align: "end" }); }}>Jump to latest <CursorIcon name="chevron-down" size={14} /></button>}
+    {!atBottom && <button className="gb-jump-latest gb-btn" onClick={() => { pinned.current = true; goToBottom(); }}>Jump to latest <CursorIcon name="chevron-down" size={14} /></button>}
   </div>;
 });
 
 export const ChatTranscript = memo(function ChatTranscript() {
-  const { messages, todos, isStreaming, liveStatusText, activeProfile, activeSession,
-    botAvatars, respondApproval, respondClarify } = useApp();
-  return <ChatTranscriptView messages={messages} todos={todos} isStreaming={isStreaming}
+  const { activeProfile, activeSession, botAvatars, respondApproval, respondClarify, loadOlderMessages } = useApp();
+  const messageIds = useChatSlice(chat => chat.messageIds);
+  const firstItemIndex = useChatSlice(chat => chat.firstItemIndex);
+  const hasOlder = useChatSlice(chat => chat.olderOffset !== null);
+  const loadingHistory = useChatSlice(chat => chat.loadingHistory);
+  const todos = useChatSlice(chat => chat.todos);
+  const isStreaming = useChatSlice(chat => chat.isStreaming);
+  const liveStatusText = useChatSlice(chat => chat.liveStatusText);
+  return <ChatTranscriptView messageIds={messageIds} firstItemIndex={firstItemIndex}
+    loadOlder={hasOlder ? loadOlderMessages : undefined} loadingHistory={loadingHistory} todos={todos} isStreaming={isStreaming}
     liveStatusText={liveStatusText} activeProfile={activeProfile} activeSession={activeSession}
     botAvatars={botAvatars} respondApproval={respondApproval} respondClarify={respondClarify} />;
 });

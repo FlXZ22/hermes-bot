@@ -68,9 +68,10 @@ impl HermesSupervisor {
     fn with_home(hermes_home: PathBuf) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(8)
             .build()
-            .unwrap_or_default();
+            .expect("initialize Hermes HTTP client");
 
         Self {
             boot_task: Arc::new(Mutex::new(None)),
@@ -357,7 +358,7 @@ impl HermesSupervisor {
             builder = builder.body(body);
         }
 
-        let resp = builder
+        let mut resp = builder
             .send()
             .await
             .map_err(|e| format!("HTTP request failed: {e}"))?;
@@ -368,10 +369,15 @@ impl HermesSupervisor {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("Failed reading response body: {e}"))?;
+        const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("Failed reading response body: {e}"))? {
+            if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
+                return Err("Hermes response exceeded the 32 MB limit".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(bytes).unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
 
         Ok(NativeHttpResponse {
             status,

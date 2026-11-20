@@ -1,3 +1,4 @@
 fn main() {
-    tauri_build::build()
+    #[cfg(feature = "tauri-host")]
+    tauri_build::build();
 }

@@ -2,18 +2,25 @@ import React from "react";
 import { AppProvider, useApp } from "./state/appStore";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
-import { BoardsView } from "./components/BoardsView";
-import { SkillsView } from "./components/SkillsView";
-import { CronView } from "./components/CronView";
-import { MemoryView } from "./components/MemoryView";
-import { GatewayView } from "./components/GatewayView";
-import { AnalyticsView } from "./components/AnalyticsView";
-import { SettingsView } from "./components/SettingsView";
 import { RightSidePane } from "./components/RightSidePane";
 import { ModelPickerModal } from "./components/ModelPickerModal";
 import { AvatarEditorModal } from "./components/AvatarEditorModal";
 import { WelcomeScreen } from "./components/WelcomeScreen";
 import { CommandPalette } from "./components/CommandPalette";
+
+const BoardsView = React.lazy(() => import("./components/BoardsView").then(module => ({ default: module.BoardsView })));
+
+const SkillsView = React.lazy(() => import("./components/SkillsView").then(module => ({ default: module.SkillsView })));
+
+const CronView = React.lazy(() => import("./components/CronView").then(module => ({ default: module.CronView })));
+
+const MemoryView = React.lazy(() => import("./components/MemoryView").then(module => ({ default: module.MemoryView })));
+
+const GatewayView = React.lazy(() => import("./components/GatewayView").then(module => ({ default: module.GatewayView })));
+
+const AnalyticsView = React.lazy(() => import("./components/AnalyticsView").then(module => ({ default: module.AnalyticsView })));
+
+const SettingsView = React.lazy(() => import("./components/SettingsView").then(module => ({ default: module.SettingsView })));
 
 const Shell: React.FC = () => {
   const { activeView, toast, setupOpen, initializing, connection } = useApp();
@@ -46,7 +53,7 @@ const Shell: React.FC = () => {
     {(setupOpen || initializing) && <WelcomeScreen />}
     <div className="gb-shell grok-bot-root" style={setupOpen || initializing ? { display: "none" } : undefined}>
       <Sidebar />
-      {renderCenter()}
+      <React.Suspense fallback={<main className="gb-chat" aria-busy="true" />}>{renderCenter()}</React.Suspense>
       <RightSidePane key={`${connection.id}:${connection.id.startsWith("local-") ? "local" : connection.url}:${JSON.stringify(connection.ssh ?? null)}`} />
 
       <ModelPickerModal />

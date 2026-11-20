@@ -1,9 +1,8 @@
-import { useBatchedState } from "../lib/useBatchedState";
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { ChatStore, lastMessageIndex, newAssistant } from "./chatStore";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   HermesClient,
   HermesRealtimeSession,
-  resolveStreamSessionId,
   setNativeHttpAdapter,
   parseSavedConnection,
   connectionError,
@@ -19,11 +18,9 @@ import {
   type HermesModelOption,
   type HermesProfile,
   type HermesSession,
-  type HermesSessionUsage,
   type HermesSkill,
   type HermesStatus,
   type HermesStreamEvent,
-  type HermesTodoItem,
   type HermesToolset,
   type HermesUsagePoint,
   type HermesWebhook,
@@ -68,8 +65,7 @@ const DEFAULT_BOARD: HermesBoardSummary = {
   workspace_path: "",
 };
 
-const EMPTY_MESSAGES: HermesMessage[] = [];
-const EMPTY_TODOS: HermesTodoItem[] = [];
+const HISTORY_PAGE_SIZE = 48;
 
 const STORAGE_THEME_KEY = "hermes-grok-bot:theme";
 const STORAGE_CONN_KEY = "hermes-grok-bot:connection";
@@ -158,11 +154,8 @@ export interface AppContextValue {
   sessions: HermesSession[];
   activeSessionId: string | null;
   activeSession: HermesSession | null;
-  messages: HermesMessage[];
-  todos: HermesTodoItem[];
-  sessionUsage: HermesSessionUsage | null;
-  isStreaming: boolean;
-  liveStatusText: string;
+  chat: ChatStore;
+  loadOlderMessages: () => Promise<void>;
   selectSession: (sessionId: string | null) => Promise<void>;
   createNewSession: (opts?: { title?: string; boardSlug?: string; cwd?: string; model?: string; provider?: string }) => Promise<string | null>;
   sendMessage: (text: string, attachments?: File[]) => Promise<void>;
@@ -314,20 +307,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Sessions & Chat
   const [sessions, setSessions] = useState<HermesSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [messagesBySession, setMessagesBySession] = useBatchedState<Record<string, HermesMessage[]>>({});
-  const [todosBySession, setTodosBySession] = useState<Record<string, HermesTodoItem[]>>({});
-  const [usageBySession, setUsageBySession] = useState<Record<string, HermesSessionUsage>>({});
-  const [streamingBySession, setStreamingBySession] = useState<Record<string, boolean>>({});
-  const [statusBySession, setStatusBySession] = useState<Record<string, string>>({});
-  const todos = activeSessionId ? todosBySession[activeSessionId] ?? EMPTY_TODOS : EMPTY_TODOS;
-  const sessionUsage = activeSessionId ? usageBySession[activeSessionId] ?? null : null;
-  const isStreaming = activeSessionId ? streamingBySession[activeSessionId] ?? false : false;
-  const liveStatusText = activeSessionId ? statusBySession[activeSessionId] ?? "" : "";
-  const markStreaming = useCallback((sid: string, value: boolean) => {
-    setStreamingBySession(prev => prev[sid] === value ? prev : ({ ...prev, [sid]: value }));
+  const [chat, setChat] = useState(() => new ChatStore());
+  const currentChat = useRef(chat);
+  const profileChats = useRef(new Map<string, ChatStore>());
+  const sseControllers = useRef(new Map<ChatStore, Map<string, AbortController>>());
+  const liveRoutes = useRef(new Map<string, { chat: ChatStore; id: string }>());
+  const activateChat = useCallback((profile: string, reset = false) => {
+    if (reset) {
+      for (const controllers of sseControllers.current.values()) {
+        for (const controller of controllers.values()) controller.abort();
+      }
+      sseControllers.current.clear();
+      for (const store of new Set([currentChat.current, ...profileChats.current.values()])) store.disconnect();
+      profileChats.current.clear();
+      liveRoutes.current.clear();
+    }
+    const store = profileChats.current.get(profile) ?? new ChatStore();
+    profileChats.current.set(profile, store);
+    currentChat.current = store;
+    setChat(store);
   }, []);
-  const markStatus = useCallback((sid: string, value: string) => {
-    setStatusBySession(prev => prev[sid] === value ? prev : ({ ...prev, [sid]: value }));
+  const registerLiveSession = useCallback((store: ChatStore, id: string, wireId: string) => {
+    store.liveIds[id] = wireId;
+    liveRoutes.current.set(wireId, { chat: store, id });
   }, []);
 
   // Models & Inference settings
@@ -351,7 +353,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const clientRef = useRef<HermesClient | null>(null);
   const rtRef = useRef<HermesRealtimeSession | null>(null);
   const draftSessionIdsRef = useRef(new Set<string>());
-  const liveSidMapRef = useRef<Record<string, string>>({}); // storedOrUiId -> liveGatewaySid
   const activeSessionIdRef = useRef<string | null>(null);
   activeSessionIdRef.current = activeSessionId;
 
@@ -449,11 +450,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Handle real-time Hermes WebSocket events
   const handleStreamEvent = useCallback((event: HermesStreamEvent) => {
     const wireSid = "sessionId" in event ? event.sessionId : undefined;
-    const targetSid = resolveStreamSessionId(wireSid, activeSessionIdRef.current, liveSidMapRef.current);
+    const route = wireSid ? liveRoutes.current.get(wireSid) : undefined;
+    const targetChat = route?.chat ?? currentChat.current;
+    const targetSid = route?.id ?? wireSid ?? activeSessionIdRef.current ?? "draft";
 
     if (event.type === "status") {
       if (event.status === "connected") {
-        liveSidMapRef.current = {};
         setConnectionStatus("connected");
         setConnectionDetail("Live Hermes Gateway");
       } else if (event.status === "connecting") {
@@ -462,8 +464,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       } else if (event.status === "disconnected") {
         setConnectionStatus("disconnected");
         setConnectionDetail("Connection lost. Reconnecting…");
-        setStreamingBySession({});
-        setMessagesBySession(prev => Object.fromEntries(Object.entries(prev).map(([id, messages]) => [id, messages.map(message => message.streaming ? { ...message, streaming: false } : message)])));
+        for (const store of new Set([currentChat.current, ...profileChats.current.values()])) store.disconnect();
+        liveRoutes.current.clear();
       } else if (event.status === "error") {
         setConnectionStatus("error");
         setConnectionDetail(event.detail ?? "WebSocket error");
@@ -471,238 +473,105 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return;
     }
 
+    // A runtime ID is registered by create/resume before the client submits.
+    // Unknown IDs must not write to a different profile with a matching stored ID.
+    if (wireSid && !route) return;
+
     if (event.type === "session.info" || event.type === "session.ready") {
-      const info = event.info ?? {};
-      setSessions(prev => prev.map(s => s.id === targetSid ? { ...s,
-        model: typeof info.model === "string" ? info.model : s.model,
-        provider: typeof info.provider === "string" ? info.provider : s.provider,
-      } : s));
+      if (targetChat !== currentChat.current) return;
+      const { model, provider } = event.info ?? {};
+      setSessions(previous => previous.map(session => {
+        if (session.id !== targetSid) return session;
+        const nextModel = typeof model === "string" ? model : session.model;
+        const nextProvider = typeof provider === "string" ? provider : session.provider;
+        return nextModel === session.model && nextProvider === session.provider
+          ? session : { ...session, model: nextModel, provider: nextProvider };
+      }));
       return;
     }
 
-    if (event.type === "approval.settled" || event.type === "clarify.settled") {
-      setMessagesBySession(prev => ({ ...prev, [targetSid]: (prev[targetSid] ?? []).map(m => {
-        if (event.type === "approval.settled" && m.approval?.id === event.id) return { ...m, approval: { ...m.approval, settled: event.decision } };
-        if (event.type === "clarify.settled" && m.clarify?.id === event.id) return { ...m, clarify: { ...m.clarify, answered: event.answer } };
-        return m;
-      }) }));
+    if (event.type === "text.delta" || event.type === "thinking.delta") {
+      targetChat.buffer(targetSid, event.delta, event.type === "text.delta" ? "text" : "thinking");
       return;
+    }
+
+    if (event.type === "status.update") targetChat.patch(targetSid, { liveStatusText: event.text });
+    if (event.type === "session.usage") targetChat.patch(targetSid, { sessionUsage: event.usage });
+    if (event.type === "todo.updated") targetChat.patch(targetSid, { todos: event.todos });
+
+    if (event.type === "message.start") {
+      targetChat.patch(targetSid, { isStreaming: true });
+      targetChat.updateMessages(targetSid, messages => messages.some(message => message.streaming)
+        ? messages : [...messages, newAssistant()]);
     }
 
     if (event.type === "message.interim") {
-      setMessagesBySession(prev => ({ ...prev, [targetSid]: (prev[targetSid] ?? []).map(m => m.streaming ? { ...m, content: event.content, streaming: false } : m) }));
-      return;
+      targetChat.updateMessages(targetSid, messages => messages.map(message =>
+        message.streaming ? { ...message, content: event.content, streaming: false } : message));
     }
 
-    if (event.type === "status.update") {
-      markStatus(targetSid, event.text);
-      return;
-    }
-
-    if (event.type === "session.usage") {
-      setUsageBySession(prev => ({ ...prev, [targetSid]: event.usage }));
-      return;
-    }
-
-    if (event.type === "todo.updated") {
-      setTodosBySession(prev => ({ ...prev, [targetSid]: event.todos }));
-      return;
-    }
-
-    if (event.type === "message.start") {
-      markStreaming(targetSid, true);
-      setMessagesBySession((prev) => {
-        const list = prev[targetSid] ?? [];
-        const last = list[list.length - 1];
-        if (last && last.role === "assistant" && last.streaming) return prev;
-        return {
-          ...prev,
-          [targetSid]: [
-            ...list,
-            {
-              id: `asst-${Date.now()}`,
-              role: "assistant",
-              content: "",
-              thinking: "",
-              toolCalls: [],
-              streaming: true,
-              timestamp: Date.now(),
-            },
-          ],
-        };
-      });
-      return;
-    }
-
-    if (event.type === "text.delta") {
-      markStreaming(targetSid, true);
-      setMessagesBySession((prev) => {
-        const list = [...(prev[targetSid] ?? [])];
-        const last = list[list.length - 1];
-        if (last && last.role === "assistant" && last.streaming) {
-          list[list.length - 1] = { ...last, content: last.content + event.delta };
-        } else {
-          list.push({
-            id: `asst-${Date.now()}`,
-            role: "assistant",
-            content: event.delta,
-            streaming: true,
-            timestamp: Date.now(),
-          });
-        }
-        return { ...prev, [targetSid]: list };
-      });
-      return;
-    }
-
-    if (event.type === "thinking.delta") {
-      markStreaming(targetSid, true);
-      setMessagesBySession((prev) => {
-        const list = [...(prev[targetSid] ?? [])];
-        const last = list[list.length - 1];
-        if (last && last.role === "assistant" && last.streaming) {
-          list[list.length - 1] = { ...last, thinking: (last.thinking ?? "") + event.delta };
-        } else {
-          list.push({
-            id: `asst-${Date.now()}`,
-            role: "assistant",
-            content: "",
-            thinking: event.delta,
-            streaming: true,
-            timestamp: Date.now(),
-          });
-        }
-        return { ...prev, [targetSid]: list };
-      });
-      return;
+    if (event.type === "message.complete" || event.type === "error") {
+      targetChat.finish(targetSid, event.type === "message.complete" ? event.content : undefined);
+      if (event.type === "error") {
+        if (targetChat === currentChat.current) showToast(event.message);
+        targetChat.updateMessages(targetSid, messages => [
+          ...messages, newAssistant({ content: event.message, streaming: false }),
+        ]);
+      }
     }
 
     if (event.type === "tool.start") {
-      markStreaming(targetSid, true);
-      markStatus(targetSid, `Running ${event.toolCall.name}...`);
-      setMessagesBySession((prev) => {
-        const list = [...(prev[targetSid] ?? [])];
-        const last = list[list.length - 1];
-        if (last && last.role === "assistant" && last.streaming) {
-          const existing = last.toolCalls ?? [];
-          list[list.length - 1] = { ...last, toolCalls: [...existing, event.toolCall] };
-        } else {
-          list.push({
-            id: `asst-${Date.now()}`,
-            role: "assistant",
-            content: "",
-            toolCalls: [event.toolCall],
-            streaming: true,
-            timestamp: Date.now(),
-          });
-        }
-        return { ...prev, [targetSid]: list };
+      targetChat.patch(targetSid, { isStreaming: true, liveStatusText: `Running ${event.toolCall.name}…` });
+      targetChat.updateMessages(targetSid, messages => {
+        const index = lastMessageIndex(messages, message => Boolean(message.streaming));
+        if (index < 0) return [...messages, newAssistant({ toolCalls: [event.toolCall] })];
+        const next = messages.slice();
+        const message = messages[index];
+        next[index] = { ...message, toolCalls: [...(message.toolCalls ?? []), event.toolCall] };
+        return next;
       });
-      return;
     }
 
-    if (event.type === "tool.progress") {
-      setMessagesBySession((prev) => {
-        const list = [...(prev[targetSid] ?? [])];
-        const last = list[list.length - 1];
-        if (last && last.role === "assistant" && last.toolCalls?.length) {
-          const updatedTools = last.toolCalls.map((tc) =>
-            tc.id === event.toolCallId ? { ...tc, preview: event.preview } : tc
-          );
-          list[list.length - 1] = { ...last, toolCalls: updatedTools };
-        }
-        return { ...prev, [targetSid]: list };
-      });
-      return;
-    }
-
-    if (event.type === "tool.end") {
-      markStatus(targetSid, "");
-      setMessagesBySession((prev) => {
-        const list = [...(prev[targetSid] ?? [])];
-        const last = list[list.length - 1];
-        if (last && last.role === "assistant" && last.toolCalls?.length) {
-          const updatedTools = last.toolCalls.map((tc) =>
-            tc.id === event.toolCallId || (!event.toolCallId && tc.status === "running")
-              ? {
-                  ...tc,
-                  status: (event.error ? "error" : "done") as "done" | "error",
-                  output: event.error ?? event.output ?? tc.output,
-                  durationMs: event.durationMs,
-                }
-              : tc
-          );
-          list[list.length - 1] = { ...last, toolCalls: updatedTools };
-        }
-        return { ...prev, [targetSid]: list };
-      });
-      return;
-    }
-
-    if (event.type === "approval.request") {
-      setMessagesBySession((prev) => {
-        const list = [...(prev[targetSid] ?? [])];
-        list.push({
-          id: `appr-${event.approval.id}`,
-          role: "assistant",
-          content: "",
-          approval: event.approval,
-          timestamp: Date.now(),
+    if (event.type === "tool.progress" || event.type === "tool.end") {
+      if (event.type === "tool.end") targetChat.patch(targetSid, { liveStatusText: "" });
+      const matches = (tool: NonNullable<HermesMessage["toolCalls"]>[number]) =>
+        event.toolCallId ? tool.id === event.toolCallId : tool.status === "running";
+      targetChat.updateMessages(targetSid, messages => {
+        const index = lastMessageIndex(messages, message => Boolean(message.toolCalls?.some(matches)));
+        if (index < 0) return messages;
+        const message = messages[index];
+        const tools = message.toolCalls!.map(tool => {
+          if (!matches(tool)) return tool;
+          if (event.type === "tool.progress") return { ...tool, preview: event.preview };
+          return { ...tool, status: event.error ? "error" as const : "done" as const,
+            output: event.error ?? event.output ?? tool.output, durationMs: event.durationMs };
         });
-        return { ...prev, [targetSid]: list };
+        const next = messages.slice();
+        next[index] = { ...message, toolCalls: tools };
+        return next;
       });
-      return;
     }
 
-    if (event.type === "clarify.request") {
-      setMessagesBySession((prev) => {
-        const list = [...(prev[targetSid] ?? [])];
-        list.push({
-          id: `clarify-${event.clarify.id}`,
-          role: "assistant",
-          content: "",
-          clarify: event.clarify,
-          timestamp: Date.now(),
-        });
-        return { ...prev, [targetSid]: list };
-      });
-      return;
+    if (event.type === "approval.request" || event.type === "clarify.request") {
+      const approval = event.type === "approval.request" ? event.approval : undefined;
+      const clarify = event.type === "clarify.request" ? event.clarify : undefined;
+      const id = approval ? `appr-${approval.id}` : `clarify-${clarify!.id}`;
+      targetChat.updateMessages(targetSid, messages => messages.some(message => message.id === id)
+        ? messages : [...messages, newAssistant({ id, approval, clarify, streaming: false })]);
     }
 
-    if (event.type === "message.complete") {
-      markStreaming(targetSid, false);
-      markStatus(targetSid, "");
-      setMessagesBySession((prev) => {
-        const list = [...(prev[targetSid] ?? [])];
-        const last = list[list.length - 1];
-        if (last && last.role === "assistant") {
-          list[list.length - 1] = {
-            ...last,
-            content: event.content && !last.content ? event.content : last.content,
-            streaming: false,
-          };
+    if (event.type === "approval.settled" || event.type === "clarify.settled") {
+      targetChat.updateMessages(targetSid, messages => messages.map(message => {
+        if (event.type === "approval.settled" && message.approval?.id === event.id) {
+          return { ...message, approval: { ...message.approval, settled: event.decision } };
         }
-        return { ...prev, [targetSid]: list };
-      });
-      return;
+        if (event.type === "clarify.settled" && message.clarify?.id === event.id) {
+          return { ...message, clarify: { ...message.clarify, answered: event.answer } };
+        }
+        return message;
+      }));
     }
-
-    if (event.type === "error") {
-      markStreaming(targetSid, false);
-      markStatus(targetSid, "");
-      showToast(event.message);
-      setMessagesBySession((prev) => {
-        const list = [...(prev[targetSid] ?? [])];
-        list.push({
-          id: `err-${Date.now()}`,
-          role: "assistant",
-          content: `**Error:** ${event.message}`,
-          timestamp: Date.now(),
-        });
-        return { ...prev, [targetSid]: list };
-      });
-    }
-  }, [showToast, markStreaming, markStatus]);
+  }, [showToast]);
 
   // Hydrate all Hermes capabilities from live HTTP API
   const refreshCapabilities = useCallback(async () => {
@@ -870,14 +739,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const previous = clientRef.current?.getConnection();
       const switched = !previous || previous.id !== conn.id || previous.url !== conn.url;
       rtRef.current?.disconnect();
-      liveSidMapRef.current = {};
+      for (const store of profileChats.current.values()) store.disconnect();
+      liveRoutes.current.clear();
       clientRef.current = c;
       rtRef.current = rt;
       rt.subscribe(event => { if (rtRef.current === rt) handleStreamEvent(event); });
       if (switched) {
-        liveSidMapRef.current = {}; draftSessionIdsRef.current.clear(); activeSessionIdRef.current = null;
-        setActiveSessionId(null); setActiveProfileState(profile); setSessions([]); setMessagesBySession({});
-        setTodosBySession({}); setUsageBySession({}); setStreamingBySession({}); setStatusBySession({});
+        draftSessionIdsRef.current.clear(); activeSessionIdRef.current = null;
+        activateChat(profile, true);
+        setActiveSessionId(null); setActiveProfileState(profile); setSessions([]);
         setModels([]); setActiveModel(""); setActiveProvider("auto"); setSkills([]); setToolsets([]);
         setMcpServers([]); setCronJobs([]); setMessagingPlatforms([]); setWebhooks([]); setUsagePoints([]);
         setProfiles([{ name: profile, active: true }]); setSoulMd(""); setMemoryMd(""); setUserMd("");
@@ -903,7 +773,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       throw new Error(connectionError(error));
     }
-  }, [handleStreamEvent, hydrateLocal, refreshCapabilities]);
+  }, [activateChat, handleStreamEvent, hydrateLocal, refreshCapabilities]);
 
   const updateConnection = useCallback(async (input: HermesConnection) => {
     const conn = { ...input, url: normalizeServerUrl(input.url), mode: "dashboard" as const };
@@ -1046,6 +916,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       await c.setActiveProfile(name);
       if (clientRef.current !== c) return;
       c.setProfile(name);
+      activateChat(name);
       setActiveProfileState(name); activeSessionIdRef.current = null;
       setActiveSessionId(null); setSessions([]); setActiveView("chat");
       setSoulMd(""); setMemoryMd(""); setUserMd("");
@@ -1065,7 +936,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       showToast(`Switched to ${name === "default" ? "Hermes" : name}`);
     } catch (error) { showToast(error instanceof Error ? error.message : "Could not switch bot"); }
     finally { profileSwitchRef.current = false; setProfileSwitching(false); }
-  }, [activeProfile, refreshCapabilities, showToast, isDesktop, isLocalConnection]);
+  }, [activateChat, activeProfile, refreshCapabilities, showToast, isDesktop, isLocalConnection]);
 
   const updateBotAvatar = useCallback(
     (seed: string, patch: BotAvatarOverride) => {
@@ -1277,67 +1148,104 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [refreshCapabilities, showToast]
   );
 
-  // Select session & hydrate transcript instantly via Rust SQLite + live Hermes API
+  // Paint the cached transcript immediately and reconcile with the gateway.
   const selectSession = useCallback(
     async (sessionId: string | null) => {
+      activeSessionIdRef.current = sessionId;
       setActiveSessionId(sessionId);
-      const selected = sessions.find(s => s.id === sessionId);
+      const selected = sessions.find(session => session.id === sessionId);
       if (selected?.model) setActiveModel(selected.model);
       if (selected?.provider) setActiveProvider(selected.provider);
       setActiveView("chat");
       if (!sessionId) return;
+      chat.retain(sessionId);
+      const cached = chat.get(sessionId);
+      if (cached.isStreaming || cached.loadingHistory) return;
 
-      // 1. Instant Rust SQLite transcript hydration (<2ms)
-      if (isDesktop && isLocalConnection && !messagesBySession[sessionId]?.length) {
+      const client = clientRef.current;
+      const realtime = rtRef.current;
+      const original = chat.get(sessionId).messages;
+      let baseline = original;
+      if (!original.length) chat.patch(sessionId, { loadingHistory: true });
+      const mayHydrate = () => currentChat.current === chat && clientRef.current === client
+        && (!client || client.getProfile() === activeProfile) && !chat.get(sessionId).isStreaming;
+
+      const local = async () => {
+        if (!isDesktop || !isLocalConnection || original.length) return;
         try {
-          const rows = await tauriBridge.loadLocalSessionMessages(sessionId, 500, activeProfile);
-          if (rows.length > 0) {
-            setMessagesBySession((prev) => ({
-              ...prev,
-              [sessionId]: rows.map((r) => ({
-                id: r.id,
-                role: (r.role === "user" || r.role === "assistant" || r.role === "system" || r.role === "tool"
-                  ? r.role
-                  : "assistant") as HermesMessage["role"],
-                content: r.content,
-                timestamp: r.timestamp ?? undefined,
-                model: r.model ?? undefined,
-              })),
+          const rows = await tauriBridge.loadLocalSessionMessages(sessionId, client ? HISTORY_PAGE_SIZE : 500, activeProfile);
+          if (mayHydrate() && rows.length && chat.get(sessionId).messages === original) {
+            baseline = rows.map(row => ({
+              id: row.id,
+              role: row.role === "user" || row.role === "system" || row.role === "tool" ? row.role : "assistant",
+              content: row.content,
+              timestamp: row.timestamp ?? undefined,
+              model: row.model ?? undefined,
             }));
+            chat.updateMessages(sessionId, () => baseline);
           }
-        } catch {
-          // ignore
-        }
-      }
-
-      // 2. Live Hermes REST hydration + WS session.resume
-      if (clientRef.current) {
+        } catch { /* Gateway history remains available. */ }
+      };
+      const remote = async () => {
+        if (!client) return;
         try {
-          const liveMsgs = await clientRef.current.getSessionMessages(sessionId, 500);
-          if (liveMsgs.length > 0) {
-            setMessagesBySession((prev) => ({ ...prev, [sessionId]: liveMsgs }));
+          const incoming = await client.getSessionMessages(sessionId, HISTORY_PAGE_SIZE);
+          if (mayHydrate() && incoming.length && chat.get(sessionId).messages === baseline) {
+            const previous = new Map(baseline.map(message => [message.id, message]));
+            chat.updateMessages(sessionId, displayed => {
+              const first = incoming[0].id;
+              const overlap = displayed.findIndex(message => message.id === first);
+              const older = overlap >= 0 ? displayed.slice(0, overlap) : [];
+              return [...older, ...incoming.map(message => {
+              const cached = previous.get(message.id);
+              return cached && cached.role === message.role && cached.content === message.content &&
+                cached.timestamp === message.timestamp && cached.model === message.model &&
+                cached.thinking === message.thinking && cached.toolName === message.toolName &&
+                !cached.toolCalls?.length && !message.toolCalls?.length && !cached.approval && !cached.clarify
+                ? cached : message;
+              })];
+            });
+            const knownOffset = cached.olderOffset;
+            if (incoming.length >= HISTORY_PAGE_SIZE && original.length <= HISTORY_PAGE_SIZE && knownOffset === null) {
+              chat.patch(sessionId, { olderOffset: HISTORY_PAGE_SIZE });
+            }
           }
-        } catch {
-          // ignore if draft/local-only session
-        }
-      }
-
-      if (rtRef.current?.isConnected()) {
+        } catch { /* Keep the cached or local transcript. */ }
+      };
+      const resume = async () => {
+        if (!realtime?.isConnected() || chat.liveIds[sessionId]) return;
         try {
-          const resumed = await rtRef.current.resumeSession(sessionId, {
-            profile: activeProfile,
-            omit_messages: true,
-          });
-          if (resumed && typeof resumed.session_id === "string") {
-            liveSidMapRef.current[sessionId] = resumed.session_id;
+          const result = await realtime.resumeSession(sessionId, { profile: activeProfile, omit_messages: true });
+          if (rtRef.current === realtime && typeof result.session_id === "string") {
+            registerLiveSession(chat, sessionId, result.session_id);
           }
-        } catch {
-          // session may be fresh/unpersisted
-        }
-      }
+        } catch { /* Drafts may not be in the gateway yet. */ }
+      };
+      void resume();
+      try { await Promise.all([local(), remote()]); }
+      finally { chat.patch(sessionId, { loadingHistory: false }); }
     },
-    [activeProfile, isDesktop, isLocalConnection, messagesBySession, sessions]
+    [activeProfile, chat, isDesktop, isLocalConnection, registerLiveSession, sessions]
   );
+
+  const loadOlderMessages = useCallback(async () => {
+    const id = activeSessionId;
+    const client = clientRef.current;
+    if (!id || !client || currentChat.current !== chat) return;
+    const { olderOffset, loadingHistory } = chat.get(id);
+    if (olderOffset === null || loadingHistory) return;
+    chat.patch(id, { loadingHistory: true });
+    try {
+      const messages = await client.getSessionMessages(id, HISTORY_PAGE_SIZE, olderOffset);
+      if (clientRef.current === client && client.getProfile() === activeProfile) {
+        chat.prepend(id, messages, messages.length >= HISTORY_PAGE_SIZE ? olderOffset + messages.length : null);
+      }
+    } catch (error) {
+      if (currentChat.current === chat) showToast(error instanceof Error ? error.message : "Could not load older messages");
+    } finally {
+      chat.patch(id, { loadingHistory: false });
+    }
+  }, [activeSessionId, activeProfile, chat, showToast]);
 
   const createNewSession = useCallback(
     async (opts?: { title?: string; boardSlug?: string; cwd?: string; model?: string; provider?: string }) => {
@@ -1348,9 +1256,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const provider = opts?.provider ?? activeProvider;
 
       let newId = `session_${Date.now().toString(36)}`;
-      if (rtRef.current?.isConnected()) {
+      const realtime = rtRef.current;
+      if (realtime?.isConnected()) {
         try {
-          const res = await rtRef.current.createSession({
+          const res = await realtime.createSession({
             profile: activeProfile,
             model,
             provider: provider !== "auto" ? provider : undefined,
@@ -1362,14 +1271,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           });
           const sid = String(res.stored_session_id ?? res.session_key ?? res.session_id ?? newId);
           newId = sid;
-          if (typeof res.session_id === "string") {
-            liveSidMapRef.current[newId] = res.session_id;
+          if (rtRef.current === realtime && typeof res.session_id === "string") {
+            registerLiveSession(chat, newId, res.session_id);
           }
         } catch {
           // fall back to local draft id
         }
       }
 
+      if (currentChat.current !== chat || rtRef.current !== realtime) return null;
       const newSession: HermesSession = {
         id: newId,
         title: opts?.title ?? "New Chat",
@@ -1386,15 +1296,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       draftSessionIdsRef.current.add(newId);
       setSessions((prev) => [newSession, ...prev.filter((s) => s.id !== newId)]);
-      setMessagesBySession((prev) => ({ ...prev, [newId]: [] }));
       assignSessionToBoard(newId, boardSlug);
       setActiveModel(model);
       setActiveProvider(provider);
+      activeSessionIdRef.current = newId;
       setActiveSessionId(newId);
       setActiveView("chat");
       return newId;
     },
-    [activeBoardSlug, activeModel, activeProfile, activeProvider, assignSessionToBoard, boards, fastMode, reasoningEffort]
+    [activeBoardSlug, activeModel, activeProfile, activeProvider, assignSessionToBoard, boards, chat, fastMode, reasoningEffort, registerLiveSession]
   );
 
   useEffect(() => {
@@ -1427,30 +1337,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const intro = task.body ? `Work on task: **${task.title}**\n\n${task.body}` : `Work on task: **${task.title}**`;
         // Seed prompt automatically if connected
         if (rtRef.current?.isConnected()) {
-          const liveSid = liveSidMapRef.current[sid] ?? sid;
-          setMessagesBySession((prev) => ({
-            ...prev,
-            [sid]: [{ id: `u-${Date.now()}`, role: "user", content: intro, timestamp: Date.now() }],
-          }));
-          markStreaming(sid!, true);
+          const liveSid = chat.liveIds[sid] ?? sid;
+          chat.updateMessages(sid, () => [{ id: `u-${Date.now()}`, role: "user", content: intro, timestamp: Date.now() }]);
+          chat.patch(sid, { isStreaming: true });
           try {
             await rtRef.current.submitPrompt(liveSid, intro);
             await updateTask(task.id, { status: "running" });
           } catch (error) {
-            markStreaming(sid, false);
+            chat.patch(sid, { isStreaming: false });
             showToast(error instanceof Error ? error.message : "Task could not start");
           }
         }
       }
     },
-    [createNewSession, selectSession, sessions, updateTask]
+    [chat, createNewSession, selectSession, sessions, updateTask, showToast]
   );
 
   const sendMessage = useCallback(
     async (rawText: string, attachments: File[] = []) => {
+      const realtime = rtRef.current;
       const text = rawText.trim() || (attachments.length ? "Please review the attached files." : "");
       if (!text) return;
-      if (!rtRef.current?.isConnected() && connection.mode !== "openai") {
+      if (!realtime?.isConnected() && connection.mode !== "openai") {
         throw new Error("Hermes is disconnected. Your draft is kept; reconnect in Settings to send it.");
       }
       if (attachments.length && connection.mode === "openai") throw new Error("File attachments require a Hermes gateway connection.");
@@ -1459,7 +1367,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (!sid) {
         sid = await createNewSession({ title: text.slice(0, 48) });
       }
-      if (!sid) return;
+      if (!sid || currentChat.current !== chat || rtRef.current !== realtime) {
+        throw new Error("The conversation changed before the message could be sent.");
+      }
+      if (chat.get(sid).isStreaming) throw new Error("Wait for the current response before sending another message.");
 
       const userMsg: HermesMessage = {
         id: `user-${Date.now()}`,
@@ -1468,10 +1379,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         timestamp: Date.now(),
       };
 
-      setMessagesBySession((prev) => ({
-        ...prev,
-        [sid!]: [...(prev[sid!] ?? []), userMsg],
-      }));
+      chat.updateMessages(sid, messages => [...messages, userMsg]);
 
       setSessions((prev) =>
         prev.map((s) =>
@@ -1488,18 +1396,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
 
       // Handle slash commands if connected
-      if (text.startsWith("/") && rtRef.current?.isConnected()) {
-        const liveSid = liveSidMapRef.current[sid] ?? sid;
+      if (text.startsWith("/") && realtime?.isConnected()) {
+        const liveSid = chat.liveIds[sid] ?? sid;
         try {
-          const res = await rtRef.current.dispatchCommand(liveSid, text);
+          const res = await realtime.dispatchCommand(liveSid, text);
           if (res && typeof res.output === "string" && res.output) {
-            setMessagesBySession((prev) => ({
-              ...prev,
-              [sid!]: [
-                ...(prev[sid!] ?? []),
+            chat.updateMessages(sid, messages => [
+                ...messages,
                 { id: `cmd-${Date.now()}`, role: "assistant", content: res.output as string, timestamp: Date.now() },
-              ],
-            }));
+              ]);
             return;
           }
         } catch {
@@ -1508,18 +1413,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       // Live WebSocket JSON-RPC submit
-      if (rtRef.current?.isConnected()) {
-        markStreaming(sid!, true);
-        markStatus(sid!, "Thinking...");
+      if (realtime?.isConnected()) {
+        chat.patch(sid, { isStreaming: true });
+        chat.patch(sid, { liveStatusText: "Thinking..." });
         try {
-          let liveSid = liveSidMapRef.current[sid];
+          let liveSid = chat.liveIds[sid];
           if (!liveSid && !sid.startsWith("session_")) {
-            const resumed = await rtRef.current.resumeSession(sid, { profile: activeProfile, omit_messages: true });
+            const resumed = await realtime.resumeSession(sid, { profile: activeProfile, omit_messages: true });
             liveSid = String(resumed.session_id ?? sid);
-            liveSidMapRef.current[sid] = liveSid;
+            if (rtRef.current !== realtime) throw new Error("Connection changed while sending");
+            registerLiveSession(chat, sid, liveSid);
           }
           if (!liveSid) {
-            const created = await rtRef.current.createSession({
+            const created = await realtime.createSession({
               profile: activeProfile,
               model: activeModel,
               provider: activeProvider !== "auto" ? activeProvider : undefined,
@@ -1530,9 +1436,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               title: activeSession?.title,
             });
             liveSid = String(created.session_id ?? sid);
-            liveSidMapRef.current[sid] = liveSid;
+            if (rtRef.current !== realtime) throw new Error("Connection changed while sending");
+            registerLiveSession(chat, sid, liveSid);
           }
-          await rtRef.current.setSessionConfig(liveSid, {
+          await realtime.setSessionConfig(liveSid, {
             reasoning_effort: reasoningEffort, fast: fastMode, yolo: yoloMode,
           });
           let prompt = text;
@@ -1544,75 +1451,66 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               reader.readAsDataURL(file);
             });
             if (file.type.startsWith("image/")) {
-              await rtRef.current.rpc("image.attach_bytes", { session_id: liveSid, content_base64: dataUrl, filename: file.name });
+              await realtime.rpc("image.attach_bytes", { session_id: liveSid, content_base64: dataUrl, filename: file.name });
             } else if (file.type === "application/pdf") {
-              await rtRef.current.rpc("pdf.attach", { session_id: liveSid, content_base64: dataUrl, filename: file.name });
+              await realtime.rpc("pdf.attach", { session_id: liveSid, content_base64: dataUrl, filename: file.name });
             } else {
-              const attached = await rtRef.current.rpc<Record<string, unknown>>("file.attach", { session_id: liveSid, data_url: dataUrl, name: file.name });
+              const attached = await realtime.rpc<Record<string, unknown>>("file.attach", { session_id: liveSid, data_url: dataUrl, name: file.name });
               prompt += `\n${attached.ref_text ?? ""}`;
             }
           }
-          await rtRef.current.submitPrompt(liveSid, prompt);
-          draftSessionIdsRef.current.delete(sid);
+          await realtime.submitPrompt(liveSid, prompt);
+          if (currentChat.current === chat) draftSessionIdsRef.current.delete(sid);
         } catch (err) {
-          markStreaming(sid!, false);
-          markStatus(sid!, "");
+          chat.finish(sid);
           const msg = err instanceof Error ? err.message : String(err);
-          setMessagesBySession((prev) => ({
-            ...prev,
-            [sid!]: [
-              ...(prev[sid!] ?? []),
+          chat.updateMessages(sid, messages => [
+              ...messages,
               {
                 id: `err-${Date.now()}`,
                 role: "assistant",
                 content: `Could not deliver message to Hermes backend: ${msg}`,
                 timestamp: Date.now(),
               },
-            ],
-          }));
+            ]);
           throw err;
         }
         return;
       }
 
       // OpenAI SSE fallback if configured in openai mode
-      if (connection.mode === "openai" && rtRef.current) {
-        markStreaming(sid!, true);
-        const asstId = `asst-${Date.now()}`;
-        setMessagesBySession((prev) => ({
-          ...prev,
-          [sid!]: [...(prev[sid!] ?? []), { id: asstId, role: "assistant", content: "", streaming: true, timestamp: Date.now() }],
-        }));
+      if (connection.mode === "openai" && realtime) {
+        chat.patch(sid, { isStreaming: true });
+        const assistant = newAssistant();
+        const history = chat.get(sid).messages;
+        chat.updateMessages(sid, messages => [...messages, assistant]);
+        const controllers = sseControllers.current.get(chat) ?? new Map<string, AbortController>();
+        const controller = new AbortController();
+        controllers.set(sid, controller);
+        sseControllers.current.set(chat, controllers);
         try {
-          const history = [...(messagesBySession[sid] ?? []), userMsg];
-          await rtRef.current.streamOpenAIChat({
+          await realtime.streamOpenAIChat({
             model: activeModel,
             messages: history,
             sessionKey: sid,
-            onDelta: (delta) => {
-              setMessagesBySession((prev) => ({
-                ...prev,
-                [sid!]: (prev[sid!] ?? []).map((m) => (m.id === asstId ? { ...m, content: m.content + delta } : m)),
-              }));
-            },
+            signal: controller.signal,
+            onDelta: delta => chat.buffer(sid, delta, "text", assistant.id),
           });
         } catch (err) {
-          showToast(err instanceof Error ? err.message : "Stream error");
+          if (!controller.signal.aborted && currentChat.current === chat) {
+            showToast(err instanceof Error ? err.message : "Stream error");
+          }
         } finally {
-          markStreaming(sid!, false);
-          setMessagesBySession((prev) => ({
-            ...prev,
-            [sid!]: (prev[sid!] ?? []).map((m) => (m.id === asstId ? { ...m, streaming: false } : m)),
-          }));
+          controllers.delete(sid);
+          if (!controllers.size) sseControllers.current.delete(chat);
+          chat.finish(sid, undefined, assistant.id);
         }
         return;
       }
 
       // Informative offline fallback when backend isn't ready yet
-      setMessagesBySession((prev) => ({
-        ...prev,
-        [sid!]: [
-          ...(prev[sid!] ?? []),
+      chat.updateMessages(sid, messages => [
+          ...messages,
           {
             id: `info-${Date.now()}`,
             role: "assistant",
@@ -1620,8 +1518,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               "Hermes backend is not connected yet. Check **Settings → Connections** or wait for the local Rust-managed `hermes serve` process to finish starting.",
             timestamp: Date.now(),
           },
-        ],
-      }));
+        ]);
     },
     [
       activeModel,
@@ -1633,24 +1530,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       connection.mode,
       createNewSession,
       fastMode,
-      messagesBySession,
+      chat,
+      registerLiveSession,
       reasoningEffort,
       yoloMode,
-      markStreaming,
-      markStatus,
       showToast,
     ]
   );
 
   const interruptStream = useCallback(async () => {
     if (!activeSessionId) return;
-    markStreaming(activeSessionId, false);
-    markStatus(activeSessionId, "");
-    if (activeSessionId && rtRef.current?.isConnected()) {
-      const liveSid = liveSidMapRef.current[activeSessionId] ?? activeSessionId;
-      await rtRef.current.interruptSession(liveSid).catch(() => undefined);
+    const controller = sseControllers.current.get(chat)?.get(activeSessionId);
+    if (controller) {
+      controller.abort();
+      return;
     }
-  }, [activeSessionId]);
+    const liveSid = chat.liveIds[activeSessionId] ?? activeSessionId;
+    try {
+      await rtRef.current?.interruptSession(liveSid);
+      chat.finish(activeSessionId);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Could not interrupt response");
+    }
+  }, [activeSessionId, chat, showToast]);
 
   const renameSession = useCallback(
     async (sessionId: string, title: string) => {
@@ -1661,11 +1563,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         await clientRef.current.renameSession(sessionId, clean, activeProfile).catch(() => undefined);
       }
       if (rtRef.current?.isConnected()) {
-        const liveSid = liveSidMapRef.current[sessionId] ?? sessionId;
+        const liveSid = chat.liveIds[sessionId] ?? sessionId;
         await rtRef.current.setSessionTitle(liveSid, clean).catch(() => undefined);
       }
     },
-    [activeProfile]
+    [activeProfile, chat]
   );
 
   const deleteSession = useCallback(
@@ -1706,19 +1608,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       showToast("Connect to Hermes to compress session context");
       return;
     }
-    const liveSid = liveSidMapRef.current[activeSessionId] ?? activeSessionId;
+    const liveSid = chat.liveIds[activeSessionId] ?? activeSessionId;
     try {
       await rtRef.current.compressSession(liveSid);
       showToast("Context compressed");
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Compress failed");
     }
-  }, [activeSessionId, showToast]);
+  }, [activeSessionId, chat, showToast]);
 
   const branchActiveSession = useCallback(async () => {
     if (!activeSessionId) return;
     if (rtRef.current?.isConnected()) {
-      const liveSid = liveSidMapRef.current[activeSessionId] ?? activeSessionId;
+      const liveSid = chat.liveIds[activeSessionId] ?? activeSessionId;
       try {
         const res = await rtRef.current.branchSession(liveSid);
         const newSid = String(res.stored_session_id ?? res.session_key ?? res.session_id ?? "");
@@ -1734,42 +1636,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
     await createNewSession({ title: `${activeSession?.title ?? "Chat"} (branch)` });
     showToast("Branched session");
-  }, [activeSession?.title, activeSessionId, createNewSession, refreshCapabilities, selectSession, showToast]);
+  }, [activeSession?.title, activeSessionId, chat, createNewSession, refreshCapabilities, selectSession, showToast]);
 
   const respondApproval = useCallback(
     async (approvalId: string, choice: "once" | "always" | "deny") => {
       const sid = activeSessionId ?? "draft";
       const settled: "allowed" | "always" | "denied" =
         choice === "deny" ? "denied" : choice === "always" ? "always" : "allowed";
-      setMessagesBySession((prev) => ({
-        ...prev,
-        [sid]: (prev[sid] ?? []).map((m) =>
+      chat.updateMessages(sid, messages => messages.map((m) =>
           m.approval?.id === approvalId ? { ...m, approval: { ...m.approval, settled } } : m
-        ),
-      }));
+        ));
       if (rtRef.current?.isConnected()) {
-        const liveSid = liveSidMapRef.current[sid] ?? sid;
+        const liveSid = chat.liveIds[sid] ?? sid;
         await rtRef.current.respondApproval(liveSid, approvalId, choice).catch(() => undefined);
       }
     },
-    [activeSessionId]
+    [activeSessionId, chat]
   );
 
   const respondClarify = useCallback(
     async (clarifyId: string, answer: string) => {
       const sid = activeSessionId ?? "draft";
-      setMessagesBySession((prev) => ({
-        ...prev,
-        [sid]: (prev[sid] ?? []).map((m) =>
+      chat.updateMessages(sid, messages => messages.map((m) =>
           m.clarify?.id === clarifyId ? { ...m, clarify: { ...m.clarify, answered: answer } } : m
-        ),
-      }));
+        ));
       if (rtRef.current?.isConnected()) {
-        const liveSid = liveSidMapRef.current[sid] ?? sid;
+        const liveSid = chat.liveIds[sid] ?? sid;
         await rtRef.current.respondClarify(liveSid, clarifyId, answer).catch(() => undefined);
       }
     },
-    [activeSessionId]
+    [activeSessionId, chat]
   );
 
   // Per-session selection, with an explicit option to change the Hermes default.
@@ -1777,7 +1673,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     async (model: string, provider?: string, saveAsDefault = false) => {
       try {
         if (activeSessionId && rtRef.current?.isConnected()) {
-          const liveSid = liveSidMapRef.current[activeSessionId] ?? activeSessionId;
+          const liveSid = chat.liveIds[activeSessionId] ?? activeSessionId;
           await rtRef.current.setSessionConfig(liveSid, { model, provider });
         }
         if (saveAsDefault && clientRef.current) {
@@ -1792,12 +1688,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         throw err;
       }
     },
-    [activeSessionId, activeProvider, showToast]
-  );
-
-  const messages = useMemo(
-    () => (activeSessionId ? messagesBySession[activeSessionId] ?? EMPTY_MESSAGES : EMPTY_MESSAGES),
-    [activeSessionId, messagesBySession]
+    [activeSessionId, activeProvider, chat, showToast]
   );
 
   const value: AppContextValue = {
@@ -1859,11 +1750,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     sessions,
     activeSessionId,
     activeSession,
-    messages,
-    todos,
-    sessionUsage,
-    isStreaming,
-    liveStatusText,
+    chat,
+    loadOlderMessages,
     selectSession,
     createNewSession,
     sendMessage,
@@ -1905,4 +1793,16 @@ export function useApp(): AppContextValue {
   const ctx = useContext(AppContext);
   if (!ctx) throw new Error("useApp must be used inside AppProvider");
   return ctx;
+}
+
+export function useChatSlice<T>(select: (snapshot: ReturnType<ChatStore["get"]>) => T): T {
+  const { activeSessionId, chat } = useApp();
+  const subscribe = useCallback((listener: () => void) => chat.subscribe(activeSessionId, listener), [activeSessionId, chat]);
+  return useSyncExternalStore(subscribe, () => select(chat.get(activeSessionId)));
+}
+
+export function useChatMessage(messageId: string) {
+  const { activeSessionId, chat } = useApp();
+  const subscribe = useCallback((listener: () => void) => chat.subscribe(activeSessionId, listener), [activeSessionId, chat]);
+  return useSyncExternalStore(subscribe, () => chat.getMessage(activeSessionId, messageId));
 }

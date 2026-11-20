@@ -2272,3 +2272,25 @@ button:disabled {
 @media (prefers-reduced-motion: reduce) { .gb-chat :is(.gb-typing-dot,.gb-typing-dots,.gb-context-meter__fill) { animation: none; transition: none; } }
 .gb-transcript::-webkit-scrollbar { display: block; width: 6px; }
 .gb-transcript::-webkit-scrollbar-thumb { background: var(--grok-bot-border-default); border-radius: 6px; }
+
+@supports (field-sizing: content) {
+  .gb-composer__textarea {
+    field-sizing: content;
+    min-height: 24px;
+    max-height: 140px;
+  }
+}
+
+.gb-markdown-fallback { white-space: pre-wrap; }
+.gb-history-more { display: flex; margin: 0 auto 10px; }
+
+.gb-markdown-block { display: flow-root; min-width: 0; }
+.gb-markdown-block:first-child > :first-child { margin-top: 0; }
+.gb-markdown-block:last-child > :last-child { margin-bottom: 0; }
+@supports (content-visibility: auto) {
+  .gb-markdown-block { content-visibility: auto; contain-intrinsic-size: auto 40px; }
+}
+
+/* Chromium delegates dragging to the window manager. Controls stay clickable. */
+[data-desktop-host="chromium"] [data-tauri-drag-region] { -webkit-app-region: drag; }
+[data-desktop-host="chromium"] [data-tauri-drag-region] :is(button, a, input, textarea, select, [role="button"]) { -webkit-app-region: no-drag; }

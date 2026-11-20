@@ -13,14 +13,24 @@ function getTauriInvoke(): (<T = unknown>(cmd: string, args?: Record<string, unk
   return t?.core?.invoke ?? null;
 }
 
-export function isTauriDesktop(): boolean {
-  return getTauriInvoke() !== null;
+interface ChromiumDesktop {
+  invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+  terminalStart: (args: Record<string, unknown>, onEvent: (event: TerminalEvent) => void) => Promise<TerminalInfo>;
+}
+
+function getChromiumDesktop() {
+  return typeof window === "undefined" ? undefined :
+    (window as unknown as { hermesDesktop?: ChromiumDesktop }).hermesDesktop;
+}
+
+export function isDesktopHost(): boolean {
+  return Boolean(getChromiumDesktop() || getTauriInvoke());
 }
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const fn = getTauriInvoke();
+  const fn = getChromiumDesktop()?.invoke ?? getTauriInvoke();
   if (!fn) {
-    throw new Error(`Tauri command "${cmd}" unavailable in web mode`);
+    throw new Error(`Desktop command "${cmd}" unavailable in web mode`);
   }
   return fn<T>(cmd, args);
 }
@@ -147,6 +157,8 @@ export interface NativeTokenSet {
 
 export const tauriBridge = {
   terminalStart: (id: string, cwd: string, cols: number, rows: number, ssh: HermesSshTarget | undefined, onEvent: (event: TerminalEvent) => void): Promise<TerminalInfo> => {
+    const chromium = getChromiumDesktop();
+    if (chromium) return chromium.terminalStart({ id, cwd, cols, rows, ssh }, onEvent);
     const channel = new Channel<TerminalEvent>();
     channel.onmessage = onEvent;
     return invoke("terminal_start", { id, cwd, cols, rows, ssh, onEvent: channel });
@@ -166,14 +178,14 @@ export const tauriBridge = {
   refreshRemoteLogin: (connection: HermesConnection): Promise<NativeTokenSet> => invoke("refresh_remote_login", {
     url: connection.url, refreshToken: connection.refreshToken, provider: connection.authProvider ?? "",
   }),
-  isDesktop: isTauriDesktop,
+  isDesktop: isDesktopHost,
 
   getBackendInfo: (): Promise<RustBackendInfo> => invoke<RustBackendInfo>("get_backend_info"),
 
   restartBackend: (): Promise<RustBackendInfo> => invoke<RustBackendInfo>("restart_hermes_backend"),
 
   createHttpAdapter: (): NativeHttpAdapter | null => {
-    if (!isTauriDesktop()) return null;
+    if (!isDesktopHost()) return null;
     return async (req) =>
       invoke<NativeHttpResponse>("hermes_http_request", {
         req: {

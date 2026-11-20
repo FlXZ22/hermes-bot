@@ -182,6 +182,7 @@ export class HermesClient {
         method: options.method ?? "GET",
         headers,
         body,
+        redirect: "error",
         credentials: this.conn.authType === "cookie" ? "include" : "same-origin",
         signal: options.signal ?? AbortSignal.timeout(30_000),
       });
@@ -352,13 +353,13 @@ export class HermesClient {
     return toArray<HermesSession>(data, "results", "sessions", "items");
   }
 
-  async getSessionMessages(sessionId: string, limit = 500): Promise<HermesMessage[]> {
+  async getSessionMessages(sessionId: string, limit = 500, offset = 0): Promise<HermesMessage[]> {
     const data = await this.request<unknown>(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
-      query: { limit, order: "latest" },
+      query: { limit, offset, order: "latest" },
     });
     const raw = toArray<Record<string, unknown>>(data, "messages", "items");
     return raw.map((m, idx) => ({
-      id: String(m.id ?? `${sessionId}-${idx}`),
+      id: String(m.id ?? `${sessionId}-${offset}-${idx}`),
       role: (m.role === "user" || m.role === "assistant" || m.role === "system" || m.role === "tool"
         ? m.role
         : "assistant") as HermesMessage["role"],

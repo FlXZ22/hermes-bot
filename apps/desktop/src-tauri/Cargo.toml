@@ -4,16 +4,30 @@ version = "1.0.0"
 description = "Grok Bot UI Linux Desktop App for Hermes Agent — Powered by Rust"
 authors = ["Hermes Grok Bot"]
 edition = "2021"
+default-run = "hermes-grok-bot"
 
 [lib]
 name = "hermes_grok_bot_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = ["tauri-host"]
+tauri-host = ["dep:tauri", "dep:tauri-build"]
+
+[[bin]]
+name = "hermes-grok-bot"
+path = "src/main.rs"
+required-features = ["tauri-host"]
+
+[[bin]]
+name = "hermes-native"
+path = "src/bin/hermes-native.rs"
+
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = [], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
