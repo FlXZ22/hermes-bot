@@ -110,7 +110,10 @@ export interface AppContextValue {
   bootstrapMs: number | null;
   client: HermesClient | null;
   updateConnection: (conn: HermesConnection) => Promise<void>;
+  restartingBackend: boolean;
+  refreshingModels: boolean;
   restartLocalBackend: () => Promise<void>;
+  refreshModels: () => Promise<void>;
   refreshAll: () => Promise<void>;
 
   // Profiles / Bots & Avatars
@@ -282,6 +285,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [hermesStatus, setHermesStatus] = useState<HermesStatus | null>(null);
   const [systemStats, setSystemStats] = useState<LinuxSystemStats | null>(null);
   const [bootstrapMs, setBootstrapMs] = useState<number | null>(null);
+  const [restartingBackend, setRestartingBackend] = useState(false);
+  const [refreshingModels, setRefreshingModels] = useState(false);
+  const wasDisconnectedRef = useRef(false);
 
   // Profiles & Memory
   const [profiles, setProfiles] = useState<HermesProfile[]>([
@@ -458,10 +464,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (event.status === "connected") {
         setConnectionStatus("connected");
         setConnectionDetail("Live Hermes Gateway");
+        if (wasDisconnectedRef.current) {
+          wasDisconnectedRef.current = false;
+          void refreshCapabilities({ refreshModels: true });
+        }
       } else if (event.status === "connecting") {
         setConnectionStatus("connecting");
         setConnectionDetail("Connecting WebSocket...");
       } else if (event.status === "disconnected") {
+        wasDisconnectedRef.current = true;
         setConnectionStatus("disconnected");
         setConnectionDetail("Connection lost. Reconnecting…");
         for (const store of new Set([currentChat.current, ...profileChats.current.values()])) store.disconnect();
@@ -574,7 +585,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [showToast]);
 
   // Hydrate all Hermes capabilities from live HTTP API
-  const refreshCapabilities = useCallback(async () => {
+  const refreshCapabilities = useCallback(async (opts?: { refreshModels?: boolean }) => {
     const c = clientRef.current;
     if (!c) return;
     const requestedProfile = c.getProfile();
@@ -598,7 +609,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...data.map(s => ({ ...prev.find(p => p.id === s.id), ...s })),
         ...prev.filter(s => (s.id.startsWith("session_") || draftSessionIdsRef.current.has(s.id)) && !data.some(d => d.id === s.id)),
       ])),
-      load("models", c.getModelOptions(true), data => { if (data.length) setModels(data); }),
+      load("models", c.getModelOptions(true, Boolean(opts?.refreshModels)), data => { if (data.length) setModels(data); }),
       load("model info", c.getModelInfo(), info => {
         if (!activeSessionIdRef.current) {
           if (typeof info.model === "string" && info.model) setActiveModel(info.model);
@@ -813,12 +824,64 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     throw new Error("Local Hermes is available in the Linux app. In this preview, start npm run dev:connected or connect to your server.");
   }, [isDesktop, updateConnection]);
 
-  const restartLocalBackend = useCallback(async () => {
+  const refreshModels = useCallback(async () => {
+    const c = clientRef.current;
+    if (!c || refreshingModels) return;
+    setRefreshingModels(true);
     try {
-      if (isDesktop) await tauriBridge.restartBackend();
-      await startLocalConnection(); showToast("Hermes is ready");
-    } catch (error) { showToast(connectionError(error)); }
-  }, [isDesktop, showToast, startLocalConnection]);
+      const [freshModels, info] = await Promise.all([
+        c.getModelOptions(true, true),
+        c.getModelInfo().catch(() => null),
+      ]);
+      if (clientRef.current === c) {
+        if (freshModels.length) setModels(freshModels);
+        if (info && !activeSessionIdRef.current) {
+          if (typeof info.model === "string" && info.model) setActiveModel(info.model);
+          if (typeof info.provider === "string" && info.provider) setActiveProvider(info.provider);
+        }
+      }
+      showToast(`Refreshed ${freshModels.length} models across providers`);
+    } catch (error) {
+      showToast(connectionError(error));
+    } finally {
+      setRefreshingModels(false);
+    }
+  }, [refreshingModels, showToast]);
+
+  const restartLocalBackend = useCallback(async () => {
+    if (restartingBackend) return;
+    setRestartingBackend(true);
+    showToast("Restarting Hermes backend…");
+    try {
+      if (isLocalConnection) {
+        if (isDesktop) {
+          await tauriBridge.restartBackend();
+        } else if (clientRef.current) {
+          await clientRef.current.gatewayAction("restart").catch(() => undefined);
+        }
+        await startLocalConnection();
+      } else {
+        const c = clientRef.current;
+        if (c) {
+          await Promise.allSettled([
+            c.gatewayAction("restart"),
+            c.rescanDashboardPlugins(),
+          ]);
+        }
+        await new Promise(resolve => setTimeout(resolve, 1200));
+        await connectToHermes(connection, activeProfile);
+      }
+      if (clientRef.current) {
+        const freshModels = await clientRef.current.getModelOptions(true, true).catch(() => []);
+        if (freshModels.length) setModels(freshModels);
+      }
+      showToast("Hermes backend restarted & providers reloaded");
+    } catch (error) {
+      showToast(connectionError(error));
+    } finally {
+      setRestartingBackend(false);
+    }
+  }, [activeProfile, connectToHermes, connection, isDesktop, isLocalConnection, restartingBackend, showToast, startLocalConnection]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1722,7 +1785,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     bootstrapMs,
     client: clientRef.current,
     updateConnection,
+    restartingBackend,
+    refreshingModels,
     restartLocalBackend,
+    refreshModels,
     refreshAll,
     profiles,
     profileSwitching,

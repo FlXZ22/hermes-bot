@@ -19,6 +19,10 @@ export const ModelPickerModal: React.FC = () => {
     setReasoningEffort,
     setFastMode,
     setYoloMode,
+    restartLocalBackend,
+    restartingBackend,
+    refreshModels,
+    refreshingModels,
   } = useApp();
 
   const [query, setQuery] = useState("");
@@ -27,20 +31,35 @@ export const ModelPickerModal: React.FC = () => {
   const [saveDefault, setSaveDefault] = useState(false);
 
   const providers = useMemo(() => {
-    const set = new Set<string>();
+    const map = new Map<string, { count: number; configured: boolean }>();
     for (const m of models) {
-      if (m.provider) set.add(m.provider);
+      if (!m.provider) continue;
+      const cur = map.get(m.provider) ?? { count: 0, configured: false };
+      cur.count += 1;
+      if (m.configured) cur.configured = true;
+      map.set(m.provider, cur);
     }
-    return ["all", ...Array.from(set).sort()];
+    const sorted = Array.from(map.entries())
+      .sort(([a, aMeta], [b, bMeta]) => {
+        if (aMeta.configured !== bMeta.configured) return aMeta.configured ? -1 : 1;
+        return a.localeCompare(b);
+      })
+      .map(([name, meta]) => ({ name, count: meta.count, configured: meta.configured }));
+    return [{ name: "all", count: models.length, configured: true }, ...sorted];
   }, [models]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return models.filter((m) => {
-      if (providerFilter !== "all" && m.provider !== providerFilter) return false;
-      if (!q) return true;
-      return `${m.id} ${m.name ?? ""} ${m.provider}`.toLowerCase().includes(q);
-    });
+    return models
+      .filter((m) => {
+        if (providerFilter !== "all" && m.provider !== providerFilter) return false;
+        if (!q) return true;
+        return `${m.id} ${m.name ?? ""} ${m.provider}`.toLowerCase().includes(q);
+      })
+      .sort((a, b) => {
+        if (Boolean(a.configured) !== Boolean(b.configured)) return a.configured ? -1 : 1;
+        return 0;
+      });
   }, [models, providerFilter, query]);
 
   const handleChoose = async (modelId: string, provider?: string) => {
@@ -53,34 +72,56 @@ export const ModelPickerModal: React.FC = () => {
   return (
     <Modal open={modelPickerOpen} title="Choose Hermes Model" onClose={() => setModelPickerOpen(false)}>
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        {/* Search bar */}
-        <div className="gb-sidebar-search" style={{ margin: 0, height: 36 }}>
-          <CursorIcon name="search" size={14} />
-          <input
-            className="gb-sidebar-search__input"
-            placeholder="Search models or providers (e.g. claude, grok, gemini, hermes)..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            autoFocus
-          />
-          {query && (
-            <button type="button" className="gb-mini-icon-btn" onClick={() => setQuery("")}>
-              <CursorIcon name="close" size={12} />
-            </button>
-          )}
+        {/* Search bar & backend refresh/restart actions */}
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div className="gb-sidebar-search" style={{ margin: 0, height: 36, flex: 1 }}>
+            <CursorIcon name="search" size={14} />
+            <input
+              className="gb-sidebar-search__input"
+              placeholder="Search models or providers (e.g. anti-gravity, claude, grok, gemini)..."
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              autoFocus
+            />
+            {query && (
+              <button type="button" className="gb-mini-icon-btn" onClick={() => setQuery("")}>
+                <CursorIcon name="close" size={12} />
+              </button>
+            )}
+          </div>
+          <button
+            type="button"
+            className="gb-btn gb-btn--secondary gb-btn--sm"
+            title="Refresh live model catalog from all providers"
+            disabled={refreshingModels || restartingBackend}
+            onClick={() => void refreshModels()}
+          >
+            <CursorIcon name="refresh" size={13} spin={refreshingModels} />
+            {refreshingModels ? "Refreshing…" : "Refresh Models"}
+          </button>
+          <button
+            type="button"
+            className="gb-btn gb-btn--secondary gb-btn--sm"
+            title="Restart Hermes backend to reload newly added providers & plugins"
+            disabled={restartingBackend}
+            onClick={() => void restartLocalBackend()}
+          >
+            <CursorIcon name="refresh" size={13} spin={restartingBackend} />
+            {restartingBackend ? "Restarting…" : "Restart Backend"}
+          </button>
         </div>
 
         {/* Provider filter chips */}
         <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-          {providers.slice(0, 10).map((p) => (
+          {providers.map((p) => (
             <button
-              key={p}
+              key={p.name}
               type="button"
               className="gb-board-pill"
-              data-active={providerFilter === p ? "true" : undefined}
-              onClick={() => setProviderFilter(p)}
+              data-active={providerFilter === p.name ? "true" : undefined}
+              onClick={() => setProviderFilter(p.name)}
             >
-              {p === "all" ? "All Providers" : p}
+              {p.name === "all" ? `All Providers (${p.count})` : `${p.name} (${p.count})`}
             </button>
           ))}
         </div>
@@ -88,7 +129,9 @@ export const ModelPickerModal: React.FC = () => {
         {/* Model catalog list */}
         <div className="gb-model-list">
           {filtered.map((m) => {
-            const isSelected = m.id === activeModel;
+            const isSelected =
+              m.id === activeModel &&
+              (!activeProvider || activeProvider === "auto" || m.provider === activeProvider);
             return (
               <button
                 key={`${m.provider}:${m.id}`}

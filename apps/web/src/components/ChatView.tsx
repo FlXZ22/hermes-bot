@@ -9,6 +9,7 @@ import { tauriBridge } from "../lib/tauriBridge";
 
 const SLASH_COMMANDS = [
   { cmd: "/model", desc: "Open model & provider picker" },
+  { cmd: "/restart", desc: "Restart Hermes backend & reload providers" },
   { cmd: "/boards", desc: "Switch to Session Boards (Kanban)" },
   { cmd: "/compress", desc: "Compress conversation context" },
   { cmd: "/branch", desc: "Branch this conversation" },
@@ -78,6 +79,7 @@ export const ChatView: React.FC = () => {
     renameSession,
     compressActiveSession,
     branchActiveSession,
+    restartLocalBackend,
   } = useApp();
 
   const { connection, setupOpen } = useApp();
@@ -153,6 +155,11 @@ export const ChatView: React.FC = () => {
     if (text === "/model") {
       setDraft("");
       setModelPickerOpen(true);
+      return;
+    }
+    if (text === "/restart") {
+      setDraft("");
+      await restartLocalBackend();
       return;
     }
     if (text === "/boards") {

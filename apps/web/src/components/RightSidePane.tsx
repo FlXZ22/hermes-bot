@@ -31,6 +31,10 @@ export const RightSidePane: React.FC = () => {
     rustBackend,
     client,
     connection,
+    restartingBackend,
+    restartLocalBackend,
+    refreshModels,
+    refreshingModels,
   } = useApp();
 
   const [terminalMounted, setTerminalMounted] = useState(false);
@@ -357,6 +361,28 @@ export const RightSidePane: React.FC = () => {
                   onClick={() => setAvatarEditorTarget({ seed: botSeed, title: botAv?.displayName || botSeed })}
                 >
                   Edit
+                </button>
+              </div>
+              <div style={{ display: "flex", gap: 6, padding: "0 12px 12px" }}>
+                <button
+                  type="button"
+                  className="gb-btn gb-btn--secondary gb-btn--sm"
+                  style={{ flex: 1 }}
+                  disabled={refreshingModels || restartingBackend}
+                  onClick={() => void refreshModels()}
+                >
+                  <CursorIcon name="refresh" size={12} spin={refreshingModels} />
+                  {refreshingModels ? "Refreshing…" : "Refresh Models"}
+                </button>
+                <button
+                  type="button"
+                  className="gb-btn gb-btn--secondary gb-btn--sm"
+                  style={{ flex: 1 }}
+                  disabled={restartingBackend}
+                  onClick={() => void restartLocalBackend()}
+                >
+                  <CursorIcon name="refresh" size={12} spin={restartingBackend} />
+                  {restartingBackend ? "Restarting…" : "Restart Backend"}
                 </button>
               </div>
             </div>

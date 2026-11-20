@@ -19,7 +19,10 @@ export const SettingsView: React.FC = () => {
     setSetupOpen,
     updateConnection,
     isLocalConnection,
+    restartingBackend,
     restartLocalBackend,
+    refreshModels,
+    refreshingModels,
     client,
     profiles,
     activeProfile,
@@ -166,16 +169,38 @@ export const SettingsView: React.FC = () => {
                       {activeModel} ({activeProvider})
                     </div>
                   </div>
-                  <button type="button" className="gb-btn gb-btn--secondary" onClick={() => setModelPickerOpen(true)}>
-                    Change Model
-                  </button>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      type="button"
+                      className="gb-btn gb-btn--secondary"
+                      disabled={refreshingModels || restartingBackend}
+                      onClick={() => void refreshModels()}
+                    >
+                      <CursorIcon name="refresh" size={13} spin={refreshingModels} />
+                      {refreshingModels ? "Refreshing…" : "Refresh Models"}
+                    </button>
+                    <button type="button" className="gb-btn gb-btn--secondary" onClick={() => setModelPickerOpen(true)}>
+                      Change Model
+                    </button>
+                  </div>
                 </div>
               </div>
 
               <div className="gb-section-card">
                 <div className="gb-section-card__head">
                   <span className="gb-section-card__title">Desktop runtime</span>
-                  <span className="gb-badge gb-badge--success">{isDesktop ? "Rust + Tauri v2" : "Web Mode"}</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span className="gb-badge gb-badge--success">{isDesktop ? "Rust + Native Host" : "Web Mode"}</span>
+                    <button
+                      type="button"
+                      className="gb-btn gb-btn--secondary gb-btn--sm"
+                      disabled={restartingBackend}
+                      onClick={() => void restartLocalBackend()}
+                    >
+                      <CursorIcon name="refresh" size={12} spin={restartingBackend} />
+                      {restartingBackend ? "Restarting…" : "Restart Backend"}
+                    </button>
+                  </div>
                 </div>
                 <div className="gb-row">
                   <div className="gb-row__info">
@@ -214,7 +239,26 @@ export const SettingsView: React.FC = () => {
                 </fieldset>
                 {sshError && <p style={{ color: "var(--grok-bot-text-danger)", fontSize: 12 }} role="alert">{sshError}</p>}
               </form>}
-              {isDesktop && isLocalConnection && <button className="gb-btn gb-btn--secondary" onClick={() => void restartLocalBackend()}><CursorIcon name="refresh" size={14} /> Restart local Hermes</button>}
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="gb-btn gb-btn--secondary"
+                  disabled={restartingBackend}
+                  onClick={() => void restartLocalBackend()}
+                >
+                  <CursorIcon name="refresh" size={14} spin={restartingBackend} />
+                  {restartingBackend ? "Restarting Hermes…" : isLocalConnection ? "Restart Local Hermes Backend" : "Restart Hermes Backend & Reload Providers"}
+                </button>
+                <button
+                  type="button"
+                  className="gb-btn gb-btn--secondary"
+                  disabled={refreshingModels || restartingBackend}
+                  onClick={() => void refreshModels()}
+                >
+                  <CursorIcon name="refresh" size={14} spin={refreshingModels} />
+                  {refreshingModels ? "Refreshing Models…" : "Refresh Model Providers"}
+                </button>
+              </div>
             </div>
           </div>}
 
@@ -223,6 +267,15 @@ export const SettingsView: React.FC = () => {
               <div className="gb-section-card">
                 <div className="gb-section-card__head">
                   <span className="gb-section-card__title">Add or Update Provider Key (~/.hermes/.env)</span>
+                  <button
+                    type="button"
+                    className="gb-btn gb-btn--secondary gb-btn--sm"
+                    disabled={restartingBackend}
+                    onClick={() => void restartLocalBackend()}
+                  >
+                    <CursorIcon name="refresh" size={12} spin={restartingBackend} />
+                    {restartingBackend ? "Restarting…" : "Restart Backend"}
+                  </button>
                 </div>
                 <form className="gb-section-card__body" onSubmit={handleSaveEnv} style={{ display: "flex", gap: 8 }}>
                   <input
@@ -338,17 +391,28 @@ export const SettingsView: React.FC = () => {
             <div className="gb-section-card">
               <div className="gb-section-card__head">
                 <span className="gb-section-card__title">~/.hermes/config.yaml</span>
-                <button
-                  type="button"
-                  className="gb-btn gb-btn--primary gb-btn--sm"
-                  onClick={async () => {
-                    if (!client) return;
-                    await client.saveRawConfig(rawConfig);
-                    showToast("Saved config.yaml");
-                  }}
-                >
-                  Save YAML
-                </button>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    type="button"
+                    className="gb-btn gb-btn--secondary gb-btn--sm"
+                    disabled={restartingBackend}
+                    onClick={() => void restartLocalBackend()}
+                  >
+                    <CursorIcon name="refresh" size={12} spin={restartingBackend} />
+                    {restartingBackend ? "Restarting…" : "Restart Backend"}
+                  </button>
+                  <button
+                    type="button"
+                    className="gb-btn gb-btn--primary gb-btn--sm"
+                    onClick={async () => {
+                      if (!client) return;
+                      await client.saveRawConfig(rawConfig);
+                      showToast("Saved config.yaml");
+                    }}
+                  >
+                    Save YAML
+                  </button>
+                </div>
               </div>
               <div className="gb-section-card__body">
                 <textarea

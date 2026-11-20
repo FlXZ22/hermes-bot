@@ -23,6 +23,8 @@ export const CommandPalette: React.FC = () => {
     selectSession,
     boards,
     setActiveBoardSlug,
+    restartLocalBackend,
+    refreshModels,
   } = useApp();
 
   const [query, setQuery] = useState("");
@@ -43,6 +45,20 @@ export const CommandPalette: React.FC = () => {
         detail: "Ctrl+Shift+M",
         icon: "sparkles",
         run: () => setModelPickerOpen(true),
+      },
+      {
+        id: "restart-backend",
+        label: "Restart Hermes Backend",
+        detail: "Reload providers, plugins, and gateway",
+        icon: "refresh",
+        run: () => void restartLocalBackend(),
+      },
+      {
+        id: "refresh-models",
+        label: "Refresh Models & Providers",
+        detail: "Re-fetch live provider catalogs",
+        icon: "refresh",
+        run: () => void refreshModels(),
       },
       {
         id: "open-boards",
@@ -132,6 +148,8 @@ export const CommandPalette: React.FC = () => {
     setModelPickerOpen,
     theme,
     toggleTheme,
+    restartLocalBackend,
+    refreshModels,
   ]);
 
   if (!commandPaletteOpen) return null;

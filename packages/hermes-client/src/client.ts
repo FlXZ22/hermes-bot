@@ -419,10 +419,14 @@ export class HermesClient {
 
   // Models & Providers
   getModelInfo(): Promise<Record<string, unknown>> {
-    return this.request("/api/model/info");
+    return this.request("/api/model/info", { query: { profile: this.profile } });
   }
 
-  async getModelOptions(includeUnconfigured = true): Promise<HermesModelOption[]> {
+  rescanDashboardPlugins(): Promise<Record<string, unknown>> {
+    return this.request("/api/dashboard/plugins/rescan");
+  }
+
+  async getModelOptions(includeUnconfigured = true, refresh = false): Promise<HermesModelOption[]> {
     if (this.conn.mode === "openai") {
       const res = await this.request<{ data?: Array<{ id: string; owned_by?: string }> }>("/v1/models");
       return (res.data ?? []).map((m) => ({
@@ -433,7 +437,11 @@ export class HermesClient {
       }));
     }
     const data = await this.request<unknown>("/api/model/options", {
-      query: { include_unconfigured: includeUnconfigured ? 1 : 0 },
+      query: {
+        include_unconfigured: includeUnconfigured ? 1 : 0,
+        refresh: refresh ? 1 : undefined,
+        profile: this.profile,
+      },
     });
     if (Array.isArray(data)) return data as HermesModelOption[];
     if (data && typeof data === "object") {
