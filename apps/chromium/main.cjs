@@ -1,5 +1,8 @@
 const { app, BrowserWindow, dialog, ipcMain, protocol, shell } = require('electron');
+const { spawn } = require('node:child_process');
+const { existsSync } = require('node:fs');
 const { readFile } = require('node:fs/promises');
+const { homedir } = require('node:os');
 const { extname, join, resolve } = require('node:path');
 const { NativeClient } = require('./native-client.cjs');
 
@@ -27,6 +30,7 @@ const commands = new Set([
   'load_board_state', 'save_board_state', 'save_local_memory_file', 'list_workspace_files',
   'read_workspace_file', 'git_workspace_status', 'get_linux_system_stats', 'terminal_start',
   'terminal_write', 'terminal_acknowledge', 'terminal_resize', 'terminal_info', 'terminal_close',
+  'get_update_status', 'check_for_updates', 'set_update_settings', 'apply_app_update',
 ]);
 const csp = [
   "default-src 'none'", "script-src 'self'", "worker-src 'self'",
@@ -147,6 +151,19 @@ async function createWindow() {
         case 'window_toggle_maximize': return win.isMaximized() ? win.unmaximize() : win.maximize();
         case 'window_close': return win.close();
         case 'window_start_drag': return undefined; // Chromium uses CSS drag regions.
+        case 'restart_app': {
+          const installedBin = join(homedir(), '.local', 'bin', 'hermes-grok-bot');
+          const target = existsSync(installedBin) ? installedBin : process.execPath;
+          const launchArgs = target === process.execPath ? process.argv.slice(1) : [];
+          app.releaseSingleInstanceLock();
+          const child = spawn(target, launchArgs, {
+            detached: true,
+            stdio: 'ignore',
+          });
+          child.unref();
+          setTimeout(() => app.quit(), 120);
+          return undefined;
+        }
         default:
           if (!commands.has(command)) throw new Error('Unknown native command');
           return native.invoke(command, args).catch(error => {

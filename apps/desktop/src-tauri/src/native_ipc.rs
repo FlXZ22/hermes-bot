@@ -3,6 +3,7 @@ use crate::{
     hermes_backend::{HermesSupervisor, NativeHttpRequest},
     profile_home, remote, save_local_memory_file, sqlite_store,
     terminal::{EventSink, TerminalManager},
+    updater::{AppUpdater, UpdateSettingsPatch},
     workspace,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -32,6 +33,7 @@ struct Service {
     supervisor: HermesSupervisor,
     terminals: TerminalManager,
     login: remote::RemoteLogin,
+    updater: AppUpdater,
 }
 
 fn args<T: DeserializeOwned>(value: Value) -> Result<T, String> {
@@ -299,6 +301,30 @@ impl Service {
                     .await
                 }
             }
+            "get_update_status" => result(self.updater.status()),
+            "check_for_updates" => result(self.updater.check_for_updates().await?),
+            "set_update_settings" => {
+                #[derive(Deserialize)]
+                struct Args {
+                    patch: UpdateSettingsPatch,
+                }
+                let Args { patch } = args(value)?;
+                result(self.updater.update_settings(patch)?)
+            }
+            "apply_app_update" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Args {
+                    mode: String,
+                    #[serde(default)]
+                    force_native_rebuild: bool,
+                }
+                let Args {
+                    mode,
+                    force_native_rebuild,
+                } = args(value)?;
+                result(self.updater.apply_update(mode, force_native_rebuild)?)
+            }
             _ => Err("Unknown native command".into()),
         }
     }
@@ -339,6 +365,7 @@ pub async fn run() -> Result<(), String> {
         supervisor: HermesSupervisor::new(),
         terminals: TerminalManager::default(),
         login: remote::RemoteLogin::default(),
+        updater: AppUpdater::new(),
     });
     let (send, mut receive) = mpsc::channel::<Value>(64);
     let writer = std::thread::spawn(move || {
@@ -422,6 +449,7 @@ mod tests {
             supervisor: HermesSupervisor::new(),
             terminals: TerminalManager::default(),
             login: remote::RemoteLogin::default(),
+            updater: AppUpdater::new(),
         });
         let (tx, _rx) = mpsc::channel(4);
 

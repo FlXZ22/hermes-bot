@@ -2256,10 +2256,29 @@ button:disabled {
 .gb-tool-duration { font-size: 11px; color: var(--grok-bot-text-tertiary); flex-shrink: 0; }
 .gb-thinking-card__body { white-space: normal; }
 .gb-tool-card__header:focus-visible,.gb-thinking-card__head:focus-visible { outline: 2px solid var(--grok-bot-text-accent); outline-offset: -2px; }
-.gb-animated-face { position: relative; display: inline-flex; flex-shrink: 0; contain: layout style; }
-.gb-animated-face__renderer { position: absolute; inset: 0; pointer-events: none; }
-.gb-animated-face__renderer svg { width: 100%; height: 100%; display: block; }
-.gb-animated-face:has(.gb-animated-face__renderer svg) .gb-animated-face__fallback { visibility: hidden; }
+.gb-animated-face {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  overflow: visible;
+}
+.gb-animated-face__renderer {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 153.3333%;
+  height: 153.3333%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.gb-animated-face__renderer svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  overflow: visible;
+}
 .gb-usage { display: flex; align-items: center; gap: 8px; padding: 0 12px 7px; color: var(--grok-bot-text-tertiary); font-size: 10px; font-variant-numeric: tabular-nums; }
 .gb-usage__track { width: 64px; height: 3px; flex-shrink: 0; border-radius: 4px; overflow: hidden; background: var(--grok-bot-border-default); }
 .gb-usage__fill { display: block; height: 100%; background: var(--grok-bot-text-accent); border-radius: inherit; }

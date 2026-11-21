@@ -1,4 +1,5 @@
 import type { HermesMessage, HermesSessionUsage, HermesTodoItem } from "@grok-bot/hermes-client";
+import type { TurnSettlement, TurnSettlementOutcome } from "../lib/botState";
 
 export interface ChatSnapshot {
   messages: HermesMessage[];
@@ -10,9 +11,27 @@ export interface ChatSnapshot {
   sessionUsage: HermesSessionUsage | null;
   isStreaming: boolean;
   liveStatusText: string;
+  activeToolName: string | null;
+  hasStreamedText: boolean;
+  awaitingUserResponse: boolean;
+  lastTurnSettlement: TurnSettlement | null;
 }
 
-const empty: ChatSnapshot = { messages: [], messageIds: [], firstItemIndex: 1_000_000, olderOffset: null, loadingHistory: false, todos: [], sessionUsage: null, isStreaming: false, liveStatusText: "" };
+const empty: ChatSnapshot = {
+  messages: [],
+  messageIds: [],
+  firstItemIndex: 1_000_000,
+  olderOffset: null,
+  loadingHistory: false,
+  todos: [],
+  sessionUsage: null,
+  isStreaming: false,
+  liveStatusText: "",
+  activeToolName: null,
+  hasStreamedText: false,
+  awaitingUserResponse: false,
+  lastTurnSettlement: null,
+};
 type MessageUpdate = (messages: HermesMessage[]) => HermesMessage[];
 
 export class ChatStore {
@@ -120,12 +139,14 @@ export class ChatStore {
       this.timer = undefined;
     }
     let messages = this.get(id).messages;
+    let streamedText = false;
     if (delta) {
       const index = delta.messageId
         ? lastMessageIndex(messages, message => message.id === delta.messageId)
         : lastMessageIndex(messages, message => message.role === "assistant" && message.streaming === true);
       const text = delta.text.join("");
       const thinking = delta.thinking.join("");
+      if (text.length > 0) streamedText = true;
       if (index >= 0) {
         messages = messages.slice();
         const previous = messages[index];
@@ -139,10 +160,12 @@ export class ChatStore {
       }
     }
     if (update) messages = update(messages);
-    this.patch(id, { messages });
+    this.patch(id, streamedText
+      ? { messages, hasStreamedText: true, activeToolName: null, lastTurnSettlement: null }
+      : { messages });
   }
 
-  finish(id: string, content?: string, messageId?: string) {
+  finish(id: string, content?: string, messageId?: string, outcome: TurnSettlementOutcome = "success") {
     this.updateMessages(id, messages => {
       const index = lastMessageIndex(messages, message => message.streaming === true && (!messageId || message.id === messageId));
       if (index < 0) return content && !messageId && messages.at(-1)?.content !== content
@@ -152,12 +175,19 @@ export class ChatStore {
       next[index] = { ...next[index], content: next[index].content || content || "", streaming: false };
       return next;
     });
-    this.patch(id, { isStreaming: false, liveStatusText: "" });
+    this.patch(id, {
+      isStreaming: false,
+      liveStatusText: "",
+      activeToolName: null,
+      hasStreamedText: false,
+      awaitingUserResponse: false,
+      lastTurnSettlement: { outcome, settledAtMs: Date.now() },
+    });
   }
 
   disconnect() {
     for (const id of this.sessions.keys()) {
-      if (this.get(id).isStreaming || this.deltas.has(id)) this.finish(id);
+      if (this.get(id).isStreaming || this.deltas.has(id)) this.finish(id, undefined, undefined, "cancelled");
     }
     for (const key of Object.keys(this.liveIds)) delete this.liveIds[key];
   }

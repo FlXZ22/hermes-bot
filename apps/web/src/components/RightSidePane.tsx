@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { BotMark, CursorIcon } from "@grok-bot/theme";
+import { CursorIcon } from "@grok-bot/theme";
+import { AnimatedBotFace } from "./AnimatedBotFace";
 import { useApp, type RightPaneTabId } from "../state/appStore";
 import { tauriBridge, type GitWorkspaceStatus, type WorkspaceFileEntry } from "../lib/tauriBridge";
 import { shortModelName } from "../lib/format";
@@ -346,7 +347,7 @@ export const RightSidePane: React.FC = () => {
           <>
             <div className="gb-section-card">
               <div className="gb-section-card__body" style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                <BotMark seed={botSeed} shapeId={botAv?.shapeId} colorId={botAv?.colorId} size={46} />
+                <AnimatedBotFace seed={botSeed} shapeId={botAv?.shapeId} colorId={botAv?.colorId} size={56} clickableSpin maxFrameRate={60} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 14, fontWeight: 600 }}>
                     {botAv?.displayName || (activeProfile === "default" ? "Hermes" : activeProfile)}

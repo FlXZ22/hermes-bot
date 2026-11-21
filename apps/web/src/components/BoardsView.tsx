@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from "react";
-import { BotMark, CursorIcon, Modal, resolveBotColor } from "@grok-bot/theme";
+import { CursorIcon, Modal, resolveBotColor } from "@grok-bot/theme";
+import { AnimatedBotFace } from "./AnimatedBotFace";
 import type { HermesKanbanStatus, HermesKanbanTask } from "@grok-bot/hermes-client";
 import { useApp } from "../state/appStore";
 import { formatRelativeTime, shortModelName } from "../lib/format";
@@ -334,7 +335,7 @@ export const BoardsView: React.FC = () => {
                         )}
                         <div className="gb-task-card__footer">
                           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                            <BotMark seed={seed} shapeId={av?.shapeId} colorId={av?.colorId} size={18} />
+                            <AnimatedBotFace seed={seed} shapeId={av?.shapeId} colorId={av?.colorId} size={22} isStatic />
                             <span className={`gb-badge ${priorityBadgeClass(task.priority)}`}>
                               {String(priorityNumber(task.priority))}
                             </span>
@@ -413,7 +414,7 @@ export const BoardsView: React.FC = () => {
                       onClick={() => void selectSession(s.id)}
                     >
                       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                        <BotMark seed={seed} shapeId={av?.shapeId} colorId={av?.colorId} size={30} />
+                        <AnimatedBotFace seed={seed} shapeId={av?.shapeId} colorId={av?.colorId} size={36} isStatic />
                         <div style={{ minWidth: 0, flex: 1 }}>
                           <div
                             style={{

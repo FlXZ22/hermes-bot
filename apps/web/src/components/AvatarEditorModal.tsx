@@ -1,13 +1,25 @@
 import React, { useEffect, useState } from "react";
 import {
   BOT_COLOR_PRESETS,
-  BOT_MARK_SHAPES,
-  BotMark,
   Modal,
   resolveBotColor,
   type GrokBotColorId,
 } from "@grok-bot/theme";
+import { AnimatedBotFace } from "./AnimatedBotFace";
+import { ALL_GROK_BOT_SHAPES, resolveGrokBotShape } from "../lib/botState";
+import type { GrokEngineState } from "../vendor/grok-face-engine";
 import { useApp } from "../state/appStore";
+
+const PREVIEW_STATES: readonly { id: GrokEngineState; label: string }[] = [
+  { id: "idle", label: "Idle" },
+  { id: "thinking", label: "Thinking" },
+  { id: "writing", label: "Writing" },
+  { id: "searching", label: "Searching" },
+  { id: "streaming", label: "Streaming" },
+  { id: "happy", label: "Happy" },
+  { id: "celebrate", label: "Celebrate" },
+  { id: "sleeping", label: "Sleeping" },
+];
 
 export const AvatarEditorModal: React.FC = () => {
   const { avatarEditorTarget, setAvatarEditorTarget, botAvatars, updateBotAvatar } = useApp();
@@ -15,14 +27,16 @@ export const AvatarEditorModal: React.FC = () => {
   const existing = botAvatars[seed];
 
   const [name, setName] = useState("");
-  const [shapeId, setShapeId] = useState<string | undefined>(undefined);
+  const [shapeId, setShapeId] = useState<string>("blob");
   const [colorId, setColorId] = useState<GrokBotColorId>("blue");
+  const [previewState, setPreviewState] = useState<GrokEngineState>("idle");
 
   useEffect(() => {
     if (!avatarEditorTarget) return;
     setName(existing?.displayName ?? avatarEditorTarget.title);
-    setShapeId(existing?.shapeId);
+    setShapeId(resolveGrokBotShape(existing?.shapeId, seed));
     setColorId(existing?.colorId ?? resolveBotColor(seed).id);
+    setPreviewState("idle");
   }, [avatarEditorTarget, existing, seed]);
 
   if (!avatarEditorTarget) return null;
@@ -40,33 +54,72 @@ export const AvatarEditorModal: React.FC = () => {
     <Modal open={Boolean(avatarEditorTarget)} title="Customize bot" onClose={() => setAvatarEditorTarget(null)}>
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 16, padding: "4px 0" }}>
-          <BotMark seed={seed} shapeId={shapeId} colorId={colorId} size={64} />
-          <div className="gb-field" style={{ flex: 1 }}>
-            <label className="gb-field__label">Display Name</label>
-            <input className="gb-input" value={name} onChange={(e) => setName(e.target.value)} />
+          <AnimatedBotFace
+            seed={seed}
+            shapeId={shapeId}
+            colorId={colorId}
+            size={72}
+            state={previewState}
+            isFollowingPointer
+            clickableSpin
+            maxFrameRate={60}
+          />
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div className="gb-field">
+              <label className="gb-field__label">Display Name</label>
+              <input className="gb-input" value={name} onChange={(e) => setName(e.target.value)} />
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+              {PREVIEW_STATES.map((st) => (
+                <button
+                  key={st.id}
+                  type="button"
+                  className={`gb-btn gb-btn--sm ${previewState === st.id ? "gb-btn--primary" : "gb-btn--ghost"}`}
+                  style={{ padding: "2px 8px", fontSize: 11 }}
+                  onClick={() => setPreviewState(st.id)}
+                >
+                  {st.label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
         <div className="gb-field">
-          <label className="gb-field__label">Shape</label>
-          <div className="gb-shape-grid">
-            {BOT_MARK_SHAPES.map((shape) => (
+          <label className="gb-field__label">Shape ({ALL_GROK_BOT_SHAPES.length})</label>
+          <div
+            className="gb-shape-grid"
+            style={{
+              gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
+              maxHeight: 220,
+              overflowY: "auto",
+              paddingRight: 2,
+            }}
+          >
+            {ALL_GROK_BOT_SHAPES.map((shape) => (
               <button
                 key={shape.id}
                 type="button"
                 className="gb-shape-btn"
                 data-active={shapeId === shape.id ? "true" : undefined}
                 onClick={() => setShapeId(shape.id)}
-                title={shape.id}
+                title={shape.label}
               >
-                <BotMark seed={seed} shapeId={shape.id} colorId={colorId} size={28} />
+                <AnimatedBotFace
+                  seed={seed}
+                  shapeId={shape.id}
+                  colorId={colorId}
+                  size={36}
+                  state="idle"
+                  isStatic
+                />
               </button>
             ))}
           </div>
         </div>
 
         <div className="gb-field">
-          <label className="gb-field__label">Color</label>
+          <label className="gb-field__label">Color ({BOT_COLOR_PRESETS.length})</label>
           <div className="gb-color-grid">
             {BOT_COLOR_PRESETS.map((preset) => (
               <button

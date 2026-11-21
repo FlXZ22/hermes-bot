@@ -1,8 +1,10 @@
 import React, { useEffect, useState } from "react";
-import { BotMark, CursorIcon } from "@grok-bot/theme";
+import { CursorIcon } from "@grok-bot/theme";
+import { AnimatedBotFace } from "./AnimatedBotFace";
 import type { HermesEnvEntry, HermesSshTarget } from "@grok-bot/hermes-client";
 import { normalizeSshTarget } from "@grok-bot/hermes-client";
 import { SshFields } from "./SshFields";
+import { UpdatesSettingsTab } from "./UpdatesSettingsTab";
 import { useApp } from "../state/appStore";
 
 export const SettingsView: React.FC = () => {
@@ -36,7 +38,7 @@ export const SettingsView: React.FC = () => {
     showToast,
   } = useApp();
 
-  const [tab, setTab] = useState<"general" | "connections" | "keys" | "profiles" | "config" | "logs">("general");
+  const [tab, setTab] = useState<"general" | "connections" | "keys" | "profiles" | "config" | "updates" | "logs">("general");
 
   const [ssh, setSsh] = useState<HermesSshTarget>(connection.ssh ?? { host: "" });
   const [savingSsh, setSavingSsh] = useState(false);
@@ -103,7 +105,7 @@ export const SettingsView: React.FC = () => {
       <div className="gb-panel__header">
         <div>
           <h2 className="gb-panel__title">Settings</h2>
-          <div className="gb-panel__sub">Appearance, connections, profiles, and preferences</div>
+          <div className="gb-panel__sub">Appearance, connections, profiles, updates, and preferences</div>
         </div>
         <div className="gb-segmented">
           {(
@@ -113,6 +115,7 @@ export const SettingsView: React.FC = () => {
               ["keys", "API Keys"],
               ["profiles", "Profiles"],
               ["config", "Config"],
+              ["updates", "Updates"],
               ["logs", "Logs"],
             ] as const
           ).map(([id, label]) => (
@@ -353,7 +356,15 @@ export const SettingsView: React.FC = () => {
                   return (
                     <div key={p.name} className="gb-row">
                       <div style={{ display: "flex", alignItems: "center", gap: 12, flex: 1 }}>
-                        <BotMark seed={p.name} shapeId={av?.shapeId} colorId={av?.colorId} size={34} />
+                        <AnimatedBotFace
+                          seed={p.name}
+                          shapeId={av?.shapeId}
+                          colorId={av?.colorId}
+                          size={36}
+                          state={activeProfile === p.name ? "idle" : "idle"}
+                          isStatic={activeProfile !== p.name}
+                          maxFrameRate={30}
+                        />
                         <div className="gb-row__info">
                           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                             <span className="gb-row__label">{av?.displayName || p.name}</span>
@@ -423,6 +434,10 @@ export const SettingsView: React.FC = () => {
                 />
               </div>
             </div>
+          )}
+
+          {tab === "updates" && (
+            <UpdatesSettingsTab isDesktop={isDesktop} showToast={showToast} />
           )}
 
           {tab === "logs" && (

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
-import { BotMark, CursorIcon } from "@grok-bot/theme";
+import { CursorIcon } from "@grok-bot/theme";
 import { HermesClient, normalizeServerUrl, normalizeSshTarget, connectionError, setNativeHttpAdapter, type HermesConnection, type HermesSshTarget } from "@grok-bot/hermes-client";
+import { AnimatedBotFace } from "./AnimatedBotFace";
 import { useApp } from "../state/appStore";
 import { tauriBridge } from "../lib/tauriBridge";
 import { SshFields } from "./SshFields";
@@ -118,9 +119,24 @@ export function WelcomeScreen() {
     <div className={`gb-welcome__stage gb-welcome__stage--${step}`}>
       {!initializing && step !== "welcome" && step !== "ready" && <button className="gb-welcome__back" disabled={!!busy} onClick={() => { setError(""); setStep(step === "remote" ? "choose" : "welcome"); }}><CursorIcon name="arrow-left" size={14} /> Back</button>}
       <div className="gb-welcome__hero" aria-hidden="true">
-        <span className="gb-welcome__friend gb-welcome__friend--one"><BotMark seed="welcome-red" colorId="red" shapeId="blob" size={42} /></span>
-        <span className="gb-welcome__hero-bot"><BotMark seed="welcome" colorId={step === "ready" ? "blue" : "black"} shapeId="blob" size={step === "welcome" ? 96 : 74} working={!!busy || initializing} /></span>
-        <span className="gb-welcome__friend gb-welcome__friend--two"><BotMark seed="welcome-cyan" colorId="cyan" shapeId="blob" size={34} /></span>
+        <span className="gb-welcome__friend gb-welcome__friend--one">
+          <AnimatedBotFace seed="welcome-red" colorId="red" shapeId="blob" size={42} state={step === "ready" ? "happy" : "idle"} isFollowingPointer maxFrameRate={60} />
+        </span>
+        <span className="gb-welcome__hero-bot">
+          <AnimatedBotFace
+            seed="welcome"
+            colorId={step === "ready" ? "blue" : "black"}
+            shapeId="blob"
+            size={step === "welcome" ? 96 : 74}
+            state={busy || initializing ? "orbit" : step === "ready" ? "celebrate" : "idle"}
+            isFollowingPointer={!busy && !initializing}
+            clickableSpin
+            maxFrameRate={60}
+          />
+        </span>
+        <span className="gb-welcome__friend gb-welcome__friend--two">
+          <AnimatedBotFace seed="welcome-cyan" colorId="cyan" shapeId="blob" size={34} state={step === "ready" ? "excited" : "idle"} isFollowingPointer maxFrameRate={60} />
+        </span>
       </div>
       <h1 ref={heading} tabIndex={-1}>{title}</h1>
       <p className="gb-welcome__subtitle">{initializing ? connectionDetail : step === "welcome" ? "A little help. A lot of possibility."
