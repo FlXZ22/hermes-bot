@@ -1,0 +1,12 @@
+import fs from 'node:fs';
+import {createHash} from 'node:crypto';
+import {parseJavaScriptSource} from '../tools/runtime/node_modules/rea-agents/dist/domain/javascript/javascriptSourceParser.js';
+import {analyzeParsedJavaScriptStaticSourceSteps} from '../tools/runtime/node_modules/rea-agents/dist/domain/javascript/javascriptStaticAnalysis.js';
+import {completeJavaScriptAnalysisSteps} from '../tools/runtime/node_modules/rea-agents/dist/application/javascript/JavaScriptAnalysisControl.js';
+const input='demo/vendor/engine.js';
+const source=fs.readFileSync(input,'utf8');
+const parsed=parseJavaScriptSource(source,input,'module');
+const facts=await completeJavaScriptAnalysisSteps(analyzeParsedJavaScriptStaticSourceSteps(source,parsed));
+const report={producer:'REA 6.10.1 static analysis library API',input,sha256:createHash('sha256').update(source).digest('hex'),reason:'CLI subprocess closed its output without a terminal response; this calls the same REA inert-source static analysis directly. This is not a complete application-graph Evidence record.',facts};
+fs.writeFileSync('evidence/rea-static-engine.json',JSON.stringify(report,null,2));
+console.log(JSON.stringify({parse_status:facts.parse_status,coverage:facts.analysis_coverage,visited_ast_nodes:facts.visited_ast_nodes,limitations:facts.limitations},null,2));

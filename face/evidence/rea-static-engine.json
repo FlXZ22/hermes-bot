@@ -1,0 +1,166 @@
+{
+  "producer": "REA 6.10.1 static analysis library API",
+  "input": "demo/vendor/engine.js",
+  "sha256": "a0b29b44f37bee76a13dc4ca5f72c8858f8140cfb6129c006ab6bc98ca321827",
+  "reason": "CLI subprocess closed its output without a terminal response; this calls the same REA inert-source static analysis directly. This is not a complete application-graph Evidence record.",
+  "facts": {
+    "parse_status": "partial",
+    "analysis_coverage": {
+      "syntax": {
+        "status": "complete",
+        "error_count": 0
+      },
+      "semantics": {
+        "unknown_findings": 2,
+        "uncertainty": [
+          "dynamic-findings",
+          "returned-reference-widening"
+        ]
+      },
+      "examination": {
+        "status": "limited",
+        "semantic_resource_limits": [
+          "alias-selections"
+        ],
+        "electron_call_paths_limited": false,
+        "controls": [
+          {
+            "control_kind": "parameter",
+            "parameter": "semantic_precision.alias_selections",
+            "effective_value": 512,
+            "unit": "count",
+            "minimum": 1,
+            "maximum": 9007199254740991,
+            "default_value": 512,
+            "applies_at": "next_call"
+          }
+        ]
+      },
+      "applicability": {
+        "electron": "unknown"
+      }
+    },
+    "parse_error_count": 0,
+    "visited_ast_nodes": 70378,
+    "references": [
+      {
+        "kind": "require",
+        "operation": "load",
+        "specifier": null,
+        "expression": "n.outline.map((n,r)=>{let i=0,a=0;for(let{outline:t,weight:n}of e)i+=t[r][0]*n,a+=t[r][1]*n;return[i/t,a/t]})",
+        "module_key": null,
+        "location": {
+          "start": {
+            "line": 590,
+            "column": 82
+          },
+          "end": {
+            "line": 590,
+            "column": 191
+          }
+        }
+      }
+    ],
+    "endpoints": [
+      {
+        "kind": "network",
+        "value": "expression",
+        "mechanism": "call:t.get",
+        "interpretation": "candidate",
+        "module_key": null,
+        "location": {
+          "start": {
+            "line": 140,
+            "column": 176
+          },
+          "end": {
+            "line": 140,
+            "column": 195
+          }
+        }
+      }
+    ],
+    "routes": {
+      "candidates": [],
+      "unresolved": [
+        {
+          "mechanism": "navigation-target",
+          "location": {
+            "start": {
+              "line": 558,
+              "column": 467
+            },
+            "end": {
+              "line": 558,
+              "column": 474
+            }
+          },
+          "reason": "The recognized navigation destination is not a supported literal."
+        },
+        {
+          "mechanism": "navigation-target",
+          "location": {
+            "start": {
+              "line": 558,
+              "column": 674
+            },
+            "end": {
+              "line": 558,
+              "column": 681
+            }
+          },
+          "reason": "The recognized navigation destination is not a supported literal."
+        },
+        {
+          "mechanism": "navigation-target",
+          "location": {
+            "start": {
+              "line": 558,
+              "column": 815
+            },
+            "end": {
+              "line": 558,
+              "column": 822
+            }
+          },
+          "reason": "The recognized navigation destination is not a supported literal."
+        },
+        {
+          "mechanism": "navigation-target",
+          "location": {
+            "start": {
+              "line": 558,
+              "column": 1054
+            },
+            "end": {
+              "line": 558,
+              "column": 1061
+            }
+          },
+          "reason": "The recognized navigation destination is not a supported literal."
+        }
+      ],
+      "capacity": null
+    },
+    "storage": [],
+    "bundler_registrations": [],
+    "role_paths": [],
+    "source_map_urls": [],
+    "vendors": [],
+    "electron": {
+      "browser_windows": [],
+      "context_bridge_apis": [],
+      "ipc": [],
+      "sender_validations": [],
+      "utility_processes": [],
+      "native_addon_bindings": [],
+      "protocols": []
+    },
+    "limitations": [
+      "Alias selection expansion was conservatively bounded (maximum 512 additional selector states); selected paths remain unknown. Semantic alias-selections budget reached: semantic_precision.alias_selections=512 additional selector states (default 512). Increase semantic_precision.alias_selections on the next analysis call (analyze_javascript_application or analyze_web_bundle); no REA restart is required. Worker memory, transfer and graph-retention limits remain independent. Cyclic or unsupported evaluations remain unknown regardless of budget.",
+      "Local returned-reference projections were conservatively widened; effects include additional source-local candidates.",
+      "One or more static keys, expressions, or Electron boundary values were dynamic and remain unknown.",
+      "JavaScript syntax was parsed as data and was never evaluated."
+    ]
+  }
+}

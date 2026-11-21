@@ -1,0 +1,1 @@
+{"name":"grokbot-face-review","private":true,"type":"module","scripts":{"start":"node scripts/serve.mjs","test":"node scripts/verify-engine.mjs","build":"node scripts/build.mjs"}}

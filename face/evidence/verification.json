@@ -1,0 +1,16 @@
+{
+  "result": "pass",
+  "sourceSha256": "77e626ca2ab064adb8bc45453d07ee3013bacdc66095df0dfa5ff643672ec055",
+  "unchangedDeclarations": 756,
+  "frameChecks": 80344,
+  "svgChecks": 3000,
+  "scenarios": 457,
+  "coverage": {
+    "states": 53,
+    "clips": 28,
+    "expressions": 9,
+    "bodies": 26,
+    "morphs": 13
+  },
+  "scope": "Differential evaluation of recovered declarations versus the complete original shipped common bundle. This does not compare the authenticated full desktop UI."
+}
