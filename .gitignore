@@ -12,3 +12,4 @@ analysis/rea-*-verification
 analysis/rea-*-evidence.json
 *.deb
 tools/rea/
+face/
