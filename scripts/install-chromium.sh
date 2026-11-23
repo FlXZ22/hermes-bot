@@ -26,6 +26,25 @@ cp -a "$renderer" "$stage/resources/renderer"
 install -m755 "$native" "$stage/resources/hermes-native"
 icon="$project_dir/packages/grok-bot-theme/assets/icons/grok-bot-256.png"
 install -m644 "$icon" "$stage/resources/icon.png"
+
+commit_full="$(git -C "$project_dir" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+commit_short="$(git -C "$project_dir" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown')"
+branch_name="$(git -C "$project_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'main')"
+built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+app_version="$(node -e "console.log(require(process.argv[1]).version || '1.0.0')" "$project_dir/package.json" 2>/dev/null || printf '1.0.0')"
+native_commit="${HERMES_NATIVE_COMMIT:-$commit_full}"
+cat > "$stage/resources/release-meta.json" <<META
+{
+  "version": "$app_version",
+  "commit": "$commit_full",
+  "shortCommit": "$commit_short",
+  "branch": "$branch_name",
+  "builtAt": "$built_at",
+  "nativeCommit": "$native_commit",
+  "host": "chromium"
+}
+META
+
 mv -T "$stage" "$release"
 stage=""
 

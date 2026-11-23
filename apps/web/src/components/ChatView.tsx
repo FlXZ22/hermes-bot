@@ -2,8 +2,9 @@ import { UsageBar } from "./UsageBar";
 import { AnimatedBotFace } from "./AnimatedBotFace";
 import { ChatTranscript } from "./ChatTranscript";
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { BotMark, CursorIcon, resolveBotColor } from "@grok-bot/theme";
+import { CursorIcon, resolveBotColor } from "@grok-bot/theme";
 import { useApp, useChatSlice, type ReasoningEffort } from "../state/appStore";
+import { useDerivedBotState } from "../lib/botState";
 import { shortModelName } from "../lib/format";
 import { tauriBridge } from "../lib/tauriBridge";
 
@@ -86,6 +87,19 @@ export const ChatView: React.FC = () => {
   const loadingHistory = useChatSlice(chat => chat.loadingHistory);
   const hasMessages = useChatSlice(chat => chat.messages.length > 0);
   const isStreaming = useChatSlice(chat => chat.isStreaming);
+  const liveStatusText = useChatSlice(chat => chat.liveStatusText);
+  const activeToolName = useChatSlice(chat => chat.activeToolName);
+  const hasStreamedText = useChatSlice(chat => chat.hasStreamedText);
+  const awaitingUserResponse = useChatSlice(chat => chat.awaitingUserResponse);
+  const lastTurnSettlement = useChatSlice(chat => chat.lastTurnSettlement);
+  const botState = useDerivedBotState({
+    isStreaming,
+    hasStreamedText,
+    activeToolName,
+    liveStatusText,
+    awaitingUserResponse,
+    lastTurnSettlement,
+  });
   const sessionUsage = useChatSlice(chat => chat.sessionUsage);
   const draftKey = `${connection.id}:${connection.id.startsWith("local-") ? "local" : connection.url}:${activeProfile}:${activeSessionId ?? "new"}`;
   const [drafts, setDrafts] = useState<Record<string, string>>(() => {
@@ -253,7 +267,7 @@ export const ChatView: React.FC = () => {
         <div className="gb-chat-header__left">
           {editingTitle && activeSessionId ? (
             <div className="gb-title-pill">
-              <BotMark seed={botSeed} shapeId={botAv?.shapeId} colorId={botAv?.colorId} size={20} />
+              <AnimatedBotFace seed={botSeed} shapeId={botAv?.shapeId} colorId={botAv?.colorId} size={24} state={botState} maxFrameRate={60} />
               <input
                 className="gb-input"
                 style={{ width: 220, padding: "2px 7px", fontSize: 13 }}
@@ -292,8 +306,9 @@ export const ChatView: React.FC = () => {
                 seed={botSeed}
                 shapeId={botAv?.shapeId}
                 colorId={botAv?.colorId}
-                size={20}
-                working={isStreaming}
+                size={24}
+                state={botState}
+                maxFrameRate={60}
               />
               <span className="gb-title-pill__name">
                 {activeSession?.title || botAv?.displayName || (activeProfile === "default" ? "Hermes" : activeProfile)}
@@ -355,7 +370,15 @@ export const ChatView: React.FC = () => {
             title="Customize Bot Avatar"
             style={{ borderRadius: 28, padding: 6 }}
           >
-            <AnimatedBotFace seed={botSeed} shapeId={botAv?.shapeId} colorId={botAv?.colorId} size={76} />
+            <AnimatedBotFace
+              seed={botSeed}
+              shapeId={botAv?.shapeId}
+              colorId={botAv?.colorId}
+              size={72}
+              state={botState}
+              isFollowingPointer
+              maxFrameRate={60}
+            />
           </button>
           <h1 className="gb-welcome__title">
             {botAv?.displayName || (activeProfile === "default" ? "Hermes" : activeProfile)}

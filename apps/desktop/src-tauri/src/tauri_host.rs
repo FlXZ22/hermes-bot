@@ -252,6 +252,50 @@ fn window_start_drag(window: Window) -> Result<(), String> {
     window.start_dragging().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn get_update_status(
+    updater: State<'_, super::updater::AppUpdater>,
+) -> Result<super::updater::UpdateStatus, String> {
+    Ok(updater.status())
+}
+
+#[tauri::command]
+async fn check_for_updates(
+    updater: State<'_, super::updater::AppUpdater>,
+) -> Result<super::updater::UpdateStatus, String> {
+    updater.check_for_updates().await
+}
+
+#[tauri::command]
+fn set_update_settings(
+    updater: State<'_, super::updater::AppUpdater>,
+    patch: super::updater::UpdateSettingsPatch,
+) -> Result<super::updater::UpdateStatus, String> {
+    updater.update_settings(patch)
+}
+
+#[tauri::command]
+fn apply_app_update(
+    updater: State<'_, super::updater::AppUpdater>,
+    mode: String,
+    force_native_rebuild: bool,
+) -> Result<super::updater::UpdateStatus, String> {
+    updater.apply_update(mode, force_native_rebuild)
+}
+
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    std::process::Command::new(exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to relaunch app: {e}"))?;
+    app.exit(0);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let supervisor = HermesSupervisor::new();
@@ -263,6 +307,7 @@ pub fn run() {
         .manage(supervisor)
         .manage(terminals)
         .manage(remote::RemoteLogin::default())
+        .manage(super::updater::AppUpdater::new())
         .setup(move |app| {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.set_title("Hermes");
@@ -302,6 +347,11 @@ pub fn run() {
             window_toggle_maximize,
             window_close,
             window_start_drag,
+            get_update_status,
+            check_for_updates,
+            set_update_settings,
+            apply_app_update,
+            restart_app,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Hermes Grok Bot Tauri application");

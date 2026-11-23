@@ -1,5 +1,7 @@
 import React, { useMemo, useState } from "react";
-import { BotMark, CursorIcon, Modal, resolveBotColor, type CursorIconName } from "@grok-bot/theme";
+import { CursorIcon, Modal, resolveBotColor, type CursorIconName } from "@grok-bot/theme";
+import { AnimatedBotFace } from "./AnimatedBotFace";
+import { useDerivedBotState } from "../lib/botState";
 import { useApp, useChatSlice, type AppViewId } from "../state/appStore";
 import { tauriBridge } from "../lib/tauriBridge";
 import { formatRelativeTime } from "../lib/format";
@@ -52,6 +54,19 @@ export const Sidebar: React.FC = () => {
   } = useApp();
 
   const isStreaming = useChatSlice(chat => chat.isStreaming);
+  const liveStatusText = useChatSlice(chat => chat.liveStatusText);
+  const activeToolName = useChatSlice(chat => chat.activeToolName);
+  const hasStreamedText = useChatSlice(chat => chat.hasStreamedText);
+  const awaitingUserResponse = useChatSlice(chat => chat.awaitingUserResponse);
+  const lastTurnSettlement = useChatSlice(chat => chat.lastTurnSettlement);
+  const activeBotState = useDerivedBotState({
+    isStreaming,
+    hasStreamedText,
+    activeToolName,
+    liveStatusText,
+    awaitingUserResponse,
+    lastTurnSettlement,
+  });
   const [newBotOpen, setNewBotOpen] = useState(false);
   const [botName, setBotName] = useState("");
   const [botDescription, setBotDescription] = useState("");
@@ -61,6 +76,8 @@ export const Sidebar: React.FC = () => {
   const [showArchived, setShowArchived] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [hoveredBot, setHoveredBot] = useState<string | null>(null);
+  const [hoveredSession, setHoveredSession] = useState<string | null>(null);
   const [newBoardOpen, setNewBoardOpen] = useState(false);
   const [boardName, setBoardName] = useState("");
   const [boardDesc, setBoardDesc] = useState("");
@@ -122,6 +139,9 @@ export const Sidebar: React.FC = () => {
     const assignedBoardSlug = sessionBoards[s.id] ?? s.board_slug;
     const assignedBoard = boards.find((b) => b.slug === assignedBoardSlug);
 
+    const isHovered = hoveredSession === s.id;
+    const activeShouldAnimate = isHovered || activeBotState !== "idle";
+
     return (
       <div
         key={s.id}
@@ -129,6 +149,8 @@ export const Sidebar: React.FC = () => {
         data-active={isActive ? "true" : undefined}
         role="button"
         tabIndex={0}
+        onPointerEnter={() => setHoveredSession(s.id)}
+        onPointerLeave={() => setHoveredSession((cur) => (cur === s.id ? null : cur))}
         onClick={() => {
           if (renamingId !== s.id) void selectSession(s.id);
         }}
@@ -136,14 +158,40 @@ export const Sidebar: React.FC = () => {
           if (e.key === "Enter" && renamingId !== s.id) void selectSession(s.id);
         }}
       >
-        <BotMark
-          seed={seed}
-          shapeId={av?.shapeId}
-          colorId={av?.colorId}
-          size={sidebarCollapsed ? 32 : 34}
-          working={isWorking}
-          title={s.title || "Untitled session"}
-        />
+        {isActive ? (
+          <AnimatedBotFace
+            seed={seed}
+            shapeId={av?.shapeId}
+            colorId={av?.colorId}
+            size={sidebarCollapsed ? 22 : 36}
+            state={activeBotState}
+            isPaused={!activeShouldAnimate}
+            isFollowingPointer={isHovered}
+            maxFrameRate={30}
+          />
+        ) : s.archived ? (
+          <AnimatedBotFace
+            seed={seed}
+            shapeId={av?.shapeId}
+            colorId="gray"
+            size={sidebarCollapsed ? 22 : 24}
+            state="sleeping"
+            isPaused
+            isStatic
+          />
+        ) : (
+          <AnimatedBotFace
+            seed={seed}
+            shapeId={av?.shapeId}
+            colorId={av?.colorId}
+            size={sidebarCollapsed ? 22 : 36}
+            state="idle"
+            isPaused={!isHovered}
+            isStatic={!isHovered}
+            isFollowingPointer={isHovered}
+            maxFrameRate={30}
+          />
+        )}
 
         {!sidebarCollapsed && (
           <div className="gb-agent-row__body">
@@ -367,6 +415,9 @@ export const Sidebar: React.FC = () => {
                 {profiles.map((prof) => {
                   const av = botAvatars[prof.name];
                   const active = activeProfile === prof.name;
+                  const isHovered = hoveredBot === prof.name;
+                  const tileState = active ? activeBotState : "idle";
+                  const shouldAnimate = isHovered || tileState !== "idle";
                   return (
                     <button
                       key={prof.name}
@@ -375,6 +426,8 @@ export const Sidebar: React.FC = () => {
                       data-active={active ? "true" : undefined}
                       disabled={profileSwitching}
                       aria-pressed={active}
+                      onPointerEnter={() => setHoveredBot(prof.name)}
+                      onPointerLeave={() => setHoveredBot((cur) => (cur === prof.name ? null : cur))}
                       onClick={() => void setActiveProfile(prof.name)}
                       onContextMenu={(e) => {
                         e.preventDefault();
@@ -385,13 +438,15 @@ export const Sidebar: React.FC = () => {
                       }}
                       title={`${prof.name} — right-click to customize Grok Bot avatar`}
                     >
-                      <BotMark
+                      <AnimatedBotFace
                         seed={prof.name}
                         shapeId={av?.shapeId}
                         colorId={av?.colorId}
-                        size={40}
-                        working={active && isStreaming}
-                        title={prof.name}
+                        size={50}
+                        state={tileState}
+                        isPaused={!shouldAnimate}
+                        isFollowingPointer={isHovered}
+                        maxFrameRate={30}
                       />
                       <span className="gb-pinned-tile__label">
                         {av?.displayName || (prof.name === "default" ? "Hermes" : prof.name)}

@@ -1,7 +1,10 @@
 import type { ChatSnapshot } from "../state/chatStore";
 import React, { memo, useEffect, useCallback, useDeferredValue, useId, useMemo, useRef, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
-import { ApprovalCard, BotMark, ClarifyCard, CursorIcon } from "@grok-bot/theme";
+import { ApprovalCard, ClarifyCard, CursorIcon } from "@grok-bot/theme";
+import { AnimatedBotFace } from "./AnimatedBotFace";
+import { useDerivedBotState } from "../lib/botState";
+import type { GrokEngineState } from "../vendor/grok-face-engine";
 import type { HermesMessage, HermesToolCall } from "@grok-bot/hermes-client";
 import { useApp, useChatMessage, useChatSlice } from "../state/appStore";
 import { CodeBlock, MarkdownBody } from "../lib/markdown";
@@ -134,16 +137,18 @@ const components = { Header: TranscriptHeader, Footer: TranscriptFooter };
 
 // Separate boundary: typing a draft never reconciles the message list.
 type TranscriptProps = Pick<ChatSnapshot, "todos" | "isStreaming" | "liveStatusText"> & {
+  botState?: GrokEngineState;
   messages?: HermesMessage[];
   messageIds?: string[];
   firstItemIndex?: number;
   loadOlder?: () => Promise<void>;
   loadingHistory?: boolean;
 } & Pick<ReturnType<typeof useApp>, "activeProfile" | "activeSession" | "botAvatars" | "respondApproval" | "respondClarify">;
-export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, messageIds, firstItemIndex = 0, loadOlder, loadingHistory, todos, isStreaming, liveStatusText, activeProfile, activeSession,
+export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, messageIds, firstItemIndex = 0, loadOlder, loadingHistory, todos, isStreaming, liveStatusText, botState, activeProfile, activeSession,
     botAvatars, respondApproval, respondClarify }: TranscriptProps) {
   const botSeed = activeSession?.profile || activeProfile || "default";
   const botAv = botAvatars[botSeed];
+  const resolvedBotState: GrokEngineState = botState ?? (isStreaming ? "thinking" : "idle");
   const scroller = useRef<HTMLElement | null>(null);
   const setScroller = useCallback((element: HTMLElement | Window | null) => {
     scroller.current = element instanceof HTMLElement ? element : null;
@@ -214,7 +219,14 @@ export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, m
   const pending = <>
     {isStreaming && (
       <div className="gb-pending">
-        <BotMark seed={botSeed} shapeId={botAv?.shapeId} colorId={botAv?.colorId} size={22} working />
+        <AnimatedBotFace
+          seed={botSeed}
+          shapeId={botAv?.shapeId}
+          colorId={botAv?.colorId}
+          size={28}
+          state={resolvedBotState}
+          maxFrameRate={60}
+        />
         <span className="gb-pending__label">
           <span>{liveStatusText || "Hermes is thinking"}</span>
           <span className="gb-typing-dots">
@@ -264,8 +276,20 @@ export const ChatTranscript = memo(function ChatTranscript() {
   const todos = useChatSlice(chat => chat.todos);
   const isStreaming = useChatSlice(chat => chat.isStreaming);
   const liveStatusText = useChatSlice(chat => chat.liveStatusText);
+  const activeToolName = useChatSlice(chat => chat.activeToolName);
+  const hasStreamedText = useChatSlice(chat => chat.hasStreamedText);
+  const awaitingUserResponse = useChatSlice(chat => chat.awaitingUserResponse);
+  const lastTurnSettlement = useChatSlice(chat => chat.lastTurnSettlement);
+  const botState = useDerivedBotState({
+    isStreaming,
+    hasStreamedText,
+    activeToolName,
+    liveStatusText,
+    awaitingUserResponse,
+    lastTurnSettlement,
+  });
   return <ChatTranscriptView messageIds={messageIds} firstItemIndex={firstItemIndex}
     loadOlder={hasOlder ? loadOlderMessages : undefined} loadingHistory={loadingHistory} todos={todos} isStreaming={isStreaming}
-    liveStatusText={liveStatusText} activeProfile={activeProfile} activeSession={activeSession}
+    liveStatusText={liveStatusText} botState={botState} activeProfile={activeProfile} activeSession={activeSession}
     botAvatars={botAvatars} respondApproval={respondApproval} respondClarify={respondClarify} />;
 });

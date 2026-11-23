@@ -155,6 +155,51 @@ export interface NativeTokenSet {
   provider?: string;
 }
 
+export type AppUpdatePhase =
+  | "idle"
+  | "checking"
+  | "up_to_date"
+  | "available"
+  | "updating"
+  | "restart_required"
+  | "error";
+
+export interface AppUpdateStatus {
+  currentVersion: string;
+  currentCommit: string;
+  currentFullCommit: string;
+  nativeCommit: string;
+  builtAt: string;
+  host: string;
+  repoPath: string | null;
+  repoValid: boolean;
+  repoDirty: boolean;
+  currentBranch: string;
+  targetBranch: string;
+  availableBranches: string[];
+  githubRepo: string;
+  autoCheck: boolean;
+  phase: AppUpdatePhase;
+  updateAvailable: boolean;
+  commitsBehind: number;
+  latestCommit: string | null;
+  latestCommitMessage: string | null;
+  latestCommitDate: string | null;
+  rustRebuildNeeded: boolean;
+  latestReleaseTag: string | null;
+  latestReleaseUrl: string | null;
+  step: string | null;
+  logs: string[];
+  lastCheckedAt: string | null;
+  error: string | null;
+}
+
+export interface AppUpdateSettingsPatch {
+  targetBranch?: string;
+  repoPath?: string;
+  autoCheck?: boolean;
+}
+
 export const tauriBridge = {
   terminalStart: (id: string, cwd: string, cols: number, rows: number, ssh: HermesSshTarget | undefined, onEvent: (event: TerminalEvent) => void): Promise<TerminalInfo> => {
     const chromium = getChromiumDesktop();
@@ -234,6 +279,21 @@ export const tauriBridge = {
 
   getLinuxSystemStats: (): Promise<LinuxSystemStats> =>
     invoke<LinuxSystemStats>("get_linux_system_stats"),
+
+  getUpdateStatus: (): Promise<AppUpdateStatus> =>
+    invoke<AppUpdateStatus>("get_update_status"),
+
+  checkForUpdates: (): Promise<AppUpdateStatus> =>
+    invoke<AppUpdateStatus>("check_for_updates"),
+
+  setUpdateSettings: (patch: AppUpdateSettingsPatch): Promise<AppUpdateStatus> =>
+    invoke<AppUpdateStatus>("set_update_settings", { patch }),
+
+  applyAppUpdate: (mode: "remote" | "local", forceNativeRebuild = false): Promise<AppUpdateStatus> =>
+    invoke<AppUpdateStatus>("apply_app_update", { mode, forceNativeRebuild }),
+
+  restartApp: (): Promise<void> =>
+    invoke<void>("restart_app"),
 
   windowMinimize: (): Promise<void> => invoke<void>("window_minimize").catch(() => undefined),
   windowToggleMaximize: (): Promise<void> => invoke<void>("window_toggle_maximize").catch(() => undefined),

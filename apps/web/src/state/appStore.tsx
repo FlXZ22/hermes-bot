@@ -502,6 +502,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     if (event.type === "text.delta" || event.type === "thinking.delta") {
+      if (event.type === "thinking.delta") {
+        targetChat.patch(targetSid, { isStreaming: true, hasStreamedText: false, activeToolName: null });
+      }
       targetChat.buffer(targetSid, event.delta, event.type === "text.delta" ? "text" : "thinking");
       return;
     }
@@ -511,7 +514,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (event.type === "todo.updated") targetChat.patch(targetSid, { todos: event.todos });
 
     if (event.type === "message.start") {
-      targetChat.patch(targetSid, { isStreaming: true });
+      targetChat.patch(targetSid, {
+        isStreaming: true,
+        hasStreamedText: false,
+        activeToolName: null,
+        lastTurnSettlement: null,
+      });
       targetChat.updateMessages(targetSid, messages => messages.some(message => message.streaming)
         ? messages : [...messages, newAssistant()]);
     }
@@ -522,7 +530,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     if (event.type === "message.complete" || event.type === "error") {
-      targetChat.finish(targetSid, event.type === "message.complete" ? event.content : undefined);
+      targetChat.finish(
+        targetSid,
+        event.type === "message.complete" ? event.content : undefined,
+        undefined,
+        event.type === "error" ? "error" : "success",
+      );
       if (event.type === "error") {
         if (targetChat === currentChat.current) showToast(event.message);
         targetChat.updateMessages(targetSid, messages => [
@@ -532,7 +545,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     if (event.type === "tool.start") {
-      targetChat.patch(targetSid, { isStreaming: true, liveStatusText: `Running ${event.toolCall.name}…` });
+      targetChat.patch(targetSid, {
+        isStreaming: true,
+        activeToolName: event.toolCall.name,
+        hasStreamedText: false,
+        liveStatusText: `Running ${event.toolCall.name}…`,
+      });
       targetChat.updateMessages(targetSid, messages => {
         const index = lastMessageIndex(messages, message => Boolean(message.streaming));
         if (index < 0) return [...messages, newAssistant({ toolCalls: [event.toolCall] })];
@@ -544,7 +562,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     if (event.type === "tool.progress" || event.type === "tool.end") {
-      if (event.type === "tool.end") targetChat.patch(targetSid, { liveStatusText: "" });
+      if (event.type === "tool.end") {
+        targetChat.patch(targetSid, { liveStatusText: "", activeToolName: null });
+      }
       const matches = (tool: NonNullable<HermesMessage["toolCalls"]>[number]) =>
         event.toolCallId ? tool.id === event.toolCallId : tool.status === "running";
       targetChat.updateMessages(targetSid, messages => {
@@ -567,6 +587,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const approval = event.type === "approval.request" ? event.approval : undefined;
       const clarify = event.type === "clarify.request" ? event.clarify : undefined;
       const id = approval ? `appr-${approval.id}` : `clarify-${clarify!.id}`;
+      targetChat.patch(targetSid, { awaitingUserResponse: true });
       targetChat.updateMessages(targetSid, messages => messages.some(message => message.id === id)
         ? messages : [...messages, newAssistant({ id, approval, clarify, streaming: false })]);
     }
@@ -581,6 +602,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
         return message;
       }));
+      const remainingPending = targetChat.get(targetSid).messages.some(
+        (m) => (m.approval && !m.approval.settled) || (m.clarify && !m.clarify.answered),
+      );
+      targetChat.patch(targetSid, { awaitingUserResponse: remainingPending });
     }
   }, [showToast]);
 
@@ -1477,8 +1502,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       // Live WebSocket JSON-RPC submit
       if (realtime?.isConnected()) {
-        chat.patch(sid, { isStreaming: true });
-        chat.patch(sid, { liveStatusText: "Thinking..." });
+        chat.patch(sid, {
+          isStreaming: true,
+          hasStreamedText: false,
+          activeToolName: null,
+          lastTurnSettlement: null,
+          liveStatusText: "Thinking...",
+        });
         try {
           let liveSid = chat.liveIds[sid];
           if (!liveSid && !sid.startsWith("session_")) {

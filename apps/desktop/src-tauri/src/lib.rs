@@ -4,6 +4,7 @@ mod workspace;
 mod remote;
 mod ssh;
 mod terminal;
+pub mod updater;
 #[cfg(feature = "tauri-host")]
 mod tauri_host;
 #[cfg(feature = "tauri-host")]
