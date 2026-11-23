@@ -3,6 +3,7 @@ import React, { memo, useEffect, useCallback, useDeferredValue, useId, useMemo, 
 import { Virtuoso } from "react-virtuoso";
 import { ApprovalCard, ClarifyCard, CursorIcon } from "@grok-bot/theme";
 import { AnimatedBotFace } from "./AnimatedBotFace";
+import { describeTool } from "../lib/toolActivity";
 import { useDerivedBotState } from "../lib/botState";
 import type { GrokEngineState } from "../vendor/grok-face-engine";
 import type { HermesMessage, HermesToolCall } from "@grok-bot/hermes-client";
@@ -22,11 +23,14 @@ const ToolPayload = memo(function ToolPayload({ value, label }: { value: unknown
 const ToolActivityCard = memo(function ToolActivityCard({ tool }: { tool: HermesToolCall }) {
   const [open, setOpen] = useState(false);
   const bodyId = useId();
-  return <div className="gb-tool-card">
+  const activity = useMemo(() => describeTool(tool), [tool.name, tool.arguments, tool.preview, tool.status]);
+  return <div className="gb-tool-card" data-state={tool.status}>
     <button type="button" className="gb-tool-card__header" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen(v => !v)}>
-      <CursorIcon name={tool.status === "running" ? "spinner" : tool.status === "error" ? "x-circle" : "check-circle"} size={14} spin={tool.status === "running"} />
-      <span className="gb-tool-card__name">{tool.status === "running" ? "Using" : "Used"} {tool.name}</span>
-      <span className="gb-tool-card__detail">{tool.status === "error" ? "Failed" : tool.preview || (tool.status === "running" ? "Running…" : "Completed")}</span>
+      <CursorIcon name={activity.icon} size={16} />
+      <span className="gb-tool-card__name">{activity.label}</span>
+      <span className="gb-tool-card__detail">{activity.detail}</span>
+      {tool.status === "error" && <span className="gb-activity-error">Failed</span>}
+      {tool.status === "running" && <span className="gb-activity-running">Running</span>}
       {tool.durationMs != null && <span className="gb-tool-duration">{(tool.durationMs / 1000).toFixed(1)}s</span>}
       <CursorIcon name={open ? "chevron-down" : "chevron-right"} size={12} />
     </button>
@@ -38,21 +42,48 @@ const ToolActivityCard = memo(function ToolActivityCard({ tool }: { tool: Hermes
   </div>;
 });
 
-const ThinkingDisclosure = memo(function ThinkingDisclosure({ text, streaming }: { text: string; streaming?: boolean }) {
+type ActivityAvatar = Pick<React.ComponentProps<typeof AnimatedBotFace>, "seed" | "shapeId" | "colorId">;
+
+const ToolActivityGroup = memo(function ToolActivityGroup({ tools, streaming, avatar }: {
+  tools: HermesToolCall[]; streaming?: boolean; avatar: ActivityAvatar;
+}) {
+  const [open, setOpen] = useState(true);
+  const bodyId = useId();
+  const active = streaming ? tools.reduce<HermesToolCall | undefined>((last, tool) => tool.status === "running" ? tool : last, undefined) : undefined;
+  const summary = useMemo(() => {
+    const labels = [...new Set(tools.map(tool => {
+      const activity = describeTool(tool);
+      return `${activity.past} ${activity.state === "running" ? "commands" : activity.state === "reading" || activity.state === "writing" ? "files" : activity.state === "searching" ? "sources" : "tools"}`;
+    }))];
+    return labels.join(", ");
+  }, [tools]);
+  const activity = active ? describeTool(active) : undefined;
+  return <div className="gb-activity-group">
+    <button type="button" className="gb-activity-summary" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen(value => !value)}>
+      {activity ? <AnimatedBotFace {...avatar} state={activity.state} size={22} maxFrameRate={30} /> : <CursorIcon name="layers" size={16} />}
+      <span className="gb-activity-summary__text">{activity ? `${activity.active} ${activity.detail}` : summary}</span>
+      <CursorIcon name={open ? "chevron-down" : "chevron-right"} size={12} />
+    </button>
+    {open && <div id={bodyId} className="gb-activity-rows">{tools.map(tool => <ToolActivityCard key={tool.id} tool={tool} />)}</div>}
+  </div>;
+});
+
+const ThinkingDisclosure = memo(function ThinkingDisclosure({ text, streaming, avatar }: { text: string; streaming?: boolean; avatar: ActivityAvatar }) {
   const [open, setOpen] = useState(false);
   const bodyId = useId();
   if (!text) return null;
   return <div className="gb-thinking-card">
     <button type="button" className="gb-thinking-card__head" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen(v => !v)}>
-      <CursorIcon name={streaming ? "spinner" : "brain"} size={13} spin={Boolean(streaming)} />
+      {streaming ? <AnimatedBotFace {...avatar} state="thinking" size={22} maxFrameRate={30} /> : <CursorIcon name="brain" size={16} />}
       <span>{streaming ? "Thinking…" : "Thought process"}</span>
-      <CursorIcon name={open ? "chevron-down" : "chevron-right"} size={12} style={{ marginLeft: "auto" }} />
+      <CursorIcon name={open ? "chevron-down" : "chevron-right"} size={12} />
     </button>
     {open && <div id={bodyId} className="gb-thinking-card__body"><MarkdownBody content={text} streaming={streaming} /></div>}
   </div>;
 });
 
-const MessageItem = memo(function MessageItem({ msg, respondApproval, respondClarify }: {
+const MessageItem = memo(function MessageItem({ msg, respondApproval, respondClarify, avatar }: {
+  avatar: ActivityAvatar;
   msg: HermesMessage;
   respondApproval: ReturnType<typeof useApp>["respondApproval"];
   respondClarify: ReturnType<typeof useApp>["respondClarify"];
@@ -72,14 +103,10 @@ const MessageItem = memo(function MessageItem({ msg, respondApproval, respondCla
 
   return (
     <div key={msg.id} className="gb-entry gb-entry--assistant" style={{ gap: 8 }}>
-      {msg.thinking ? <ThinkingDisclosure text={msg.thinking} streaming={msg.streaming} /> : null}
+      {msg.thinking ? <ThinkingDisclosure text={msg.thinking} streaming={msg.streaming && !msg.content && !msg.toolCalls?.some(tool => tool.status === "running")} avatar={avatar} /> : null}
 
       {msg.toolCalls && msg.toolCalls.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, width: "100%" }}>
-          {msg.toolCalls.map((tc) => (
-            <ToolActivityCard key={tc.id} tool={tc} />
-          ))}
-        </div>
+        <ToolActivityGroup tools={msg.toolCalls} streaming={msg.streaming} avatar={avatar} />
       )}
 
       {msg.approval && (
@@ -126,7 +153,7 @@ const MessageItem = memo(function MessageItem({ msg, respondApproval, respondCla
 
 });
 
-const SubscribedMessage = memo(function SubscribedMessage({ id, ...actions }: Pick<React.ComponentProps<typeof MessageItem>, "respondApproval" | "respondClarify"> & { id: string }) {
+const SubscribedMessage = memo(function SubscribedMessage({ id, ...actions }: Pick<React.ComponentProps<typeof MessageItem>, "respondApproval" | "respondClarify" | "avatar"> & { id: string }) {
   const msg = useChatMessage(id);
   return msg ? <MessageItem msg={msg} {...actions} /> : null;
 });
@@ -138,16 +165,18 @@ const components = { Header: TranscriptHeader, Footer: TranscriptFooter };
 // Separate boundary: typing a draft never reconciles the message list.
 type TranscriptProps = Pick<ChatSnapshot, "todos" | "isStreaming" | "liveStatusText"> & {
   botState?: GrokEngineState;
+  hasInlineActivity?: boolean;
   messages?: HermesMessage[];
   messageIds?: string[];
   firstItemIndex?: number;
   loadOlder?: () => Promise<void>;
   loadingHistory?: boolean;
 } & Pick<ReturnType<typeof useApp>, "activeProfile" | "activeSession" | "botAvatars" | "respondApproval" | "respondClarify">;
-export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, messageIds, firstItemIndex = 0, loadOlder, loadingHistory, todos, isStreaming, liveStatusText, botState, activeProfile, activeSession,
+export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, messageIds, firstItemIndex = 0, loadOlder, loadingHistory, todos, isStreaming, liveStatusText, botState, hasInlineActivity, activeProfile, activeSession,
     botAvatars, respondApproval, respondClarify }: TranscriptProps) {
   const botSeed = activeSession?.profile || activeProfile || "default";
   const botAv = botAvatars[botSeed];
+  const avatar = useMemo(() => ({ seed: botSeed, shapeId: botAv?.shapeId, colorId: botAv?.colorId }), [botSeed, botAv?.shapeId, botAv?.colorId]);
   const resolvedBotState: GrokEngineState = botState ?? (isStreaming ? "thinking" : "idle");
   const scroller = useRef<HTMLElement | null>(null);
   const setScroller = useCallback((element: HTMLElement | Window | null) => {
@@ -216,8 +245,10 @@ export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, m
     )}
 
 </>;
+  const tail = messages?.[messages.length - 1];
+  const inlineActivity = hasInlineActivity ?? Boolean(tail?.streaming && ((tail.thinking && !tail.content) || tail.toolCalls?.some(tool => tool.status === "running")));
   const pending = <>
-    {isStreaming && (
+    {isStreaming && !inlineActivity && (
       <div className="gb-pending">
         <AnimatedBotFace
           seed={botSeed}
@@ -240,10 +271,10 @@ export const ChatTranscriptView = memo(function ChatTranscriptView({ messages, m
   const renderMessage = useCallback((_: number, entry: string | HermesMessage) => (
     <div className="gb-transcript-row">
       {typeof entry === "string"
-        ? <SubscribedMessage id={entry} respondApproval={respondApproval} respondClarify={respondClarify} />
-        : <MessageItem msg={entry} respondApproval={respondApproval} respondClarify={respondClarify} />}
+        ? <SubscribedMessage id={entry} avatar={avatar} respondApproval={respondApproval} respondClarify={respondClarify} />
+        : <MessageItem msg={entry} avatar={avatar} respondApproval={respondApproval} respondClarify={respondClarify} />}
     </div>
-  ), [respondApproval, respondClarify]);
+  ), [respondApproval, respondClarify, avatar]);
   const rows = messageIds ?? messages ?? [];
   return <div className="gb-transcript-shell">
     <Virtuoso scrollerRef={setScroller} className="gb-transcript" data={rows}
@@ -276,6 +307,10 @@ export const ChatTranscript = memo(function ChatTranscript() {
   const todos = useChatSlice(chat => chat.todos);
   const isStreaming = useChatSlice(chat => chat.isStreaming);
   const liveStatusText = useChatSlice(chat => chat.liveStatusText);
+  const hasInlineActivity = useChatSlice(chat => {
+    const tail = chat.messages[chat.messages.length - 1];
+    return Boolean(tail?.streaming && ((tail.thinking && !tail.content) || tail.toolCalls?.some(tool => tool.status === "running")));
+  });
   const activeToolName = useChatSlice(chat => chat.activeToolName);
   const hasStreamedText = useChatSlice(chat => chat.hasStreamedText);
   const awaitingUserResponse = useChatSlice(chat => chat.awaitingUserResponse);
@@ -290,6 +325,6 @@ export const ChatTranscript = memo(function ChatTranscript() {
   });
   return <ChatTranscriptView messageIds={messageIds} firstItemIndex={firstItemIndex}
     loadOlder={hasOlder ? loadOlderMessages : undefined} loadingHistory={loadingHistory} todos={todos} isStreaming={isStreaming}
-    liveStatusText={liveStatusText} botState={botState} activeProfile={activeProfile} activeSession={activeSession}
+    liveStatusText={liveStatusText} botState={botState} hasInlineActivity={hasInlineActivity} activeProfile={activeProfile} activeSession={activeSession}
     botAvatars={botAvatars} respondApproval={respondApproval} respondClarify={respondClarify} />;
 });

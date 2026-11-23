@@ -144,5 +144,35 @@ const assert = require('node:assert/strict');
  console.log('PASS reference renderer respects reduced motion');
  console.log('PASS full app: 8 bots, create/switch, rejected-switch recovery, usage and 100-token burst ordering; no page errors');
 
+ // Activity presentation: lazy payloads, semantic icons, one live animation and
+ // correct transitions between file writing, terminal work and completion.
+ await page.evaluate(() => window.setActivity([
+  {id:'read',name:'read_file',arguments:{path:'pasted-text-1.txt'},status:'done'},
+  {id:'run',name:'terminal',arguments:{command:'rg --files src scripts'},output:'terminal output',status:'done'},
+  {id:'write',name:'write_file',arguments:{path:'src/app.ts'},status:'running'},
+ ], true));
+ const activity = page.locator('.gb-entry--assistant').last();
+ await activity.locator('[data-grok-state="writing"][data-engine-ready="true"]').waitFor();
+ assert.equal(await activity.locator('.gb-animated-face').count(),1);
+ assert.equal(await activity.locator('.gb-tool-card__body').count(),0);
+ assert.equal(await activity.locator('.gb-tool-card__header').nth(0).textContent().then(t=>t.includes('pasted-text-1.txt')),true);
+ assert.equal(await activity.locator('.gb-tool-card__header').nth(1).textContent().then(t=>t.includes('rg --files')),true);
+ for (const selector of ['.gb-thinking-card','.gb-tool-card']) {
+  assert.equal(await activity.locator(selector).first().evaluate(el=>getComputedStyle(el).borderTopWidth),'0px');
+ }
+ const summary=activity.locator('.gb-activity-summary');
+ await summary.focus(); await page.keyboard.press('Enter');
+ assert.equal(await activity.locator('.gb-tool-card').count(),0);
+ await page.keyboard.press('Enter');
+ await activity.locator('.gb-tool-card__header').nth(1).click();
+ await activity.getByText('terminal output',{exact:true}).waitFor();
+ await page.evaluate(() => window.setActivity([{id:'write',name:'terminal',arguments:'{"command":"npm test"}',status:'running'}],true));
+ await activity.locator('[data-grok-state="running"]').waitFor();
+ await page.evaluate(() => window.setActivity([{id:'write',name:'terminal',arguments:{command:'npm test'},status:'error'}],false));
+ await activity.getByText('Failed',{exact:true}).waitFor();
+ assert.equal(await activity.locator('.gb-animated-face').count(),0);
+ await page.setViewportSize({width:390,height:844});
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth > innerWidth),false);
+ console.log('PASS minimal activity rows, keyboard disclosure, lazy payloads, writing/terminal animation transitions, failure and mobile layout');
  await browser.close();
 })().catch(e=>{console.error(e);process.exit(1)});
