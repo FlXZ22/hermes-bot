@@ -1,0 +1,15 @@
+{
+  "id": "appgdep_6b01bbe47bf481918ce678d94d1772e6",
+  "project_id": "appgprj_6b01ba9a590481918a5910b73bbc158c",
+  "title": "Grok Bot Motion Review",
+  "version_id": "appgprj_6b01ba9a590481918a5910b73bbc158c~appgver_38a35aab46b481918d653f540ab8a591",
+  "type": "publish",
+  "status": "succeeded",
+  "url": "https://grokbot-motion-review-metis.ali0913.chatgpt.site",
+  "has_mcp": false,
+  "screenshot_asset_pointer": null,
+  "provider_deployment_id": "release---6b01bbe47bf481918ce678d94d1772e6",
+  "failure_message": null,
+  "env_set_revision": 0,
+  "updated_at": "2026-11-21T15:42:41.870145+00:00"
+}
