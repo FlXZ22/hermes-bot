@@ -20,7 +20,10 @@ class NativeClient extends EventEmitter {
     this.#child.stdout.on('data', bytes => this.#read(bytes));
     this.#child.stdin.on('error', error => this.#fail(error));
     this.#child.on('error', error => this.#fail(error));
-    this.#child.on('close', () => this.#fail(new Error('Hermes native service closed')));
+    this.#child.on('close', (code, signal) => {
+      const reason = signal ? `signal ${signal}` : `exit code ${code}`;
+      this.#fail(new Error(`Hermes native service exited (${reason}). Restart the app before retrying. If this happened during a build, check the terminal/system logs for the cause.`));
+    });
   }
 
   #fail(error) {

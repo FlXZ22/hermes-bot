@@ -98,6 +98,7 @@ pub struct AppUpdater {
     inner: Arc<Mutex<UpdateRuntime>>,
 }
 
+#[derive(Clone)]
 struct UpdateRuntime {
     config: UpdateConfig,
     phase: String,
@@ -320,7 +321,7 @@ impl AppUpdater {
     }
 
     pub fn status(&self) -> UpdateStatus {
-        let rt = self.inner.lock().unwrap();
+        let rt = self.inner.lock().unwrap().clone();
         let meta = read_release_meta();
         let host = meta
             .as_ref()
@@ -423,6 +424,7 @@ impl AppUpdater {
         let (cfg, installed_full, native_full) = {
             let mut rt = self.inner.lock().unwrap();
             if rt.in_flight {
+                drop(rt);
                 return Ok(self.status());
             }
             rt.phase = "checking".to_string();
@@ -679,6 +681,8 @@ impl AppUpdater {
                         "--no-default-features",
                         "--bin",
                         "hermes-native",
+                        "--jobs",
+                        "2",
                     ],
                     &[],
                 )
@@ -726,6 +730,11 @@ impl AppUpdater {
         let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(cwd)
+            // This service owns the desktop IPC stdin. Build tools must never
+            // inherit it: a reader can steal requests from the protocol.
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .env("GIT_TERMINAL_PROMPT", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (k, v) in envs {

@@ -26,6 +26,36 @@ Build prerequisites on Arch are Node.js, npm, Rust, pkgconf, a C/C++ toolchain, 
 
 For desktop development, run `npm run desktop:chromium` (after `npm run desktop:chromium:build`) or `npm run desktop:dev` (Tauri/WebKitGTK). For the browser preview connected to the installed Hermes backend, run `npm run dev:connected`, then open `http://127.0.0.1:5173`. That command starts an owned gateway and a same-origin development proxy, and stops them on Ctrl+C. `npm run dev` starts the frontend alone.
 
+## App updates and recovery
+
+In the desktop app, use **Settings → Updates** with a clean local checkout and
+update branch `main`. **Update Now** fetches that branch, fast-forwards the
+checkout, builds the UI, rebuilds Rust when needed, and installs the app.
+**Restart App Now** launches the installed release. **Install Local Build**
+previews the current checkout without switching Git branches.
+
+If the native service exits during an update, the stopped process cannot finish
+its own repair. Close the app and run these commands from the repository after
+committing or stashing local changes:
+
+```bash
+git switch main
+git pull --ff-only origin main
+npm ci
+npm run build
+cargo build --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --release --no-default-features --bin hermes-native --jobs 2
+bash scripts/install-chromium.sh
+hermes-grok-bot
+```
+
+This recovery installs the Chromium host. It needs the same Node/npm, Rust and
+Linux runtime prerequisites as the normal build. If the service exits again,
+launch `hermes-grok-bot` from a terminal and retain the terminal output and the
+reported exit code or signal; the old generic “service closed” message does not
+identify the cause. Build subprocesses have isolated stdin, and update checks
+remain responsive during installation. Native update builds use two jobs to
+limit peak resource use.
+
 ## Chat
 
 The transcript virtualizes variable-height messages (`react-virtuoso`), isolates per-message subscriptions in `ChatStore`, parses large Markdown responses and syntax highlighting in a Web Worker, paginates older session history on demand, and gates external images behind explicit opt-in.
