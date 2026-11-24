@@ -19,7 +19,9 @@ export const CommandPalette: React.FC = () => {
     toggleTheme,
     theme,
     createNewSession,
+    startNewWork,
     sessions,
+    workSessionIds,
     selectSession,
     boards,
     setActiveBoardSlug,
@@ -38,6 +40,13 @@ export const CommandPalette: React.FC = () => {
         detail: "Start a fresh Hermes conversation",
         icon: "chat-bubble-plus",
         run: () => void createNewSession(),
+      },
+      {
+        id: "new-work",
+        label: "New Work Session",
+        detail: "Choose a workspace for Hermes",
+        icon: "code",
+        run: startNewWork,
       },
       {
         id: "pick-model",
@@ -125,11 +134,12 @@ export const CommandPalette: React.FC = () => {
     }
 
     for (const s of sessions.slice(0, 20)) {
+      const work = workSessionIds.has(s.id);
       base.push({
         id: `sess:${s.id}`,
-        label: s.title || "Untitled Chat",
-        detail: s.model || "Session",
-        icon: "chat-bubble",
+        label: s.title || (work ? "Untitled Work" : "Untitled Chat"),
+        detail: work ? `Work · ${s.cwd ?? "Workspace"}` : s.model || "Session",
+        icon: work ? "code" : "chat-bubble",
         run: () => void selectSession(s.id),
       });
     }
@@ -143,6 +153,7 @@ export const CommandPalette: React.FC = () => {
     query,
     selectSession,
     sessions,
+    workSessionIds,
     setActiveBoardSlug,
     setActiveView,
     setModelPickerOpen,

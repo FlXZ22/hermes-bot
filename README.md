@@ -70,9 +70,59 @@ The face animation is adapted from [mikeg0/grokbot-face](https://github.com/mike
 loads separately, pauses during scrolling, and respects reduced motion.
 
 For the chat regression checks, start `npm run dev`, then run
-`npm run test:chat-ui` in another terminal. The standalone check uses the shared
-Playwright installation documented in AGENTS.md, deterministic HTTP/WebSocket
-fixtures, and a 1,000-message transcript. It does not send prompts to a live model.
+`npm run test:chat-ui` in another terminal. The checks use Playwright, deterministic
+HTTP/WebSocket fixtures and a 1,000-message transcript. They do not call a live model.
+
+## Work
+
+Select a Hermes profile, open **Work** in the sidebar, and enter the absolute
+path to a project folder on the Hermes host. Work sessions appear in that
+profile’s Work list. Open **Chat** to return to its conversation list.
+
+Hermes uses the selected folder for coding tools, commands, and tests. Use
+`/plan` to draft an implementation plan, `/goal <objective>` for a persistent
+goal, and `/diff` or **Git** to review changes. The activity panel shows
+subagents and lets you steer or stop them. **Checkpoints** previews and
+restores snapshots in profiles with Hermes checkpoints enabled. Type `@` to
+reference project files. While the agent runs, use **Queue** for a follow-up
+or **Steer turn** for an instruction during the current turn. Use `/export`
+to download the saved Work conversation as JSON. From **New Work**, choose
+a workspace path and select a **Session export** to import conversation
+text from OpenCode v1, OpenCode v2, or a Hermes Work JSON file into the
+selected profile. The session is ready for a new prompt after import.
+
+Use **Explore** or `/explore <question>` for a read-only answer. It sees a
+bounded list of top-level entries, or excerpts from up to four workspace files
+you name, for example `/explore How is startup wired? @file:src/main.ts`.
+Quote paths with spaces. Explore sends this context to Hermes's one-shot model endpoint, not to
+the coding agent. It cannot run shell commands, edit files, delegate work, or
+search for more files. Answers appear in the current view but are not saved to
+the Hermes transcript. A gateway without `llm.oneshot` shows an error rather
+than starting a regular turn.
+
+Use `/oc` to list OpenCode commands in the active workspace and
+`/oc/<command> <arguments>` to run one with Hermes. Work reads `.opencode/commands`,
+the legacy `.opencode/command` directory, and the workspace's `opencode.json(c)`
+files. Templates support `$ARGUMENTS` and positional placeholders. Shell blocks
+use Hermes's terminal tool and its permissions. Commands use the active Work
+session's model and agent.
+
+The Work Git panel supports stage, unstage, commit, push, switching branches,
+and creating worktrees. Browser connections and desktop connections to a server
+without SSH use the Hermes Git API. Its commit action stages all changes when
+the index is empty, and it creates worktrees under the repository’s `.worktrees`
+directory. The desktop Git panel also offers **Last turn**, which compares tracked
+files against their state when the request was submitted. **Create pull request**
+uses GitHub CLI on the Hermes host after you confirm the push. Desktop Work
+sessions have their own terminal tabs.
+
+Run `npm run test:work-ui` with the development server running to exercise
+profile separation, workspace validation, Explore, goal controls, and Git
+review. For both browser checks, install `@playwright/test` locally
+(`npm install --no-save @playwright/test`, then `npx playwright install chromium`)
+or set `PLAYWRIGHT_MODULE` to an existing installation.
+See the [OpenCode compatibility audit](docs/work-opencode-compatibility.md)
+for available Hermes features and remaining Work integrations.
 
 ## Connect your server
 

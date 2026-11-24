@@ -26,6 +26,7 @@
     "desktop:diagnose": "cargo run --manifest-path apps/desktop/src-tauri/Cargo.toml -- --diagnose-backend",
     "test:auth": "npm run build:client && node scripts/hermes-auth-e2e.mjs",
     "test:chat-ui": "node scripts/chat-ui-check.cjs",
+    "test:work-ui": "node scripts/work-ui-check.cjs",
     "test:desktop-perf": "node scripts/webkit-perf.mjs",
     "desktop:chromium:build": "npm run build && cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --no-default-features --bin hermes-native && electron --version",
     "desktop:chromium": "electron apps/chromium/main.cjs",

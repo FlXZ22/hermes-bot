@@ -233,6 +233,7 @@ export class HermesRealtimeSession {
           type: "status.update",
           sessionId,
           text: String(payload.text ?? payload.status ?? payload.message ?? ""),
+          kind: typeof payload.kind === "string" ? payload.kind : undefined,
         });
         return;
 
@@ -332,6 +333,29 @@ export class HermesRealtimeSession {
           status: String(t.status ?? "pending"),
         }));
         this.emit({ type: "todo.updated", sessionId, todos });
+        return;
+      }
+
+      case "subagent.spawn_requested":
+      case "subagent.start":
+      case "subagent.tool":
+      case "subagent.progress":
+      case "subagent.complete": {
+        const id = typeof payload.subagent_id === "string" ? payload.subagent_id : "";
+        if (!id || !sessionId) return;
+        const activity = payload.summary ?? payload.tool_preview ?? payload.text ?? payload.tool_name;
+        this.emit({
+          type: "subagent.update",
+          sessionId,
+          subagent: {
+            id,
+            phase: eventType === "subagent.complete" ? "finished" : eventType === "subagent.spawn_requested" ? "queued" : "running",
+            goal: typeof payload.goal === "string" && payload.goal ? payload.goal : undefined,
+            model: typeof payload.model === "string" && payload.model ? payload.model : undefined,
+            activity: typeof activity === "string" && activity ? activity.slice(0, 400) : undefined,
+            outcome: typeof payload.status === "string" ? payload.status : undefined,
+          },
+        });
         return;
       }
 

@@ -28,9 +28,16 @@ import {
 import { resolveBotColor, type GrokBotColorId } from "@grok-bot/theme";
 import { tauriBridge, type LinuxSystemStats, type RustBackendInfo } from "../lib/tauriBridge";
 import { slugify } from "../lib/format";
+import { dispatchWorkCommand } from "../lib/workCommands";
+import { importedWorkId, isImportedWorkId, type WorkImport } from "../lib/workImport";
+import {
+  isWorkControlCommand, loadWorkSessions, normalizeWorkspacePath, workGoalStatus, WORK_SESSIONS_KEY,
+  type SessionSection, type WorkCheckpointResults, type WorkReference,
+} from "./workSessions";
 
 export type AppViewId =
   | "chat"
+  | "work"
   | "boards"
   | "skills"
   | "cron"
@@ -155,13 +162,22 @@ export interface AppContextValue {
 
   // Sessions & Chat
   sessions: HermesSession[];
+  sessionSection: SessionSection;
+  workSessionIds: ReadonlySet<string>;
+  startNewWork: () => void;
+  workCheckpoint: <A extends keyof WorkCheckpointResults>(action: A, hash?: string) => Promise<WorkCheckpointResults[A]>;
+  refreshWorkGoal: () => Promise<void>;
+  controlWorkSubagent: (id: string, text?: string) => Promise<void>;
+  completeWorkReference: (word: string) => Promise<WorkReference[]>;
+  exportWorkSession: () => Promise<void>;
+  importWorkSession: (session: WorkImport, path: string) => Promise<void>;
   activeSessionId: string | null;
   activeSession: HermesSession | null;
   chat: ChatStore;
   loadOlderMessages: () => Promise<void>;
   selectSession: (sessionId: string | null) => Promise<void>;
-  createNewSession: (opts?: { title?: string; boardSlug?: string; cwd?: string; model?: string; provider?: string }) => Promise<string | null>;
-  sendMessage: (text: string, attachments?: File[]) => Promise<void>;
+  createNewSession: (opts?: { title?: string; boardSlug?: string; cwd?: string; model?: string; provider?: string; section?: SessionSection }) => Promise<string | null>;
+  sendMessage: (text: string, attachments?: File[]) => Promise<string | void>;
   interruptStream: () => Promise<void>;
   renameSession: (sessionId: string, title: string) => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
@@ -253,7 +269,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Shell UI state
   const [theme, setThemeState] = useState<ThemeMode>(loadStoredTheme);
-  const [activeView, setActiveView] = useState<AppViewId>("chat");
+  const [activeView, setActiveViewState] = useState<AppViewId>("chat");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [rightPaneOpen, setRightPaneOpen] = useState(false);
   const [rightPaneTab, setRightPaneTab] = useState<RightPaneTabId>("files");
@@ -312,7 +328,53 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Sessions & Chat
   const [sessions, setSessions] = useState<HermesSession[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [sessionSection, setSessionSection] = useState<SessionSection>("chat");
+  const [selectedSessions, setSelectedSessions] = useState<Record<SessionSection, string | null>>({ chat: null, work: null });
+  const activeSessionId = selectedSessions[sessionSection];
+  const workScope = JSON.stringify([connection.id, isLocalConnection ? "" : connection.url, activeProfile]);
+  const [workCatalog, setWorkCatalog] = useState(loadWorkSessions);
+  const workCatalogRef = useRef(workCatalog);
+  workCatalogRef.current = workCatalog;
+  const workSessionIds = useMemo(() => new Set([
+    ...(workCatalog[workScope] ?? []),
+    ...sessions.filter(session => isImportedWorkId(session.id)).map(session => session.id),
+  ]), [sessions, workCatalog, workScope]);
+  const setWorkSession = useCallback((id: string, work = true) => {
+    setWorkCatalog(catalog => {
+      const current = catalog[workScope] ?? [];
+      if (current.includes(id) === work) return catalog;
+      return { ...catalog, [workScope]: work ? [...current, id] : current.filter(item => item !== id) };
+    });
+  }, [workScope]);
+  useEffect(() => {
+    try { localStorage.setItem(WORK_SESSIONS_KEY, JSON.stringify(workCatalog)); } catch { /* Storage unavailable. */ }
+  }, [workCatalog]);
+
+  const setActiveView = useCallback((view: AppViewId) => {
+    if (view === "chat" || view === "work") {
+      if (view !== sessionSection) {
+        const next = sessions.find(session => session.id === selectedSessions[view]);
+        if (next?.model) setActiveModel(next.model);
+        if (next?.provider) setActiveProvider(next.provider);
+      }
+      setSessionSection(view);
+    }
+    setActiveViewState(view);
+  }, [selectedSessions, sessionSection, sessions]);
+  const showSession = useCallback((id: string | null, section: SessionSection) => {
+    setSelectedSessions(previous => ({ ...previous, [section]: id }));
+    setSessionSection(section);
+    setActiveViewState(section);
+  }, []);
+  const startNewWork = useCallback(() => {
+    showSession(null, "work");
+  }, [showSession]);
+  const forgetSelectedSession = useCallback((id: string) => {
+    setSelectedSessions(previous => ({
+      chat: previous.chat === id ? null : previous.chat,
+      work: previous.work === id ? null : previous.work,
+    }));
+  }, []);
   const [chat, setChat] = useState(() => new ChatStore());
   const currentChat = useRef(chat);
   const profileChats = useRef(new Map<string, ChatStore>());
@@ -337,6 +399,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     store.liveIds[id] = wireId;
     liveRoutes.current.set(wireId, { chat: store, id });
   }, []);
+  const workResumes = useRef(new WeakMap<ChatStore, Map<string, {
+    gateway: HermesRealtimeSession;
+    result: Promise<string>;
+  }>>());
 
   // Models & Inference settings
   const [models, setModels] = useState<HermesModelOption[]>([]);
@@ -344,7 +410,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [activeProvider, setActiveProvider] = useState<string>("auto");
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("medium");
   const [fastMode, setFastMode] = useState<boolean>(false);
-  const [yoloMode, setYoloMode] = useState<boolean>(false);
+  const [chatYolo, setChatYolo] = useState(false);
+  const [workYolo, setWorkYolo] = useState<Record<string, boolean>>({});
+  const workSessionScope = JSON.stringify([workScope, activeSessionId]);
+  const yoloMode = sessionSection === "work" ? workYolo[workSessionScope] ?? false : chatYolo;
+  const setYoloMode = useCallback((enabled: boolean) => {
+    if (sessionSection === "work") setWorkYolo(previous => ({ ...previous, [workSessionScope]: enabled }));
+    else setChatYolo(enabled);
+  }, [sessionSection, workSessionScope]);
 
   // Capabilities
   const [skills, setSkills] = useState<HermesSkill[]>([]);
@@ -361,6 +434,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const draftSessionIdsRef = useRef(new Set<string>());
   const activeSessionIdRef = useRef<string | null>(null);
   activeSessionIdRef.current = activeSessionId;
+
+  const resumeWorkSession = useCallback((store: ChatStore, id: string, profile: string, gateway: HermesRealtimeSession) => {
+    if (store.liveIds[id]) return Promise.resolve(store.liveIds[id]);
+    const pending = workResumes.current.get(store) ?? new Map();
+    workResumes.current.set(store, pending);
+    const existing = pending.get(id);
+    if (existing?.gateway === gateway) return existing.result;
+    const result = gateway.resumeSession(id, { profile, omit_messages: true }).then(response => {
+      if (rtRef.current !== gateway || typeof response.session_id !== "string") {
+        throw new Error("Hermes could not resume this Work session.");
+      }
+      registerLiveSession(store, id, response.session_id);
+      return response.session_id;
+    }).finally(() => {
+      if (pending.get(id)?.result === result) pending.delete(id);
+    });
+    pending.set(id, { gateway, result });
+    return result;
+  }, [registerLiveSession]);
 
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showToast = useCallback((msg: string) => {
@@ -509,16 +601,38 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return;
     }
 
-    if (event.type === "status.update") targetChat.patch(targetSid, { liveStatusText: event.text });
+    if (event.type === "status.update") targetChat.patch(targetSid, event.kind === "goal"
+      ? { liveStatusText: event.text, goalStatus: workGoalStatus(event.text) }
+      : { liveStatusText: event.text });
     if (event.type === "session.usage") targetChat.patch(targetSid, { sessionUsage: event.usage });
     if (event.type === "todo.updated") targetChat.patch(targetSid, { todos: event.todos });
+    if (event.type === "subagent.update") {
+      const update = event.subagent;
+      const subagents = targetChat.get(targetSid).subagents;
+      const index = subagents.findIndex(agent => agent.id === update.id);
+      if (index < 0) {
+        targetChat.patch(targetSid, { subagents: [...subagents, update] });
+      } else if (subagents[index].phase !== "finished" || update.phase === "finished") {
+        const previous = subagents[index];
+        const next = {
+          ...update,
+          goal: update.goal ?? previous.goal,
+          model: update.model ?? previous.model,
+          activity: update.activity ?? previous.activity,
+          outcome: update.outcome ?? previous.outcome,
+        };
+        targetChat.patch(targetSid, { subagents: subagents.map((agent, i) => i === index ? next : agent) });
+      }
+    }
 
     if (event.type === "message.start") {
+      const followUp = targetChat.get(targetSid).workFollowUpQueued;
       targetChat.patch(targetSid, {
         isStreaming: true,
         hasStreamedText: false,
         activeToolName: null,
         lastTurnSettlement: null,
+        ...(followUp ? { workFollowUpQueued: false, gitTurnBaseline: null } : {}),
       });
       targetChat.updateMessages(targetSid, messages => messages.some(message => message.streaming)
         ? messages : [...messages, newAssistant()]);
@@ -630,10 +744,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       load("profiles", c.listProfiles(), data => {
         if (data.length) setProfiles(data);
       }),
-      load("sessions", c.listSessions(120, "include"), data => setSessions(prev => [
-        ...data.map(s => ({ ...prev.find(p => p.id === s.id), ...s })),
-        ...prev.filter(s => (s.id.startsWith("session_") || draftSessionIdsRef.current.has(s.id)) && !data.some(d => d.id === s.id)),
-      ])),
+      load("sessions", c.listSessions(120, "include"), data => {
+        const target = c.getConnection();
+        const local = target.id === "local-rust" || target.id === "local-dev";
+        const scope = JSON.stringify([target.id, local ? "" : target.url, requestedProfile]);
+        const work = new Set(workCatalogRef.current[scope]);
+        const rows = data.map(session => {
+          // Hermes projects compressed conversations with the latest durable
+          // ID. Keep Work attached to its original selection and transcript.
+          const root = session._lineage_root_id;
+          return typeof root === "string" && (work.has(root) || isImportedWorkId(root)) ? { ...session, id: root } : session;
+        });
+        setSessions(prev => [
+          ...rows.map(s => ({ ...prev.find(p => p.id === s.id), ...s })),
+          ...prev.filter(s => (s.id.startsWith("session_") || draftSessionIdsRef.current.has(s.id)) && !rows.some(d => d.id === s.id)),
+        ]);
+      }),
       load("models", c.getModelOptions(true, Boolean(opts?.refreshModels)), data => { if (data.length) setModels(data); }),
       load("model info", c.getModelInfo(), info => {
         if (!activeSessionIdRef.current) {
@@ -783,7 +909,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (switched) {
         draftSessionIdsRef.current.clear(); activeSessionIdRef.current = null;
         activateChat(profile, true);
-        setActiveSessionId(null); setActiveProfileState(profile); setSessions([]);
+        setSelectedSessions({ chat: null, work: null }); setActiveProfileState(profile); setSessions([]);
         setModels([]); setActiveModel(""); setActiveProvider("auto"); setSkills([]); setToolsets([]);
         setMcpServers([]); setCronJobs([]); setMessagingPlatforms([]); setWebhooks([]); setUsagePoints([]);
         setProfiles([{ name: profile, active: true }]); setSoulMd(""); setMemoryMd(""); setUserMd("");
@@ -1006,7 +1132,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       c.setProfile(name);
       activateChat(name);
       setActiveProfileState(name); activeSessionIdRef.current = null;
-      setActiveSessionId(null); setSessions([]); setActiveView("chat");
+      setSelectedSessions({ chat: null, work: null }); setSessions([]);
+      setSessionSection("chat"); setActiveViewState("chat");
       setSoulMd(""); setMemoryMd(""); setUserMd("");
       setProfiles(prev => prev.map(profile => ({ ...profile, active: profile.name === name })));
       if (isDesktop && isLocalConnection) {
@@ -1238,13 +1365,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Paint the cached transcript immediately and reconcile with the gateway.
   const selectSession = useCallback(
-    async (sessionId: string | null) => {
+    async (sessionId: string | null, section: SessionSection = sessionId && workSessionIds.has(sessionId) ? "work" : "chat") => {
       activeSessionIdRef.current = sessionId;
-      setActiveSessionId(sessionId);
+      showSession(sessionId, section);
       const selected = sessions.find(session => session.id === sessionId);
       if (selected?.model) setActiveModel(selected.model);
       if (selected?.provider) setActiveProvider(selected.provider);
-      setActiveView("chat");
       if (!sessionId) return;
       chat.retain(sessionId);
       const cached = chat.get(sessionId);
@@ -1303,6 +1429,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const resume = async () => {
         if (!realtime?.isConnected() || chat.liveIds[sessionId]) return;
         try {
+          if (section === "work") {
+            await resumeWorkSession(chat, sessionId, activeProfile, realtime);
+            return;
+          }
           const result = await realtime.resumeSession(sessionId, { profile: activeProfile, omit_messages: true });
           if (rtRef.current === realtime && typeof result.session_id === "string") {
             registerLiveSession(chat, sessionId, result.session_id);
@@ -1313,7 +1443,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       try { await Promise.all([local(), remote()]); }
       finally { chat.patch(sessionId, { loadingHistory: false }); }
     },
-    [activeProfile, chat, isDesktop, isLocalConnection, registerLiveSession, sessions]
+    [activeProfile, chat, isDesktop, isLocalConnection, registerLiveSession, resumeWorkSession, sessions, showSession, workSessionIds]
   );
 
   const loadOlderMessages = useCallback(async () => {
@@ -1336,15 +1466,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [activeSessionId, activeProfile, chat, showToast]);
 
   const createNewSession = useCallback(
-    async (opts?: { title?: string; boardSlug?: string; cwd?: string; model?: string; provider?: string }) => {
+    async (opts?: { title?: string; boardSlug?: string; cwd?: string; model?: string; provider?: string; section?: SessionSection }) => {
+      const section = opts?.section ?? "chat";
       const boardSlug = opts?.boardSlug ?? (activeBoardSlug !== "all" ? activeBoardSlug : "default");
       const board = boards.find((b) => b.slug === boardSlug);
-      const cwd = opts?.cwd ?? board?.workspace_path ?? undefined;
+      const cwd = section === "work" ? normalizeWorkspacePath(opts?.cwd ?? "") : opts?.cwd ?? board?.workspace_path;
       const model = opts?.model ?? activeModel;
       const provider = opts?.provider ?? activeProvider;
 
       let newId = `session_${Date.now().toString(36)}`;
       const realtime = rtRef.current;
+      if (section === "work" && !realtime?.isConnected()) {
+        throw new Error("Connect to a Hermes gateway to start a Work session.");
+      }
       if (realtime?.isConnected()) {
         try {
           const res = await realtime.createSession({
@@ -1357,12 +1491,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             title: opts?.title,
             source: "desktop",
           });
+          if (section === "work") {
+            const info = res.info as { cwd?: string } | undefined;
+            if (typeof res.session_id !== "string" || info?.cwd !== cwd) {
+              if (typeof res.session_id === "string") {
+                await realtime.rpc("session.close", { session_id: res.session_id }).catch(() => undefined);
+              }
+              throw new Error("Hermes could not open that workspace. Check the path on the Hermes host.");
+            }
+          }
           const sid = String(res.stored_session_id ?? res.session_key ?? res.session_id ?? newId);
           newId = sid;
           if (rtRef.current === realtime && typeof res.session_id === "string") {
             registerLiveSession(chat, newId, res.session_id);
           }
-        } catch {
+        } catch (error) {
+          if (section === "work") throw error;
           // fall back to local draft id
         }
       }
@@ -1370,7 +1514,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (currentChat.current !== chat || rtRef.current !== realtime) return null;
       const newSession: HermesSession = {
         id: newId,
-        title: opts?.title ?? "New Chat",
+        title: opts?.title ?? (section === "work" ? "New Work" : "New Chat"),
         profile: activeProfile,
         model,
         provider,
@@ -1383,16 +1527,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       };
 
       draftSessionIdsRef.current.add(newId);
+      if (section === "work") setWorkSession(newId);
       setSessions((prev) => [newSession, ...prev.filter((s) => s.id !== newId)]);
       assignSessionToBoard(newId, boardSlug);
       setActiveModel(model);
       setActiveProvider(provider);
       activeSessionIdRef.current = newId;
-      setActiveSessionId(newId);
-      setActiveView("chat");
+      showSession(newId, section);
       return newId;
     },
-    [activeBoardSlug, activeModel, activeProfile, activeProvider, assignSessionToBoard, boards, chat, fastMode, reasoningEffort, registerLiveSession]
+    [activeBoardSlug, activeModel, activeProfile, activeProvider, assignSessionToBoard, boards, chat, fastMode, reasoningEffort, registerLiveSession, setWorkSession, showSession]
   );
 
   useEffect(() => {
@@ -1400,12 +1544,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (setupOpen) return;
       if ((event.target as HTMLElement)?.closest?.(".xterm")) return;
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n" && !event.shiftKey) {
-        event.preventDefault(); void createNewSession();
+        event.preventDefault();
+        if (sessionSection === "work") startNewWork();
+        else void createNewSession();
       }
     };
     window.addEventListener("keydown", onNew);
     return () => window.removeEventListener("keydown", onNew);
-  }, [createNewSession, setupOpen]);
+  }, [createNewSession, sessionSection, setupOpen, startNewWork]);
 
   const launchSessionForTask = useCallback(
     async (task: HermesKanbanTask) => {
@@ -1441,13 +1587,152 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [chat, createNewSession, selectSession, sessions, updateTask, showToast]
   );
 
+  const ensureWorkSession = useCallback(async (id: string) => {
+    const gateway = rtRef.current;
+    if (!gateway?.isConnected()) throw new Error("Connect to the Hermes gateway to use Work.");
+    const liveId = await resumeWorkSession(chat, id, activeProfile, gateway);
+    if (rtRef.current !== gateway || currentChat.current !== chat) throw new Error("The selected Work profile changed.");
+    return { gateway, liveId };
+  }, [activeProfile, chat, resumeWorkSession]);
+
+  const refreshWorkHistory = useCallback(async (id: string) => {
+    const client = clientRef.current;
+    if (!client) throw new Error("Connect to Hermes to reload the conversation.");
+    const messages = await client.getSessionMessages(id, HISTORY_PAGE_SIZE);
+    if (currentChat.current === chat && clientRef.current === client && client.getProfile() === activeProfile) {
+      chat.updateMessages(id, () => messages);
+      chat.patch(id, { olderOffset: messages.length >= HISTORY_PAGE_SIZE ? HISTORY_PAGE_SIZE : null });
+    }
+  }, [activeProfile, chat]);
+
+  const refreshWorkGoal = useCallback(async () => {
+    const id = activeSessionId;
+    if (sessionSection !== "work" || !id) return;
+    const before = chat.get(id).goalStatus;
+    const { gateway, liveId } = await ensureWorkSession(id);
+    const result = await gateway.dispatchCommand(liveId, "/goal status");
+    if (typeof result.output === "string" && chat.get(id).goalStatus === before) {
+      chat.patch(id, { goalStatus: workGoalStatus(result.output) });
+    }
+  }, [activeSessionId, chat, ensureWorkSession, sessionSection]);
+
+  const completeWorkReference = useCallback(async (word: string) => {
+    if (sessionSection !== "work" || !activeSessionId || !activeSession?.cwd) return [];
+    const { gateway, liveId } = await ensureWorkSession(activeSessionId);
+    const { items } = await gateway.rpc<{ items: WorkReference[] }>("complete.path", {
+      word, cwd: activeSession.cwd, session_id: liveId, profile: activeProfile,
+    });
+    return items.filter(item => /^@(?:file:|folder:|git:|diff$|staged$|url:)/.test(item.text) &&
+      !/^@(?:file|folder):\.\.(?:\/|$)/.test(item.text)).slice(0, 10);
+  }, [activeProfile, activeSession?.cwd, activeSessionId, ensureWorkSession, sessionSection]);
+
+  const exportWorkSession = useCallback(async () => {
+    const client = clientRef.current;
+    const session = activeSession;
+    if (sessionSection !== "work" || !client || !session) throw new Error("Open a connected Work session first.");
+    if (chat.get(session.id).isStreaming) throw new Error("Wait until the current Work turn finishes, then export.");
+    const pages: HermesMessage[][] = [];
+    const size = 100;
+    for (let offset = 0; ; offset += size) {
+      const page = await client.getSessionMessages(session.id, size, offset);
+      if (currentChat.current !== chat || clientRef.current !== client || client.getProfile() !== activeProfile) {
+        throw new Error("The Work profile changed during export.");
+      }
+      if (page.length && pages.at(-1)?.[0]?.id === page[0].id) {
+        throw new Error("Hermes did not advance the Work history page.");
+      }
+      pages.push(page);
+      if (page.length < size) break;
+    }
+    const data = {
+      format: "hermes-work-session",
+      version: 1,
+      session: { id: session.id, title: session.title, cwd: session.cwd, profile: activeProfile, model: session.model },
+      messages: pages.reverse().flat(),
+    };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+    const download = document.createElement("a");
+    download.href = url;
+    download.download = `${slugify(session.title ?? "") || "hermes-work"}.json`;
+    document.body.append(download);
+    download.click();
+    download.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  }, [activeProfile, activeSession, chat, sessionSection]);
+
+  const importWorkSession = useCallback(async (session: WorkImport, path: string) => {
+    const client = clientRef.current;
+    if (!client || client.getConnection().mode === "openai") throw new Error("Connect to a Hermes gateway to import a Work session.");
+    const cwd = normalizeWorkspacePath(path);
+    const checkProfile = () => {
+      if (currentChat.current !== chat || clientRef.current !== client || client.getProfile() !== activeProfile) {
+        throw new Error("The Work profile changed during import.");
+      }
+    };
+    checkProfile();
+    const id = await importedWorkId(session.identity, cwd);
+    await client.listFiles(cwd);
+    checkProfile();
+    const started_at = session.messages[0].timestamp || Date.now() / 1000;
+    const ended_at = Math.max(started_at, session.messages.at(-1)?.timestamp ?? 0);
+    const result = await client.importSession({
+      id, source: "desktop", title: session.title, cwd, model: activeModel || undefined,
+      started_at, ended_at,
+      messages: session.messages.map(message => message.timestamp ? message : { ...message, timestamp: started_at }),
+    });
+    checkProfile();
+    if (!result.ok || (!result.imported_ids.includes(id) && !result.skipped_ids.includes(id))) {
+      throw new Error("Hermes could not save the Work session.");
+    }
+    setSessions(previous => previous.some(row => row.id === id) ? previous : [{
+      id, title: session.title, cwd, model: activeModel, provider: activeProvider, source: "desktop",
+      profile: activeProfile, message_count: session.messages.length, started_at, updated_at: ended_at,
+    }, ...previous]);
+    await selectSession(id, "work");
+  }, [activeModel, activeProfile, activeProvider, chat, selectSession]);
+
+  const controlWorkSubagent = useCallback(async (subagentId: string, text?: string) => {
+    const id = activeSessionId;
+    if (sessionSection !== "work" || !id || !chat.get(id).subagents.some(
+      agent => agent.id === subagentId && agent.phase === "running"
+    )) throw new Error("This subagent is no longer running.");
+    const { gateway, liveId } = await ensureWorkSession(id);
+    const result = text
+      ? await gateway.rpc<{ queued?: boolean }>("subagent.steer", { session_id: liveId, subagent_id: subagentId, text })
+      : await gateway.rpc<{ found?: boolean }>("subagent.interrupt", { session_id: liveId, subagent_id: subagentId });
+    if (!("queued" in result ? result.queued : "found" in result && result.found)) {
+      throw new Error("Hermes could not find a running subagent for this request.");
+    }
+  }, [activeSessionId, chat, ensureWorkSession, sessionSection]);
+
+  const workCheckpoint = useCallback(async <A extends keyof WorkCheckpointResults>(action: A, hash?: string) => {
+    const id = activeSessionId;
+    if (sessionSection !== "work" || !id) throw new Error("Open a Work session first.");
+    if (action !== "list" && !hash) throw new Error("Select a checkpoint first.");
+    if (action === "restore" && chat.get(id).isStreaming) throw new Error("Stop the current response before restoring a checkpoint.");
+    const { gateway, liveId } = await ensureWorkSession(id);
+    const result = await gateway.rpc<WorkCheckpointResults[A]>(`rollback.${action}`, { session_id: liveId, hash });
+    if (action === "restore") {
+      const restored = result as WorkCheckpointResults["restore"];
+      if (!restored.success) throw new Error(restored.error ?? "Hermes could not restore the checkpoint.");
+      if (restored.history_removed) {
+        await refreshWorkHistory(id).catch(() => showToast("Checkpoint restored. Reopen the session to reload its history."));
+      }
+    }
+    return result;
+  }, [activeSessionId, chat, ensureWorkSession, refreshWorkHistory, sessionSection, showToast]);
+
   const sendMessage = useCallback(
     async (rawText: string, attachments: File[] = []) => {
       const realtime = rtRef.current;
       const text = rawText.trim() || (attachments.length ? "Please review the attached files." : "");
       if (!text) return;
+      const work = sessionSection === "work";
       if (!realtime?.isConnected() && connection.mode !== "openai") {
         throw new Error("Hermes is disconnected. Your draft is kept; reconnect in Settings to send it.");
+      }
+      if (work && (!realtime?.isConnected() || !activeSessionId || !activeSession?.cwd)) {
+        throw new Error("Open a workspace with the Hermes gateway before sending a Work request.");
       }
       if (attachments.length && connection.mode === "openai") throw new Error("File attachments require a Hermes gateway connection.");
 
@@ -1458,7 +1743,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (!sid || currentChat.current !== chat || rtRef.current !== realtime) {
         throw new Error("The conversation changed before the message could be sent.");
       }
-      if (chat.get(sid).isStreaming) throw new Error("Wait for the current response before sending another message.");
+      if (chat.get(sid).isStreaming && !(work && isWorkControlCommand(text))) {
+        throw new Error("Wait for the current response before sending another message.");
+      }
+      if (work && chat.get(sid).workExploring) throw new Error("Wait for Explore to finish.");
+      if (work && /^\/(?:queue|q|steer)\s+\/explore(?:\s|$)/i.test(text)) {
+        throw new Error("Send /explore directly. It cannot run as a normal Work follow-up.");
+      }
+      if (work && attachments.length && /^\/explore(?:\s|$)/i.test(text)) {
+        throw new Error("Explore uses @file: references, not uploaded attachments.");
+      }
+
+      let promptText = text;
+      let queued = false;
+      const workLiveId = work ? (await ensureWorkSession(sid)).liveId : undefined;
+      if (work && (currentChat.current !== chat || rtRef.current !== realtime)) {
+        throw new Error("The Work session changed before the request could be sent.");
+      }
 
       const userMsg: HermesMessage = {
         id: `user-${Date.now()}`,
@@ -1474,7 +1775,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           s.id === sid
             ? {
                 ...s,
-                title: !s.title || s.title === "New Chat" ? text.slice(0, 52) : s.title,
+            title: !s.title || s.title === "New Chat" || s.title === "New Work" ? text.slice(0, 52) : s.title,
                 preview: text.slice(0, 100),
                 updated_at: Date.now(),
                 message_count: (s.message_count ?? 0) + 1,
@@ -1485,8 +1786,56 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       // Handle slash commands if connected
       if (text.startsWith("/") && realtime?.isConnected()) {
-        const liveSid = chat.liveIds[sid] ?? sid;
-        try {
+        const liveSid = workLiveId ?? chat.liveIds[sid] ?? sid;
+        if (work) {
+          const { command, result } = await dispatchWorkCommand({
+            input: text, gateway: realtime, client: clientRef.current, sessionId: liveSid, cwd: activeSession?.cwd,
+            explore: async question => {
+              const client = clientRef.current;
+              const cwd = activeSession?.cwd;
+              if (!client || !cwd) throw new Error("Open a Work workspace before using Explore.");
+              if (attachments.length) throw new Error("Explore uses @file: references, not uploaded attachments.");
+              if (chat.get(sid).workExploring || chat.get(sid).isStreaming) throw new Error("Wait for the current Work request to finish.");
+              const assertCurrent = () => {
+                if (currentChat.current !== chat || rtRef.current !== realtime || clientRef.current !== client || client.getProfile() !== activeProfile) {
+                  throw new Error("The Work profile changed during Explore.");
+                }
+              };
+              assertCurrent();
+              chat.patch(sid, { workExploring: true });
+              try {
+                const { exploreWorkspace } = await import("../lib/workExplore");
+                assertCurrent();
+                const answer = await exploreWorkspace({ client, gateway: realtime, sessionId: liveSid, cwd, question, assertCurrent });
+                return `**Explore · Read-only**\n\n${answer}`;
+              } finally {
+                chat.patch(sid, { workExploring: false });
+              }
+            },
+          });
+          if (currentChat.current !== chat || rtRef.current !== realtime) {
+            throw new Error("The Work profile changed while resolving the command.");
+          }
+          const output = [result.notice, result.warning, result.output]
+            .filter((line): line is string => typeof line === "string" && Boolean(line.trim())).join("\n\n");
+          if (output && /^\/goal(?:\s|$)/.test(command)) {
+            chat.patch(sid, { goalStatus: workGoalStatus(output) });
+          }
+          if (result.type === "prefill") {
+            await refreshWorkHistory(sid).catch(() => showToast("Reopen the Work session to reload its history."));
+          }
+          if (output) chat.updateMessages(sid, messages => [...messages, newAssistant({ content: output, streaming: false })]);
+          if (result.type === "prefill") return typeof result.message === "string" ? result.message : undefined;
+          if (result.type === "send" || result.type === "skill") {
+            if (typeof result.message !== "string" || !result.message.trim()) throw new Error("Hermes returned an empty command prompt.");
+            promptText = result.message;
+            queued = /^\/(?:queue|q|steer)\s/i.test(command);
+          } else if (result.type === "exec" || result.type === "plugin" || typeof result.output === "string") {
+            return;
+          } else {
+            throw new Error("This Hermes command returned an unsupported response.");
+          }
+        } else try {
           const res = await realtime.dispatchCommand(liveSid, text);
           if (res && typeof res.output === "string" && res.output) {
             chat.updateMessages(sid, messages => [
@@ -1502,15 +1851,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       // Live WebSocket JSON-RPC submit
       if (realtime?.isConnected()) {
-        chat.patch(sid, {
-          isStreaming: true,
-          hasStreamedText: false,
-          activeToolName: null,
-          lastTurnSettlement: null,
-          liveStatusText: "Thinking...",
-        });
+        const inFlight = work && queued && chat.get(sid).isStreaming;
+        if (!inFlight) {
+          chat.patch(sid, {
+            isStreaming: true,
+            hasStreamedText: false,
+            activeToolName: null,
+            lastTurnSettlement: null,
+            liveStatusText: "Thinking...",
+          });
+        }
         try {
-          let liveSid = chat.liveIds[sid];
+          if (!inFlight && work && isDesktop && activeSession?.cwd && (isLocalConnection || connection.ssh)) {
+            const baseline = await new Promise<string | null>(resolve => {
+              const timer = setTimeout(() => resolve(null), 2_000);
+              void tauriBridge.gitWorkTurnBaseline(activeSession.cwd!, isLocalConnection ? undefined : connection.ssh)
+                .then(resolve, () => resolve(null))
+                .finally(() => clearTimeout(timer));
+            });
+            if (!chat.get(sid).isStreaming || rtRef.current !== realtime) return;
+            chat.patch(sid, { gitTurnBaseline: baseline });
+          }
+          let liveSid = workLiveId ?? chat.liveIds[sid];
           if (!liveSid && !sid.startsWith("session_")) {
             const resumed = await realtime.resumeSession(sid, { profile: activeProfile, omit_messages: true });
             liveSid = String(resumed.session_id ?? sid);
@@ -1532,10 +1894,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             if (rtRef.current !== realtime) throw new Error("Connection changed while sending");
             registerLiveSession(chat, sid, liveSid);
           }
-          await realtime.setSessionConfig(liveSid, {
-            reasoning_effort: reasoningEffort, fast: fastMode, yolo: yoloMode,
-          });
-          let prompt = text;
+          if (!inFlight) {
+            await realtime.setSessionConfig(liveSid, {
+              reasoning_effort: reasoningEffort, fast: fastMode, yolo: yoloMode,
+            });
+          }
+          let prompt = promptText;
           for (const file of attachments) {
             const dataUrl = await new Promise<string>((resolve, reject) => {
               const reader = new FileReader();
@@ -1552,10 +1916,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               prompt += `\n${attached.ref_text ?? ""}`;
             }
           }
-          await realtime.submitPrompt(liveSid, prompt);
+          if (work && (rtRef.current !== realtime || (!queued && !chat.get(sid).isStreaming))) return;
+          const receipt = await realtime.submitPrompt(liveSid, prompt, queued ? { queued: true } : undefined);
+          if (queued && receipt.status === "queued") {
+            chat.patch(sid, { workFollowUpQueued: true });
+            showToast("Follow-up queued");
+          }
           if (currentChat.current === chat) draftSessionIdsRef.current.delete(sid);
         } catch (err) {
-          chat.finish(sid);
+          if (!inFlight) chat.finish(sid);
           const msg = err instanceof Error ? err.message : String(err);
           chat.updateMessages(sid, messages => [
               ...messages,
@@ -1621,10 +1990,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       activeSession?.cwd,
       activeSession?.title,
       connection.mode,
+      connection.ssh,
       createNewSession,
+      ensureWorkSession,
       fastMode,
       chat,
+      isDesktop,
+      isLocalConnection,
       registerLiveSession,
+      refreshWorkHistory,
+      sessionSection,
       reasoningEffort,
       yoloMode,
       showToast,
@@ -1642,10 +2017,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     try {
       await rtRef.current?.interruptSession(liveSid);
       chat.finish(activeSessionId);
+      if (sessionSection === "work") chat.patch(activeSessionId, { workFollowUpQueued: false });
     } catch (error) {
       showToast(error instanceof Error ? error.message : "Could not interrupt response");
     }
-  }, [activeSessionId, chat, showToast]);
+  }, [activeSessionId, chat, sessionSection, showToast]);
 
   const renameSession = useCallback(
     async (sessionId: string, title: string) => {
@@ -1666,23 +2042,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const deleteSession = useCallback(
     async (sessionId: string) => {
       setSessions((prev) => prev.filter((s) => s.id !== sessionId));
-      if (activeSessionId === sessionId) setActiveSessionId(null);
+      forgetSelectedSession(sessionId);
+      setWorkSession(sessionId, false);
       if (clientRef.current) {
         await clientRef.current.deleteSession(sessionId, activeProfile).catch(() => undefined);
       }
       showToast("Session deleted");
     },
-    [activeProfile, activeSessionId, showToast]
+    [activeProfile, forgetSelectedSession, setWorkSession, showToast]
   );
 
   const archiveSession = useCallback(async (sessionId: string, archived: boolean) => {
     try {
       if (clientRef.current) await clientRef.current.archiveSession(sessionId, archived, activeProfile);
       setSessions(prev => prev.map(session => session.id === sessionId ? { ...session, archived } : session));
-      if (archived && activeSessionId === sessionId) setActiveSessionId(null);
+      if (archived) forgetSelectedSession(sessionId);
       showToast(archived ? "Session archived" : "Session restored");
     } catch (error) { showToast(error instanceof Error ? error.message : "Could not archive session"); }
-  }, [activeProfile, activeSessionId, showToast]);
+  }, [activeProfile, forgetSelectedSession, showToast]);
 
   const togglePinSession = useCallback(
     async (sessionId: string) => {
@@ -1718,8 +2095,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const res = await rtRef.current.branchSession(liveSid);
         const newSid = String(res.stored_session_id ?? res.session_key ?? res.session_id ?? "");
         if (newSid) {
+          if (currentChat.current !== chat) return;
+          if (sessionSection === "work") setWorkSession(newSid);
+          if (typeof res.session_id === "string") registerLiveSession(chat, newSid, res.session_id);
           await refreshCapabilities();
-          await selectSession(newSid);
+          if (currentChat.current === chat) await selectSession(newSid, sessionSection);
           showToast("Branched session");
           return;
         }
@@ -1727,9 +2107,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         // fallback below
       }
     }
+    if (sessionSection === "work") {
+      showToast("Hermes could not branch this Work session.");
+      return;
+    }
     await createNewSession({ title: `${activeSession?.title ?? "Chat"} (branch)` });
     showToast("Branched session");
-  }, [activeSession?.title, activeSessionId, chat, createNewSession, refreshCapabilities, selectSession, showToast]);
+  }, [activeSession?.title, activeSessionId, chat, createNewSession, refreshCapabilities, registerLiveSession, selectSession, sessionSection, setWorkSession, showToast]);
 
   const respondApproval = useCallback(
     async (approvalId: string, choice: "once" | "always" | "deny") => {
@@ -1844,6 +2228,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     dispatchBoardWorkers,
     launchSessionForTask,
     sessions,
+    sessionSection,
+    workSessionIds,
+    startNewWork,
+    workCheckpoint,
+    refreshWorkGoal,
+    controlWorkSubagent,
+    completeWorkReference,
+    exportWorkSession,
+    importWorkSession,
     activeSessionId,
     activeSession,
     chat,

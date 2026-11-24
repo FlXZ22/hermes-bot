@@ -1,11 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CursorIcon } from "@grok-bot/theme";
 import { AnimatedBotFace } from "./AnimatedBotFace";
-import { useApp, type RightPaneTabId } from "../state/appStore";
-import { tauriBridge, type GitWorkspaceStatus, type WorkspaceFileEntry } from "../lib/tauriBridge";
+import { useApp, useChatSlice, type RightPaneTabId } from "../state/appStore";
+import { tauriBridge, type GitDiffScope, type GitWorkspaceAction, type GitWorkspaceStatus, type WorkspaceFileEntry } from "../lib/tauriBridge";
 import { shortModelName } from "../lib/format";
 
 const TerminalWorkspace = React.lazy(() => import("./TerminalWorkspace").then(module => ({ default: module.TerminalWorkspace })));
+const WorkGitActions = React.lazy(() => import("./WorkGitActions").then(module => ({ default: module.WorkGitActions })));
+const RemoteWorkGitReview = React.lazy(() => import("./RemoteWorkGitReview").then(module => ({ default: module.RemoteWorkGitReview })));
+const WorkPullRequest = React.lazy(() => import("./WorkPullRequest").then(module => ({ default: module.WorkPullRequest })));
 
 export const RightSidePane: React.FC = () => {
   const {
@@ -36,10 +39,23 @@ export const RightSidePane: React.FC = () => {
     restartLocalBackend,
     refreshModels,
     refreshingModels,
+    showToast,
+    createNewSession,
   } = useApp();
 
+  const workspaceView = activeView === "chat" || (activeView === "work" && Boolean(activeSession));
   const [terminalMounted, setTerminalMounted] = useState(false);
-  useEffect(() => { if (rightPaneOpen && rightPaneTab === "terminal" && activeView === "chat" && !setupOpen) setTerminalMounted(true); }, [rightPaneOpen, rightPaneTab, activeView, setupOpen]);
+  const [mountedWorkTerminals, setMountedWorkTerminals] = useState<ReadonlySet<string>>(() => new Set());
+  const workTerminalScope = activeView === "work" && activeSession ? JSON.stringify([activeProfile, activeSession.id]) : undefined;
+  const terminalVisible = rightPaneOpen && workspaceView && rightPaneTab === "terminal" && !setupOpen;
+  useEffect(() => {
+    if (!terminalVisible) return;
+    if (workTerminalScope) {
+      setMountedWorkTerminals(previous => previous.has(workTerminalScope) ? previous : new Set([...previous, workTerminalScope]));
+    } else {
+      setTerminalMounted(true);
+    }
+  }, [terminalVisible, workTerminalScope]);
 
   const isDesktop = nativeDesktop && isLocalConnection;
   const defaultDir = activeSession?.cwd || systemStats?.home_dir || (isLocalConnection ? "/home" : "");
@@ -48,11 +64,27 @@ export const RightSidePane: React.FC = () => {
   const [fileError, setFileError] = useState<string | null>(null);
   const [previewPath, setPreviewPath] = useState<string | null>(null);
   const [previewContent, setPreviewContent] = useState<string>("");
+  const filesRequest = useRef(0);
+  const previewRequest = useRef(0);
 
   // Git state
-  const [gitStatus, setGitStatus] = useState<GitWorkspaceStatus | null>(null);
+  const [gitResult, setGitResult] = useState<{ key: string; status: GitWorkspaceStatus } | null>(null);
   const [gitLoading, setGitLoading] = useState(false);
   const [gitError, setGitError] = useState("");
+  const [gitBusy, setGitBusy] = useState(false);
+  const [gitRevision, setGitRevision] = useState(0);
+  const gitActionPending = useRef(false);
+  const lastTurn = useChatSlice(chat => activeView === "work" ? chat.lastTurnSettlement : null);
+  const lastTurnBaseline = useChatSlice(chat => activeView === "work" ? chat.gitTurnBaseline : null);
+  const [workDiffScope, setWorkDiffScope] = useState<GitDiffScope>("uncommitted");
+  const gitRequest = useRef(0);
+  const gitScope = activeView === "work"
+    ? (workDiffScope === "lastTurn" && !lastTurnBaseline ? "uncommitted" : workDiffScope)
+    : undefined;
+  const gitBaseline = gitScope === "lastTurn" ? lastTurnBaseline ?? undefined : undefined;
+  const gitCwd = activeView === "work" ? activeSession?.cwd : cwd;
+  const gitKey = JSON.stringify([gitCwd, gitScope, gitBaseline]);
+  const gitStatus = gitResult?.key === gitKey ? gitResult.status : null;
   const canReadGit = nativeDesktop && (isLocalConnection || !!connection.ssh);
 
   // Bot SOUL draft
@@ -62,23 +94,37 @@ export const RightSidePane: React.FC = () => {
   }, [soulMd]);
 
   useEffect(() => {
+    if (activeView === "work") return;
     if (activeSession?.cwd) {
       setCwd(activeSession.cwd);
     } else if (systemStats?.home_dir && cwd === "/home") {
       setCwd(systemStats.home_dir);
     }
-  }, [activeSession?.cwd, cwd, systemStats?.home_dir]);
+  }, [activeView, activeSession?.cwd, cwd, systemStats?.home_dir]);
+
+  useEffect(() => {
+    if (activeView !== "work" || !activeSession?.cwd) return;
+    setCwd(activeSession.cwd);
+    setPreviewPath(null);
+    setPreviewContent("");
+    previewRequest.current += 1;
+    return () => {
+      filesRequest.current += 1;
+      previewRequest.current += 1;
+    };
+  }, [activeView, activeSession?.id, activeSession?.cwd]);
 
   const loadFiles = useCallback(
     async (targetDir: string) => {
       setFileError(null);
+      const request = ++filesRequest.current;
       try {
         if (isDesktop) {
           const list = await tauriBridge.listWorkspaceFiles(targetDir);
-          setFiles(list);
+          if (request === filesRequest.current) setFiles(list);
         } else if (client) {
           const list = await client.listFiles(targetDir);
-          setFiles(
+          if (request === filesRequest.current) setFiles(
             list.map((e) => ({
               name: e.name,
               path: e.path,
@@ -89,29 +135,55 @@ export const RightSidePane: React.FC = () => {
           );
         }
       } catch (err) {
-        setFileError(err instanceof Error ? err.message : String(err));
+        if (request === filesRequest.current) setFileError(err instanceof Error ? err.message : String(err));
       }
     },
     [client, isDesktop]
   );
 
   const loadGit = useCallback(async () => {
-    if (!canReadGit) return;
+    if (!canReadGit || !gitCwd) return;
+    const request = ++gitRequest.current;
     setGitLoading(true); setGitError("");
     try {
-      const st = await tauriBridge.gitWorkspaceStatus(cwd, isLocalConnection ? undefined : connection.ssh);
-      setGitStatus(st);
-    } catch (error) { setGitError(String(error)); setGitStatus(null);
+      const st = await tauriBridge.gitWorkspaceStatus(gitCwd, isLocalConnection ? undefined : connection.ssh, gitScope, gitBaseline);
+      if (request === gitRequest.current) setGitResult({ key: gitKey, status: st });
+    } catch (error) {
+      if (request === gitRequest.current) { setGitError(String(error)); setGitResult(null); }
     } finally {
-      setGitLoading(false);
+      if (request === gitRequest.current) setGitLoading(false);
     }
-  }, [cwd, canReadGit, isLocalConnection, connection.ssh]);
+  }, [gitBaseline, gitCwd, gitKey, gitScope, canReadGit, isLocalConnection, connection.ssh]);
+
+  const runGitAction = async (action: GitWorkspaceAction) => {
+    if (!gitCwd || !canReadGit || gitActionPending.current || activeView !== "work") return false;
+    gitActionPending.current = true;
+    setGitBusy(true);
+    try {
+      await tauriBridge.gitWorkspaceAction(gitCwd, action, isLocalConnection ? undefined : connection.ssh);
+      if (action.type === "worktree") showToast(`Worktree created at ${action.path}`);
+      if (action.type === "commit") showToast("Staged changes committed");
+      if (action.type === "push") showToast("Git push finished");
+      setGitRevision(value => value + 1);
+      return true;
+    } catch (error) {
+      showToast(typeof error === "string" ? error : error instanceof Error ? error.message : "Git action failed");
+      return false;
+    } finally {
+      gitActionPending.current = false;
+      setGitBusy(false);
+    }
+  };
 
   useEffect(() => {
-    if (!rightPaneOpen || activeView !== "chat" || setupOpen) return;
-    if (rightPaneTab === "files") void loadFiles(cwd);
-    if (rightPaneTab === "git") void loadGit();
-  }, [cwd, loadFiles, loadGit, rightPaneOpen, rightPaneTab, activeView, setupOpen]);
+    if (rightPaneOpen && workspaceView && !setupOpen && rightPaneTab === "files") void loadFiles(cwd);
+  }, [cwd, loadFiles, rightPaneOpen, rightPaneTab, workspaceView, setupOpen]);
+
+  useEffect(() => {
+    if (!rightPaneOpen || !workspaceView || setupOpen || rightPaneTab !== "git") return;
+    void loadGit();
+    return () => { gitRequest.current += 1; };
+  }, [gitRevision, lastTurn, loadGit, rightPaneOpen, rightPaneTab, workspaceView, setupOpen]);
 
   // Drag resize handle
   const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -134,6 +206,7 @@ export const RightSidePane: React.FC = () => {
 
 
   const openFile = async (entry: WorkspaceFileEntry) => {
+    const request = ++previewRequest.current;
     if (entry.is_dir) {
       setCwd(entry.path);
       setPreviewPath(null);
@@ -146,9 +219,9 @@ export const RightSidePane: React.FC = () => {
         : client
           ? await client.readFile(entry.path)
           : "";
-      setPreviewContent(text);
+      if (request === previewRequest.current) setPreviewContent(text);
     } catch (err) {
-      setPreviewContent(err instanceof Error ? err.message : "Unable to read file");
+      if (request === previewRequest.current) setPreviewContent(err instanceof Error ? err.message : "Unable to read file");
     }
   };
 
@@ -163,7 +236,7 @@ export const RightSidePane: React.FC = () => {
   const botAv = botAvatars[botSeed];
 
   return (
-    <aside className="gb-side-pane" style={{ width: rightPaneWidth, display: rightPaneOpen && activeView === "chat" && !setupOpen ? undefined : "none" }}>
+    <aside className="gb-side-pane" style={{ width: rightPaneWidth, display: rightPaneOpen && workspaceView && !setupOpen ? undefined : "none" }}>
       <div className="gb-side-pane__resize" onMouseDown={startResize} />
 
       <div className="gb-side-pane__header">
@@ -275,23 +348,48 @@ export const RightSidePane: React.FC = () => {
         )}
 
         <div style={{ display: rightPaneTab === "terminal" ? "flex" : "none", flex: 1, minHeight: 0 }}>
-          {terminalMounted && <React.Suspense fallback={<span style={{ fontSize: 12, color: "var(--grok-bot-text-secondary)" }}>Opening terminal…</span>}><TerminalWorkspace cwd={cwd} visible={rightPaneOpen && activeView === "chat" && rightPaneTab === "terminal" && !setupOpen} /></React.Suspense>}
+          <React.Suspense fallback={<span style={{ fontSize: 12, color: "var(--grok-bot-text-secondary)" }}>Opening terminal…</span>}>
+            <div style={{ display: workTerminalScope ? "none" : "contents" }}>
+              {terminalMounted && <TerminalWorkspace cwd={cwd} visible={terminalVisible && !workTerminalScope} />}
+            </div>
+            {workTerminalScope && mountedWorkTerminals.has(workTerminalScope) && (
+              <TerminalWorkspace key={workTerminalScope} workScope={workTerminalScope}
+                cwd={activeSession?.cwd ?? cwd} visible={terminalVisible} />
+            )}
+          </React.Suspense>
         </div>
 
         {/* GIT TAB */}
-        {rightPaneTab === "git" && (
+        {rightPaneOpen && rightPaneTab === "git" && activeView === "work" && !canReadGit && client && gitCwd && (
+          <React.Suspense fallback={<span role="status">Opening Git review…</span>}>
+            <RemoteWorkGitReview key={gitCwd} client={client} cwd={gitCwd} />
+          </React.Suspense>
+        )}
+        {rightPaneTab === "git" && !(activeView === "work" && !canReadGit && client && gitCwd) && (
           <>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
               <span className="gb-badge gb-badge--accent">
                 <CursorIcon name="git-branch" size={12} />
-                {!canReadGit ? "Add SSH access to read server Git status" : gitStatus?.is_repo ? gitStatus.branch : "Not a git repo"}
+                {!canReadGit ? "Add SSH access to read server Git status" : gitLoading ? "Reading repository…" : gitStatus?.is_repo ? gitStatus.branch : gitError ? "Git review" : "Not a git repo"}
               </span>
-              <button type="button" className="gb-btn gb-btn--secondary gb-btn--sm" disabled={!canReadGit || gitLoading} onClick={() => void loadGit()}>
+              <button type="button" className="gb-btn gb-btn--secondary gb-btn--sm" disabled={!canReadGit || gitLoading || gitBusy} onClick={() => void loadGit()}>
                 <CursorIcon name="refresh" size={12} spin={gitLoading} />
                 Refresh
               </button>
             </div>
 
+            {activeView === "work" && canReadGit && (
+              <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span>Diff scope</span>
+                <select className="gb-input" value={gitScope} disabled={gitBusy} onChange={event => setWorkDiffScope(event.target.value as GitDiffScope)}>
+                  <option value="uncommitted">Uncommitted</option>
+                  <option value="unstaged">Unstaged</option>
+                  <option value="staged">Staged</option>
+                  <option value="branch">Branch</option>
+                  <option value="lastTurn" disabled={!lastTurnBaseline}>Last turn · tracked files</option>
+                </select>
+              </label>
+            )}
             {gitError && <div className="gb-terminal-error" role="alert">{gitError}</div>}
             {gitStatus?.is_repo && (
               <>
@@ -309,11 +407,35 @@ export const RightSidePane: React.FC = () => {
                         <div key={idx} style={{ display: "flex", gap: 8, fontSize: 12, fontFamily: "var(--cursor-font-family-mono)" }}>
                           <span className="gb-badge gb-badge--warning">{f.status || "M"}</span>
                           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.path}</span>
+                          {activeView === "work" && f.paths?.length && (
+                            <span className="gb-work-git-file-actions">
+                              {f.worktree_status && f.worktree_status !== " " && <button className="gb-chip-btn" type="button" disabled={gitBusy || gitLoading}
+                                aria-label={`Stage ${f.path}`} onClick={() => void runGitAction({ type: "stage", paths: f.paths! })}>Stage</button>}
+                              {f.index_status && f.index_status !== " " && f.index_status !== "?" && <button className="gb-chip-btn" type="button" disabled={gitBusy || gitLoading}
+                                aria-label={`Unstage ${f.path}`} onClick={() => void runGitAction({ type: "unstage", paths: f.paths! })}>Unstage</button>}
+                            </span>
+                          )}
                         </div>
                       ))
                     )}
                   </div>
                 </div>
+
+                {activeView === "work" && (
+                  <React.Suspense fallback={null}>
+                    <WorkGitActions key={`actions:${gitCwd}`}
+                      staged={gitStatus.changed_files.some(file => Boolean(file.index_status?.trim() && file.index_status !== "?"))}
+                      busy={gitBusy || gitLoading}
+                      run={runGitAction}
+                      createWorktree={async (branch, path) => await runGitAction({ type: "worktree", branch, path }) ? path : null}
+                      openWorktree={async path => {
+                        try { await createNewSession({ section: "work", cwd: path }); }
+                        catch (error) { showToast(error instanceof Error ? error.message : "Could not open worktree"); }
+                      }}
+                    />
+                    {client && gitCwd && <WorkPullRequest key={`pull-request:${gitCwd}`} client={client} cwd={gitCwd} disabled={gitBusy || gitLoading} />}
+                  </React.Suspense>
+                )}
 
                 {gitStatus.worktrees.length > 0 && (
                   <div className="gb-section-card">

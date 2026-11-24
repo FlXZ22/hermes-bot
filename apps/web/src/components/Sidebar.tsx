@@ -8,6 +8,7 @@ import { formatRelativeTime } from "../lib/format";
 
 const NAV_ITEMS: Array<{ id: AppViewId; label: string; icon: CursorIconName }> = [
   { id: "chat", label: "Chat", icon: "chat-bubble" },
+  { id: "work", label: "Work", icon: "code" },
   { id: "boards", label: "Boards", icon: "board-kanban" },
   { id: "skills", label: "Skills", icon: "sparkles" },
   { id: "cron", label: "Cron", icon: "clock" },
@@ -44,6 +45,9 @@ export const Sidebar: React.FC = () => {
     sessionBoards,
     createBoard,
     sessions,
+    sessionSection,
+    workSessionIds,
+    startNewWork,
     activeSessionId,
     selectSession,
     createNewSession,
@@ -87,16 +91,17 @@ export const Sidebar: React.FC = () => {
   const filteredSessions = useMemo(() => {
     const q = search.trim().toLowerCase();
     return sessions.filter((s) => {
+      if (workSessionIds.has(s.id) !== (sessionSection === "work")) return false;
       if (Boolean(s.archived) !== showArchived) return false;
-      if (activeBoardSlug !== "all") {
+      if (sessionSection === "chat" && activeBoardSlug !== "all") {
         const assigned = sessionBoards[s.id] ?? s.board_slug ?? "default";
         if (assigned !== activeBoardSlug) return false;
       }
       if (!q) return true;
-      const hay = `${s.title ?? ""} ${s.preview ?? ""} ${s.model ?? ""} ${s.profile ?? ""}`.toLowerCase();
+      const hay = `${s.title ?? ""} ${s.preview ?? ""} ${s.model ?? ""} ${s.profile ?? ""}${sessionSection === "work" ? ` ${s.cwd ?? ""}` : ""}`.toLowerCase();
       return hay.includes(q);
     });
-  }, [activeBoardSlug, search, sessionBoards, sessions, showArchived]);
+  }, [activeBoardSlug, search, sessionBoards, sessionSection, sessions, showArchived, workSessionIds]);
 
   const pinnedSessions = useMemo(() => filteredSessions.filter((s) => s.pinned), [filteredSessions]);
   const recentSessions = useMemo(() => filteredSessions.filter((s) => !s.pinned), [filteredSessions]);
@@ -132,7 +137,7 @@ export const Sidebar: React.FC = () => {
   };
 
   const renderSessionRow = (s: typeof sessions[number]) => {
-    const isActive = activeView === "chat" && activeSessionId === s.id;
+    const isActive = activeView === sessionSection && activeSessionId === s.id;
     const seed = s.profile || s.id;
     const av = botAvatars[seed];
     const isWorking = isActive && isStreaming;
@@ -218,7 +223,7 @@ export const Sidebar: React.FC = () => {
                   }}
                 />
               ) : (
-                <span className="gb-agent-row__name">{s.title || "Untitled Chat"}</span>
+                <span className="gb-agent-row__name">{s.title || (sessionSection === "work" ? "Untitled Work" : "Untitled Chat")}</span>
               )}
 
               <span className="gb-agent-row__time">
@@ -323,10 +328,10 @@ export const Sidebar: React.FC = () => {
               <button
                 type="button"
                 className="gb-circle-btn"
-                title="New Chat"
-                onClick={() => void createNewSession()}
+                title={sessionSection === "work" ? "New Work" : "New Chat"}
+                onClick={() => sessionSection === "work" ? startNewWork() : void createNewSession()}
               >
-                <CursorIcon name="chat-bubble-plus" size={15} />
+                <CursorIcon name={sessionSection === "work" ? "plus" : "chat-bubble-plus"} size={15} />
               </button>
             )}
           </div>
@@ -352,7 +357,7 @@ export const Sidebar: React.FC = () => {
         )}
 
         {/* Session Boards Switcher Strip */}
-        {!sidebarCollapsed && (
+        {!sidebarCollapsed && sessionSection === "chat" && (
           <div className="gb-board-strip" aria-label="Session boards">
             <button
               type="button"
@@ -476,7 +481,7 @@ export const Sidebar: React.FC = () => {
           {/* Recent Sessions */}
           {!sidebarCollapsed && (
             <div className="gb-sidebar-section-label">
-              <span>{showArchived ? "Archived" : activeBoardSlug === "all" ? "Sessions" : `Board · ${boards.find((b) => b.slug === activeBoardSlug)?.name ?? activeBoardSlug}`}</span>
+              <span>{showArchived ? "Archived" : sessionSection === "work" ? "Work sessions" : activeBoardSlug === "all" ? "Sessions" : `Board · ${boards.find((b) => b.slug === activeBoardSlug)?.name ?? activeBoardSlug}`}</span>
               <span style={{display:"flex",alignItems:"center",gap:6}}>{recentSessions.length}<button type="button" className="gb-mini-icon-btn" title={showArchived ? "Show active sessions" : "Show archived sessions"} aria-pressed={showArchived} onClick={() => setShowArchived(value => !value)}><CursorIcon name="archive" size={12}/></button></span>
             </div>
           )}
@@ -485,7 +490,7 @@ export const Sidebar: React.FC = () => {
             recentSessions.map(renderSessionRow)
           ) : !sidebarCollapsed ? (
             <div style={{ padding: "14px 10px", fontSize: 12.5, color: "var(--grok-bot-sidebar-text-tertiary)" }}>
-              No sessions here yet. Click <strong>+</strong> to start a new chat.
+              {sessionSection === "work" ? "No Work sessions yet." : <>No sessions here yet. Click <strong>+</strong> to start a new chat.</>}
             </div>
           ) : null}
         </div>

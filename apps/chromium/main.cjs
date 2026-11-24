@@ -28,7 +28,8 @@ const commands = new Set([
   'load_connection', 'save_connection', 'begin_remote_login', 'poll_remote_login', 'cancel_remote_login',
   'refresh_remote_login', 'hermes_http_request', 'load_local_bootstrap', 'load_local_session_messages',
   'load_board_state', 'save_board_state', 'save_local_memory_file', 'list_workspace_files',
-  'read_workspace_file', 'git_workspace_status', 'get_linux_system_stats', 'terminal_start',
+  'read_workspace_file', 'git_workspace_status', 'git_workspace_action', 'git_work_turn_baseline',
+  'get_linux_system_stats', 'terminal_start',
   'terminal_write', 'terminal_acknowledge', 'terminal_resize', 'terminal_info', 'terminal_close',
   'get_update_status', 'check_for_updates', 'set_update_settings', 'apply_app_update',
 ]);

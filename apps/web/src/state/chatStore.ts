@@ -1,4 +1,4 @@
-import type { HermesMessage, HermesSessionUsage, HermesTodoItem } from "@grok-bot/hermes-client";
+import type { HermesMessage, HermesSessionUsage, HermesSubagentEvent, HermesTodoItem } from "@grok-bot/hermes-client";
 import type { TurnSettlement, TurnSettlementOutcome } from "../lib/botState";
 
 export interface ChatSnapshot {
@@ -8,6 +8,11 @@ export interface ChatSnapshot {
   olderOffset: number | null;
   loadingHistory: boolean;
   todos: HermesTodoItem[];
+  subagents: HermesSubagentEvent[];
+  goalStatus: string | null;
+  gitTurnBaseline: string | null;
+  workFollowUpQueued: boolean;
+  workExploring: boolean;
   sessionUsage: HermesSessionUsage | null;
   isStreaming: boolean;
   liveStatusText: string;
@@ -24,6 +29,11 @@ const empty: ChatSnapshot = {
   olderOffset: null,
   loadingHistory: false,
   todos: [],
+  subagents: [],
+  goalStatus: null,
+  gitTurnBaseline: null,
+  workFollowUpQueued: false,
+  workExploring: false,
   sessionUsage: null,
   isStreaming: false,
   liveStatusText: "",
@@ -51,7 +61,7 @@ export class ChatStore {
     if (this.recent.size <= 32) return;
     for (const candidate of this.recent) {
       const session = this.get(candidate);
-      if (candidate === id || this.listeners.has(candidate) || session.isStreaming || session.loadingHistory) continue;
+      if (candidate === id || this.listeners.has(candidate) || session.isStreaming || session.loadingHistory || session.workExploring) continue;
       this.recent.delete(candidate);
       this.sessions.delete(candidate);
       this.messagesById.delete(candidate);

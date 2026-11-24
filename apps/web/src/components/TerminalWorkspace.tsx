@@ -150,10 +150,10 @@ function TerminalSurface({ tab, active, ssh, update, theme }: { tab: TerminalTab
   </section>;
 }
 
-export function TerminalWorkspace({ cwd, visible }: { cwd: string; visible: boolean }) {
+export function TerminalWorkspace({ cwd, visible, workScope }: { cwd: string; visible: boolean; workScope?: string }) {
   const { isDesktop, isLocalConnection, connection, theme, setSetupOpen, client, initializing } = useApp();
   const scope = isLocalConnection ? "local" : `${connection.url}:${JSON.stringify(connection.ssh ?? null)}`;
-  const key = `hermes-grok-bot:terminals:${scope}`;
+  const key = workScope ? `hermes-grok-bot:terminals:${scope}:work:${workScope}` : `hermes-grok-bot:terminals:${scope}`;
   const [initial] = useState(() => readTabs(key));
   const [tabs, setTabs] = useState<TerminalTab[]>(initial.tabs);
   const [active, setActive] = useState<string | null>(initial.active);
@@ -169,11 +169,12 @@ export function TerminalWorkspace({ cwd, visible }: { cwd: string; visible: bool
   useEffect(() => {
     clearTimeout(closeTimer.current);
     return () => {
+      if (workScope) return;
       // Delay one task so React StrictMode's effect check cannot kill a shell
       // immediately reattached by its second mount.
       closeTimer.current = setTimeout(() => { for (const tab of latestTabs.current) void tauriBridge.terminalClose(tab.id).catch(() => undefined); }, 0);
     };
-  }, []);
+  }, [workScope]);
   const update = useCallback((id: string, patch: Partial<TerminalTab>) => {
     const next = latestTabs.current.map(tab => tab.id === id && Object.entries(patch).some(([key, value]) => tab[key as keyof TerminalTab] !== value) ? { ...tab, ...patch } : tab);
     latestTabs.current = next;

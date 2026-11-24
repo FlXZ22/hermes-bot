@@ -1,8 +1,8 @@
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { once } from 'node:events';
 import assert from 'node:assert/strict';
 import { HermesClient } from '../packages/hermes-client/dist/client.js';
@@ -15,6 +15,7 @@ const home = await mkdtemp(`${tmpdir()}/hermes-ui-e2e-`);
 const token = randomBytes(32).toString('hex');
 const reply = 'Hermes UI integration response.';
 let modelRequests = 0;
+let exploreRequest;
 const model = createServer(async (req, res) => {
   if (req.method === 'GET') {
     res.setHeader('Content-Type', 'application/json');
@@ -25,16 +26,41 @@ const model = createServer(async (req, res) => {
   for await (const chunk of req) body += chunk;
   const data = JSON.parse(body);
   modelRequests++;
+  const user = data.messages?.findLast(message => message.role === 'user');
+  if (user?.content?.includes?.('Explore the Work fixture without editing.')) {
+    exploreRequest = data;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({
+      id: 'fixture-explore', object: 'chat.completion', model: 'hermes-ui-test',
+      choices: [{ index: 0, message: {
+        role: 'assistant', content: 'The existing Work fixture contains one line.',
+        tool_calls: [{ id: 'call_explore_write', type: 'function', function: {
+          name: 'write_file', arguments: JSON.stringify({ path: 'work-fixture.txt', content: 'Unexpected Explore write\n' }),
+        } }],
+      }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+    }));
+    return;
+  }
   if (!data.stream) {
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ id: 'fixture', object: 'chat.completion', model: 'hermes-ui-test', choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 5, total_tokens: 6 } }));
     return;
   }
   res.setHeader('Content-Type', 'text/event-stream');
-  for (const delta of [{ role: 'assistant' }, { content: 'Hermes UI ' }, { content: 'integration response.' }]) {
+  const toolTurn = user?.content === 'Create the Work fixture file.' && !data.messages.some(message => message.role === 'tool');
+  const deltas = toolTurn ? [
+    { role: 'assistant', tool_calls: [{
+      index: 0,
+      id: 'call_work_file',
+      type: 'function',
+      function: { name: 'write_file', arguments: JSON.stringify({ path: 'work-fixture.txt', content: 'Created by Hermes Work\n' }) },
+    }] },
+  ] : [{ role: 'assistant' }, { content: 'Hermes UI ' }, { content: 'integration response.' }];
+  for (const delta of deltas) {
     res.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', model: 'hermes-ui-test', choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
   }
-  res.end(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', model: 'hermes-ui-test', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+  res.end(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', model: 'hermes-ui-test', choices: [{ index: 0, delta: {}, finish_reason: toolTurn ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`);
 });
 model.listen(0, '127.0.0.1');
 await once(model, 'listening');
@@ -98,6 +124,91 @@ try {
   const resumed = await rt.resumeSession(session.stored_session_id, { omit_messages: true });
   assert.equal(typeof resumed.session_id, 'string');
   console.log('PASS conversation branch, resume, and file attachment staging');
+  const workspace = `${home}/project with spaces`;
+  await mkdir(workspace);
+  execFileSync("git", ["init", "--quiet"], { cwd: workspace });
+  const work = await rt.createSession({ source: 'desktop', title: 'Fixture Work', cwd: workspace, model: 'hermes-ui-test', provider: 'custom' });
+  assert.equal(work.info.cwd, workspace);
+  const workPlan = await rt.dispatchCommand(work.session_id, '/plan Add a file');
+  assert.equal(workPlan.type, 'send');
+  assert.match(workPlan.message, /Add a file/);
+  const workGoal = await rt.dispatchCommand(work.session_id, '/goal Add a file');
+  assert.equal(workGoal.type, 'send');
+  assert.equal(workGoal.message, 'Add a file');
+  const paused = await rt.dispatchCommand(work.session_id, '/goal pause');
+  assert.equal(paused.type, 'exec');
+  assert.match(paused.output, /Goal paused/);
+  const resumedGoal = await rt.dispatchCommand(work.session_id, '/goal resume');
+  assert.equal(resumedGoal.type, 'send');
+  assert.equal(resumedGoal.display, '/goal resume');
+  await rt.dispatchCommand(work.session_id, '/goal clear');
+  console.log('PASS Work workspace binding, plan dispatch, and native goal lifecycle');
+  const workComplete = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { unsubscribe(); reject(new Error('No completed Work response')); }, 40_000);
+    const unsubscribe = rt.subscribe(event => {
+      if (event.sessionId !== work.session_id || (event.type !== 'error' && event.type !== 'message.complete')) return;
+      unsubscribe();
+      clearTimeout(timer);
+      if (event.type === 'error') reject(new Error(event.message));
+      else resolve();
+    });
+  });
+  await rt.submitPrompt(work.session_id, 'Create the Work fixture file.');
+  await workComplete;
+  assert.equal(await readFile(`${workspace}/work-fixture.txt`, 'utf8'), 'Created by Hermes Work\n');
+  const workGitStatus = await client.getGitStatus(workspace);
+  assert.ok(workGitStatus?.files.some(file => file.path === 'work-fixture.txt' && file.untracked));
+  const workDiff = await client.getGitFileDiff(workspace, 'work-fixture.txt', 'unstaged');
+  assert.match(workDiff.diff, /\+Created by Hermes Work/);
+  console.log('PASS Hermes Work writes a file inside the requested workspace and reports its diff');
+  assert.ok((await client.listFiles(workspace)).some(entry => entry.name === 'work-fixture.txt'));
+  const fixturePath = `${workspace}/work-fixture.txt`;
+  const source = await client.readFile(fixturePath, { expectedPath: fixturePath, maxBytes: 64 * 1024 });
+  await assert.rejects(client.readFile(fixturePath, { expectedPath: `${workspace}/wrong.txt`, maxBytes: 64 * 1024 }), /expected workspace file/);
+  const beforeExplore = await client.getSessionMessages(work.stored_session_id);
+  const explored = await rt.rpc('llm.oneshot', {
+    session_id: work.session_id, task: 'work_explore', instructions: 'Answer in read-only mode.',
+    input: `Explore the Work fixture without editing.\n${source}`, max_tokens: 1400,
+  });
+  assert.equal(explored.text, 'The existing Work fixture contains one line.');
+  assert.ok(exploreRequest);
+  assert.ok(!exploreRequest.tools?.length);
+  assert.equal(await readFile(fixturePath, 'utf8'), source);
+  assert.deepEqual(await client.getSessionMessages(work.stored_session_id), beforeExplore);
+  console.log('PASS real Hermes Explore request has no tools, does not write files, and preserves history');
+  const importTime = Date.now() / 1000;
+  const imported = {
+    id: 'work-import-fixture', title: 'Imported fixture', cwd: workspace, source: 'desktop',
+    started_at: importTime, ended_at: importTime, model: 'hermes-ui-test',
+    messages: [
+      { role: 'user', content: 'Check a historical fixture.', timestamp: importTime },
+      { role: 'assistant', content: 'The fixture is ready.', timestamp: importTime },
+    ],
+  };
+  assert.deepEqual((await client.importSession(imported)).imported_ids, [imported.id]);
+  assert.deepEqual((await client.importSession(imported)).skipped_ids, [imported.id]);
+  assert.equal((await client.listSessions()).find(row => row.id === imported.id)?.cwd, workspace);
+  assert.deepEqual((await client.getSessionMessages(imported.id)).map(({ role, content }) => [role, content]),
+    imported.messages.map(({ role, content }) => [role, content]));
+  const importedLive = await rt.resumeSession(imported.id, { omit_messages: true });
+  assert.equal(importedLive.info.cwd, workspace);
+  console.log('PASS native Work transcript import, duplicate retry, and workspace resume');
+  execFileSync('git', ['config', 'user.name', 'Hermes fixture'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.email', 'hermes-fixture@example.invalid'], { cwd: workspace });
+  await client.changeGitStaging(workspace, 'work-fixture.txt', true);
+  assert.equal((await client.commitGitChanges(workspace, 'Create fixture')).ok, true);
+  const fixtureRemote = `${home}/fixture-remote.git`;
+  execFileSync('git', ['init', '--bare', '--quiet', fixtureRemote], { cwd: workspace });
+  execFileSync('git', ['remote', 'add', 'origin', fixtureRemote], { cwd: workspace });
+  assert.equal((await client.pushGitBranch(workspace)).ok, true);
+  assert.match(execFileSync('git', ['ls-remote', '--heads', fixtureRemote], { cwd: workspace, encoding: 'utf8' }), /refs\/heads\//);
+  execFileSync('git', ['branch', 'review-fixture'], { cwd: workspace });
+  assert.equal((await client.switchGitBranch(workspace, 'review-fixture')).branch, 'review-fixture');
+  const worktree = await client.createGitWorktree(workspace, 'worktree-fixture');
+  assert.equal(worktree.branch, 'worktree-fixture');
+  assert.ok(worktree.path.startsWith(`${workspace}/.worktrees/`));
+  assert.equal(await readFile(`${worktree.path}/work-fixture.txt`, 'utf8'), 'Created by Hermes Work\n');
+  console.log('PASS Hermes Git staging, commit, push to a local remote, branch switch, and worktree creation');
   await client.pinSession(session.stored_session_id, true);
   assert.equal((await client.listSessions(120)).find(s => s.id === session.stored_session_id)?.pinned, true);
   await client.archiveSession(session.stored_session_id, true);

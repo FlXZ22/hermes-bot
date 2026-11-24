@@ -2,6 +2,7 @@ import type {
   HermesBoardSummary,
   HermesConnection,
   HermesCronJob,
+  HermesGitStatus,
   HermesEnvEntry,
   HermesFileEntry,
   HermesKanbanStatus,
@@ -16,6 +17,7 @@ import type {
   HermesOAuthProvider,
   HermesProfile,
   HermesSession,
+  HermesSessionImport,
   HermesSkill,
   HermesStatus,
   HermesSystemStats,
@@ -341,6 +343,54 @@ export class HermesClient {
       if (page.length < pageSize) break;
     }
     return sessions;
+  }
+
+  importSession(session: HermesSessionImport): Promise<{ ok: boolean; imported_ids: string[]; skipped_ids: string[] }> {
+    return this.request("/api/sessions/import", {
+      method: "POST",
+      body: { profile: this.profile, sessions: [session] },
+    });
+  }
+
+  getGitStatus(path: string): Promise<HermesGitStatus | null> {
+    return this.request("/api/git/status", { query: { path } });
+  }
+
+  listGitWorktrees(path: string): Promise<{ worktrees: Array<{ path: string; branch?: string }> }> {
+    return this.request("/api/git/worktrees", { query: { path } });
+  }
+
+  getGitFileDiff(path: string, file: string, mode: "unstaged" | "staged" | "uncommitted"): Promise<{ diff: string }> {
+    return mode === "uncommitted"
+      ? this.request("/api/git/file-diff", { query: { path, file } })
+      : this.request("/api/git/review/diff", { query: { path, file, scope: "uncommitted", staged: mode === "staged" ? "true" : "false" } });
+  }
+
+  changeGitStaging(path: string, file: string, staged: boolean): Promise<{ ok: boolean }> {
+    return this.request(`/api/git/review/${staged ? "stage" : "unstage"}`, {
+      method: "POST",
+      body: { path, file: `:(top,literal)${file}` },
+    });
+  }
+
+  commitGitChanges(path: string, message: string): Promise<{ ok: boolean }> {
+    return this.request("/api/git/review/commit", { method: "POST", body: { path, message } });
+  }
+
+  pushGitBranch(path: string): Promise<{ ok: boolean }> {
+    return this.request("/api/git/review/push", { method: "POST", body: { path } });
+  }
+
+  switchGitBranch(path: string, branch: string): Promise<{ branch: string }> {
+    return this.request("/api/git/branch/switch", { method: "POST", body: { path, branch } });
+  }
+
+  createGitWorktree(path: string, branch: string): Promise<{ path: string; branch: string }> {
+    return this.request("/api/git/worktree/add", { method: "POST", body: { path, branch, name: branch } });
+  }
+
+  createGitPullRequest(path: string): Promise<{ url: string }> {
+    return this.request("/api/git/review/create-pr", { method: "POST", body: { path } });
   }
 
   async listAllProfileSessions(): Promise<HermesSession[]> {
@@ -746,10 +796,14 @@ export class HermesClient {
     }));
   }
 
-  async readFile(filePath: string): Promise<string> {
-    const res = await this.request<{ content?: string; data_url?: string } | string>("/api/files/read", {
+  async readFile(filePath: string, constraint?: { expectedPath: string; maxBytes: number }): Promise<string> {
+    const res = await this.request<{ content?: string; data_url?: string; path?: string; size?: number } | string>("/api/files/read", {
       query: { path: filePath },
     });
+    if (constraint && (!res || typeof res === "string" || res.path !== constraint.expectedPath ||
+        typeof res.size !== "number" || !Number.isSafeInteger(res.size) || res.size < 0 || res.size > constraint.maxBytes)) {
+      throw new Error("Hermes did not confirm the expected workspace file and size.");
+    }
     if (typeof res === "string") return res;
     if (res.content !== undefined) return res.content;
     if (res.data_url) {

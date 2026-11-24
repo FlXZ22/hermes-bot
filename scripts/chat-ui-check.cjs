@@ -1,4 +1,4 @@
-const { chromium } = require('/home/metis/.local/share/codex-tools/lib/node_modules/@playwright/test');
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || '@playwright/test');
 const assert = require('node:assert/strict');
 (async () => {
  const browser = await chromium.launch({headless:true});

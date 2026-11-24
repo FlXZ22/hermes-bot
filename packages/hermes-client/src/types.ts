@@ -94,6 +94,36 @@ export interface HermesSession {
   [key: string]: unknown;
 }
 
+export interface HermesSessionImportMessage {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: number;
+}
+
+export interface HermesSessionImport {
+  id: string;
+  source: "desktop";
+  title: string;
+  cwd: string;
+  model?: string;
+  started_at: number;
+  ended_at: number;
+  messages: HermesSessionImportMessage[];
+}
+
+export interface HermesGitStatus {
+  branch: string | null;
+  detached: boolean;
+  changed: number;
+  files: Array<{
+    path: string;
+    staged: boolean;
+    unstaged: boolean;
+    untracked: boolean;
+    conflicted: boolean;
+  }>;
+}
+
 export interface HermesToolCall {
   id: string;
   name: string;
@@ -348,13 +378,22 @@ export interface HermesTodoItem {
   status: "pending" | "in_progress" | "completed" | "cancelled" | string;
 }
 
+export interface HermesSubagentEvent {
+  id: string;
+  phase: "queued" | "running" | "finished";
+  goal?: string;
+  model?: string;
+  activity?: string;
+  outcome?: string;
+}
+
 export type HermesStreamEvent =
   | { type: "status"; status: "connecting" | "connected" | "disconnected" | "error"; detail?: string }
   | { type: "gateway.ready"; payload?: Record<string, unknown> }
   | { type: "session.ready"; sessionId: string; info?: Record<string, unknown> }
   | { type: "session.info"; sessionId?: string; info: Record<string, unknown> }
   | { type: "session.usage"; sessionId?: string; usage: HermesSessionUsage }
-  | { type: "status.update"; sessionId?: string; text: string }
+  | { type: "status.update"; sessionId?: string; text: string; kind?: string }
   | { type: "message.start"; sessionId?: string; streamId?: string }
   | { type: "text.delta"; sessionId?: string; delta: string }
   | { type: "thinking.delta"; sessionId?: string; delta: string }
@@ -363,6 +402,7 @@ export type HermesStreamEvent =
   | { type: "tool.progress"; sessionId?: string; toolCallId: string; preview?: string }
   | { type: "tool.end"; sessionId?: string; toolCallId: string; output?: string; error?: string; durationMs?: number }
   | { type: "todo.updated"; sessionId?: string; todos: HermesTodoItem[] }
+  | { type: "subagent.update"; sessionId?: string; subagent: HermesSubagentEvent }
   | { type: "approval.request"; sessionId?: string; approval: HermesApprovalRequest }
   | { type: "approval.settled"; sessionId?: string; id: string; decision: "allowed" | "always" | "denied" }
   | { type: "clarify.request"; sessionId?: string; clarify: HermesClarifyRequest }

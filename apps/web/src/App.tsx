@@ -9,6 +9,7 @@ import { WelcomeScreen } from "./components/WelcomeScreen";
 import { CommandPalette } from "./components/CommandPalette";
 
 const BoardsView = React.lazy(() => import("./components/BoardsView").then(module => ({ default: module.BoardsView })));
+const WorkView = React.lazy(() => import("./components/WorkView").then(module => ({ default: module.WorkView })));
 
 const SkillsView = React.lazy(() => import("./components/SkillsView").then(module => ({ default: module.SkillsView })));
 
@@ -42,6 +43,8 @@ const Shell: React.FC = () => {
         return <AnalyticsView />;
       case "settings":
         return <SettingsView />;
+      case "work":
+        return <WorkView />;
       case "chat":
       default:
         return <ChatView />;

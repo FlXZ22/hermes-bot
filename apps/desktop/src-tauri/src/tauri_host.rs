@@ -214,8 +214,24 @@ fn read_workspace_file(file_path: String) -> Result<String, String> {
 async fn git_workspace_status(
     dir_path: String,
     ssh: Option<ssh::SshTarget>,
+    scope: Option<workspace::GitDiffScope>,
+    baseline: Option<String>,
 ) -> Result<GitWorkspaceStatus, String> {
-    workspace::git_workspace_status(&dir_path, ssh.as_ref()).await
+    workspace::git_workspace_status(&dir_path, ssh.as_ref(), scope.unwrap_or_default(), baseline.as_deref()).await
+}
+
+#[tauri::command]
+async fn git_work_turn_baseline(dir_path: String, ssh: Option<ssh::SshTarget>) -> Result<String, String> {
+    workspace::git_work_turn_baseline(&dir_path, ssh.as_ref()).await
+}
+
+#[tauri::command]
+async fn git_workspace_action(
+    dir_path: String,
+    ssh: Option<ssh::SshTarget>,
+    action: workspace::GitWorkspaceAction,
+) -> Result<String, String> {
+    workspace::git_workspace_action(&dir_path, ssh.as_ref(), action).await
 }
 
 #[tauri::command]
@@ -341,6 +357,8 @@ pub fn run() {
             list_workspace_files,
             read_workspace_file,
             git_workspace_status,
+            git_work_turn_baseline,
+            git_workspace_action,
             run_shell_command,
             get_linux_system_stats,
             window_minimize,

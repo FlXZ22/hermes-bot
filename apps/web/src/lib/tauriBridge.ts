@@ -125,10 +125,19 @@ export interface WorkspaceFileEntry {
 export interface GitWorkspaceStatus {
   is_repo: boolean;
   branch: string;
-  changed_files: Array<{ status: string; path: string }>;
+  changed_files: Array<{ status: string; path: string; index_status?: string; worktree_status?: string; paths?: string[] | null }>;
   worktrees: string[];
   diff: string;
 }
+
+export type GitWorkspaceAction =
+  | { type: "stage" | "unstage"; paths: string[] }
+  | { type: "commit"; message: string }
+  | { type: "push" }
+  | { type: "switchBranch"; branch: string }
+  | { type: "worktree"; path: string; branch: string };
+
+export type GitDiffScope = "unstaged" | "staged" | "uncommitted" | "branch" | "lastTurn";
 
 export interface ShellExecResult {
   stdout: string;
@@ -271,8 +280,14 @@ export const tauriBridge = {
   readWorkspaceFile: (filePath: string): Promise<string> =>
     invoke<string>("read_workspace_file", { filePath }),
 
-  gitWorkspaceStatus: (dirPath: string, ssh?: HermesSshTarget): Promise<GitWorkspaceStatus> =>
-    invoke<GitWorkspaceStatus>("git_workspace_status", { dirPath, ssh }),
+  gitWorkspaceStatus: (dirPath: string, ssh?: HermesSshTarget, scope?: GitDiffScope, baseline?: string): Promise<GitWorkspaceStatus> =>
+    invoke<GitWorkspaceStatus>("git_workspace_status", { dirPath, ssh, scope, baseline }),
+
+  gitWorkspaceAction: (dirPath: string, action: GitWorkspaceAction, ssh?: HermesSshTarget): Promise<string> =>
+    invoke<string>("git_workspace_action", { dirPath, action, ssh }),
+
+  gitWorkTurnBaseline: (dirPath: string, ssh?: HermesSshTarget): Promise<string> =>
+    invoke<string>("git_work_turn_baseline", { dirPath, ssh }),
 
   runShellCommand: (cwd: string, command: string): Promise<ShellExecResult> =>
     invoke<ShellExecResult>("run_shell_command", { cwd, command }),

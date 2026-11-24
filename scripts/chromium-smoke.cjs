@@ -39,7 +39,12 @@ async function run() {
     input.dispatchEvent(new Event('input', { bubbles: true }));
   })()`, true);
   await js(`document.querySelector('button[title^="Send message"]')?.click()`, true);
-  await wait(`Boolean(document.querySelector('.gb-transcript')?.textContent.includes('Chromium gateway fixture'))`, 'The local model reply did not reach the composer');
+  try {
+    await wait(`Boolean(document.querySelector('.gb-transcript')?.textContent.includes('Chromium gateway fixture'))`, 'The local model reply did not reach the composer');
+  } catch (error) {
+    console.log(await js(`document.querySelector('main.gb-chat')?.innerText.slice(0, 1800)`));
+    throw error;
+  }
   const selected = await js(`hermesDesktop.invoke('load_connection')`);
   assert.equal(selected.id, 'local-rust');
   assert.equal(selected.token, undefined);
@@ -56,6 +61,37 @@ async function run() {
     await writeFile(process.env.HERMES_CHROMIUM_SMOKE_SCREENSHOT, page.toPNG());
   }
   console.log('PASS sandboxed renderer, blocked child window, native credentials and authenticated Markdown streaming');
+
+  const workRoot = process.env.HERMES_CHROMIUM_WORK_FIXTURE;
+  if (workRoot) {
+    await js(`document.querySelector('.gb-sidebar-nav button[title="Work"]')?.click()`, true);
+    await wait(`Boolean(document.querySelector('.gb-work-setup input'))`, 'Work workspace chooser did not appear');
+    await js(`(() => {
+      const input = document.querySelector('.gb-work-setup input');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(workRoot)});
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`, true);
+    await click('Open workspace');
+    await wait(`Boolean(document.querySelector('.gb-work-toolbar')?.textContent.includes(${JSON.stringify(workRoot)}))`, 'Work did not open the selected folder');
+    await js(`(() => {
+      const input = document.querySelector('.gb-composer__textarea');
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(
+        input, '/explore What does this Work fixture contain? @file:work-fixture.txt'
+      );
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`, true);
+    await js(`document.querySelector('button[title^="Send message"]')?.click()`, true);
+    await wait(`Boolean(document.querySelector('.gb-transcript')?.textContent.includes('The Chromium fixture contains a single line.'))`, 'Read-only Work Explore did not answer');
+    await js(`[...document.querySelectorAll('.gb-work-toolbar button')].find(button => button.textContent === 'Git')?.click()`, true);
+    await wait(`Boolean(document.querySelector('button[aria-label="Stage work-fixture.txt"]'))`, 'Native Work Git status did not list the untracked file');
+    await js(`document.querySelector('button[aria-label="Stage work-fixture.txt"]')?.click()`, true);
+    await wait(`Boolean(document.querySelector('button[aria-label="Unstage work-fixture.txt"]'))`, 'Native Work Git staging did not refresh');
+    const index = await js(`hermesDesktop.invoke('git_workspace_status', { dirPath: ${JSON.stringify(workRoot)}, scope: 'staged' })`);
+    assert.match(index.diff, /\+Chromium Git fixture/);
+    await js(`document.querySelector('.gb-sidebar-nav button[title="Chat"]')?.click()`, true);
+    await wait(`Boolean(document.querySelector('.gb-transcript strong')?.textContent.includes('Chromium gateway fixture'))`, 'Returning to Chat lost the previous conversation');
+    console.log('PASS Chromium Work folder selection, read-only Explore, native Git staging, and Chat separation');
+  }
 
   const result = await js(`(async () => {
     const id = 'chromium-smoke';

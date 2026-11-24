@@ -655,6 +655,8 @@ mod ssh_integration {
             .block_on(crate::workspace::git_workspace_status(
                 &repo.to_string_lossy(),
                 Some(&ssh),
+                crate::workspace::GitDiffScope::default(),
+                None,
             ))
             .unwrap();
         assert!(status.is_repo);
@@ -662,6 +664,18 @@ mod ssh_integration {
             .changed_files
             .iter()
             .any(|change| change.path == "untracked file.txt"));
+        runtime.block_on(crate::workspace::git_workspace_action(
+            &repo.to_string_lossy(),
+            Some(&ssh),
+            crate::workspace::GitWorkspaceAction::Stage { paths: vec!["untracked file.txt".into()] },
+        )).unwrap();
+        let staged = runtime.block_on(crate::workspace::git_workspace_status(
+            &repo.to_string_lossy(),
+            Some(&ssh),
+            crate::workspace::GitDiffScope::Staged,
+            None,
+        )).unwrap();
+        assert!(staged.diff.contains("untracked file.txt"));
         manager.close(&info.id);
     }
 }

@@ -198,19 +198,32 @@ impl Service {
                 blocking(move || save_local_memory_file(&self.supervisor, kind, content, profile))
                     .await
             }
-            "list_workspace_files" | "git_workspace_status" => {
+            "list_workspace_files" | "git_workspace_status" | "git_work_turn_baseline" => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
                 struct Args {
                     dir_path: String,
                     ssh: Option<crate::ssh::SshTarget>,
+                    scope: Option<workspace::GitDiffScope>,
+                    baseline: Option<String>,
                 }
-                let Args { dir_path, ssh } = args(value)?;
-                if request.command == "list_workspace_files" {
-                    blocking(move || workspace::list_workspace_files(&dir_path)).await
-                } else {
-                    result(workspace::git_workspace_status(&dir_path, ssh.as_ref()).await?)
+                let Args { dir_path, ssh, scope, baseline } = args(value)?;
+                match request.command.as_str() {
+                    "list_workspace_files" => blocking(move || workspace::list_workspace_files(&dir_path)).await,
+                    "git_work_turn_baseline" => result(workspace::git_work_turn_baseline(&dir_path, ssh.as_ref()).await?),
+                    _ => result(workspace::git_workspace_status(&dir_path, ssh.as_ref(), scope.unwrap_or_default(), baseline.as_deref()).await?),
                 }
+            }
+            "git_workspace_action" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Args {
+                    dir_path: String,
+                    ssh: Option<crate::ssh::SshTarget>,
+                    action: workspace::GitWorkspaceAction,
+                }
+                let Args { dir_path, ssh, action } = args(value)?;
+                result(workspace::git_workspace_action(&dir_path, ssh.as_ref(), action).await?)
             }
             "read_workspace_file" => {
                 #[derive(Deserialize)]

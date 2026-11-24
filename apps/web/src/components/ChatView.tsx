@@ -7,6 +7,9 @@ import { useApp, useChatSlice, type ReasoningEffort } from "../state/appStore";
 import { useDerivedBotState } from "../lib/botState";
 import { shortModelName } from "../lib/format";
 import { tauriBridge } from "../lib/tauriBridge";
+import { formatWorkReference, isWorkControlCommand, type WorkReference } from "../state/workSessions";
+const WorkCheckpoints = React.lazy(() => import("./WorkCheckpoints").then(module => ({ default: module.WorkCheckpoints })));
+const WorkActivity = React.lazy(() => import("./WorkActivity").then(module => ({ default: module.WorkActivity })));
 
 const SLASH_COMMANDS = [
   { cmd: "/model", desc: "Open model & provider picker" },
@@ -18,6 +21,25 @@ const SLASH_COMMANDS = [
   { cmd: "/cron", desc: "Manage scheduled automations" },
   { cmd: "/memory", desc: "Inspect SOUL.md & memories" },
   { cmd: "/clear", desc: "Start a fresh chat session" },
+];
+const WORK_COMMANDS = [
+  { cmd: "/goal", desc: "Set an objective or check progress" },
+  { cmd: "/goal pause", desc: "Pause the current goal" },
+  { cmd: "/goal resume", desc: "Resume the current goal" },
+  { cmd: "/goal clear", desc: "Clear the current goal" },
+  { cmd: "/plan", desc: "Plan an implementation" },
+  { cmd: "/explore", desc: "Ask a read-only question about workspace files" },
+  { cmd: "/init", desc: "Create or update AGENTS.md" },
+  { cmd: "/diff", desc: "Show repository changes" },
+  { cmd: "/review", desc: "Request an independent review" },
+  { cmd: "/agents", desc: "Show running agents and tasks" },
+  { cmd: "/status", desc: "Show workspace and session details" },
+  { cmd: "/queue", desc: "Queue a follow-up prompt" },
+  { cmd: "/steer", desc: "Guide the current turn" },
+  { cmd: "/undo", desc: "Rewind and edit a previous prompt" },
+  { cmd: "/rollback", desc: "Preview and restore workspace checkpoints" },
+  { cmd: "/export", desc: "Download this Work session as JSON" },
+  { cmd: "/oc", desc: "List OpenCode commands from the workspace" },
 ];
 
 const EFFORT_CYCLE: ReasoningEffort[] = ["none", "low", "medium", "high", "xhigh"];
@@ -49,7 +71,7 @@ const STARTER_PROMPTS = [
   },
 ];
 
-export const ChatView: React.FC = () => {
+export const ChatView: React.FC<{ work?: boolean }> = ({ work = false }) => {
   const {
     isDesktop,
     activeProfile,
@@ -74,6 +96,10 @@ export const ChatView: React.FC = () => {
     setActiveView,
     rightPaneOpen,
     setRightPaneOpen,
+    setRightPaneTab,
+    startNewWork,
+    completeWorkReference,
+    exportWorkSession,
     createNewSession,
     sendMessage,
     interruptStream,
@@ -87,6 +113,7 @@ export const ChatView: React.FC = () => {
   const loadingHistory = useChatSlice(chat => chat.loadingHistory);
   const hasMessages = useChatSlice(chat => chat.messages.length > 0);
   const isStreaming = useChatSlice(chat => chat.isStreaming);
+  const workExploring = useChatSlice(chat => work && chat.workExploring);
   const liveStatusText = useChatSlice(chat => chat.liveStatusText);
   const activeToolName = useChatSlice(chat => chat.activeToolName);
   const hasStreamedText = useChatSlice(chat => chat.hasStreamedText);
@@ -102,8 +129,9 @@ export const ChatView: React.FC = () => {
   });
   const sessionUsage = useChatSlice(chat => chat.sessionUsage);
   const draftKey = `${connection.id}:${connection.id.startsWith("local-") ? "local" : connection.url}:${activeProfile}:${activeSessionId ?? "new"}`;
+  const draftStorageKey = work ? "hermes-grok-bot:work-drafts" : "hermes-grok-bot:drafts";
   const [drafts, setDrafts] = useState<Record<string, string>>(() => {
-    try { return JSON.parse(localStorage.getItem("hermes-grok-bot:drafts") ?? "{}"); } catch { return {}; }
+    try { return JSON.parse(localStorage.getItem(draftStorageKey) ?? "{}"); } catch { return {}; }
   });
   const draft = drafts[draftKey] ?? "";
   const setDraft = (value: React.SetStateAction<string>) => setDrafts(prev => ({
@@ -112,7 +140,7 @@ export const ChatView: React.FC = () => {
   const latestDrafts = useRef(drafts);
   latestDrafts.current = drafts;
   const saveDrafts = () => {
-    try { localStorage.setItem("hermes-grok-bot:drafts", JSON.stringify(latestDrafts.current)); } catch { /* Storage may be full. */ }
+    try { localStorage.setItem(draftStorageKey, JSON.stringify(latestDrafts.current)); } catch { /* Storage may be full. */ }
   };
   useEffect(() => {
     const timer = setTimeout(saveDrafts, 400);
@@ -126,11 +154,40 @@ export const ChatView: React.FC = () => {
   const attachments = filesBySession[draftKey] ?? [];
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [checkpointsFor, setCheckpointsFor] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [boardMenuOpen, setBoardMenuOpen] = useState(false);
   const [slashIndex, setSlashIndex] = useState(0);
+  const [referenceResult, setReferenceResult] = useState<{ token: string; items: WorkReference[] }>();
+  const [referenceIndex, setReferenceIndex] = useState(0);
+  const [dismissedReference, setDismissedReference] = useState<string>();
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const referenceToken = work ? /(?:^|\s)(@[^\s]*)$/.exec(draft)?.[1] : undefined;
+  const references = referenceResult?.token === referenceToken && dismissedReference !== referenceToken
+    ? referenceResult?.items ?? [] : [];
+
+  useEffect(() => {
+    if (!referenceToken || referenceToken === dismissedReference) return;
+    let live = true;
+    const timer = setTimeout(() => {
+      void completeWorkReference(referenceToken).then(items => {
+        if (live) {
+          setReferenceIndex(0);
+          setReferenceResult({ token: referenceToken, items });
+        }
+      }, () => { if (live) setReferenceResult(undefined); });
+    }, 120);
+    return () => { live = false; clearTimeout(timer); };
+  }, [completeWorkReference, dismissedReference, referenceToken]);
+
+  const chooseReference = (item: WorkReference) => {
+    if (!referenceToken) return;
+    const reference = formatWorkReference(item.text);
+    setDraft(value => `${value.slice(0, -referenceToken.length)}${reference}${reference.endsWith(":") ? "" : " "}`);
+    setReferenceIndex(0);
+    textareaRef.current?.focus();
+  };
 
   // Auto-resize composer textarea
   useEffect(() => {
@@ -156,10 +213,16 @@ export const ChatView: React.FC = () => {
   const botAv = botAvatars[botSeed];
 
   const matchingSlash = useMemo(() => {
-    if (!draft.startsWith("/") || draft.includes(" ")) return [];
+    if (!draft.startsWith("/") || (!work && draft.includes(" "))) return [];
     const q = draft.toLowerCase();
-    return SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q));
-  }, [draft, setupOpen]);
+    return (work ? [...WORK_COMMANDS, ...SLASH_COMMANDS] : SLASH_COMMANDS).filter((c) => c.cmd.startsWith(q));
+  }, [draft, work, setupOpen]);
+
+  const fillCommand = (cmd: string) => {
+    setDraft(`${cmd} `);
+    setSlashIndex(0);
+    textareaRef.current?.focus();
+  };
 
   const handleSubmit = async (customText?: string) => {
     const text = (customText ?? draft).trim();
@@ -198,7 +261,8 @@ export const ChatView: React.FC = () => {
     }
     if (text === "/clear") {
       setDraft("");
-      await createNewSession();
+      if (work) startNewWork();
+      else await createNewSession();
       return;
     }
     if (text === "/compress") {
@@ -211,17 +275,61 @@ export const ChatView: React.FC = () => {
       await branchActiveSession();
       return;
     }
+    if (work && text === "/rollback") {
+      setDraft("");
+      setCheckpointsFor(activeSessionId);
+      return;
+    }
+    if (work && text === "/export") {
+      try {
+        await exportWorkSession();
+        setDraft("");
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : "Could not export this Work session");
+      }
+      return;
+    }
 
     try {
-      await sendMessage(text, attachments);
-      setDraft(prev => prev.trim() === text ? "" : prev);
+      const replacement = await sendMessage(text, attachments);
+      setDraft(prev => replacement ?? (prev.trim() === text ? "" : prev));
       setFilesBySession(prev => ({ ...prev, [draftKey]: (prev[draftKey] ?? []).filter(file => !attachments.includes(file)) }));
     } catch (error) {
       showToast(error instanceof Error ? error.message : "Message could not be sent");
     }
   };
 
+  const canQueueDraft = work && isStreaming && !attachments.length && Boolean(draft.trim()) && !draft.trimStart().startsWith("/");
+  const sendWorkFollowUp = async (kind: "queue" | "steer") => {
+    if (!canQueueDraft) return;
+    const instruction = draft.trim();
+    try {
+      await sendMessage(`/${kind} ${instruction}`);
+      setDraft(current => current.trim() === instruction ? "" : current);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Could not send the Work follow-up");
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (references.length) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setDismissedReference(referenceToken);
+        return;
+      }
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const step = e.key === "ArrowDown" ? 1 : -1;
+        setReferenceIndex(index => (index + step + references.length) % references.length);
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        chooseReference(references[referenceIndex] ?? references[0]);
+        return;
+      }
+    }
     if (matchingSlash.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -237,7 +345,8 @@ export const ChatView: React.FC = () => {
         e.preventDefault();
         const chosen = matchingSlash[slashIndex] ?? matchingSlash[0];
         if (chosen) {
-          void handleSubmit(chosen.cmd);
+          if (work && (e.key === "Tab" || draft !== chosen.cmd)) fillCommand(chosen.cmd);
+          else void handleSubmit(chosen.cmd);
         }
         return;
       }
@@ -245,7 +354,8 @@ export const ChatView: React.FC = () => {
 
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (!isStreaming) void handleSubmit();
+      if (canQueueDraft) void sendWorkFollowUp("queue");
+      else if (!workExploring && (!isStreaming || (work && isWorkControlCommand(draft.trim())))) void handleSubmit();
     }
   };
 
@@ -342,10 +452,10 @@ export const ChatView: React.FC = () => {
           <button
             type="button"
             className="gb-window-action"
-            title="New Chat"
-            onClick={() => void createNewSession()}
+            title={work ? "New Work" : "New Chat"}
+            onClick={() => work ? startNewWork() : void createNewSession()}
           >
-            <CursorIcon name="chat-bubble-plus" size={14} />
+            <CursorIcon name={work ? "plus" : "chat-bubble-plus"} size={14} />
           </button>
           <button
             type="button"
@@ -359,9 +469,39 @@ export const ChatView: React.FC = () => {
         </div>
       </header>
 
+      {work && (
+        <div className="gb-work-toolbar" aria-label="Work controls">
+          <div className="gb-work-toolbar__path" title={activeSession?.cwd}>
+            <CursorIcon name="folder" size={14} /><span>{activeSession?.cwd}</span>
+          </div>
+          <button className="gb-chip-btn" type="button" onClick={() => fillCommand("/plan")}>Plan</button>
+          <button className="gb-chip-btn" type="button" onClick={() => fillCommand("/explore")}>Explore</button>
+          <button className="gb-chip-btn" type="button" onClick={() => fillCommand("/goal")}>Goal</button>
+          <button className="gb-chip-btn" type="button" onClick={() => { setRightPaneTab("git"); setRightPaneOpen(true); }}>Git</button>
+          <button className="gb-chip-btn" type="button" onClick={() => { setRightPaneTab("terminal"); setRightPaneOpen(true); }}>Terminal</button>
+          <button className="gb-chip-btn" type="button" onClick={() => setCheckpointsFor(activeSessionId)}>Checkpoints</button>
+        </div>
+      )}
+      {work && <React.Suspense fallback={null}>
+        {checkpointsFor && checkpointsFor === activeSessionId && (
+          <WorkCheckpoints key={`checkpoints:${checkpointsFor}`} onClose={() => setCheckpointsFor(null)} />
+        )}
+        {activeSessionId && (
+          <WorkActivity key={`activity:${activeSessionId}`} submit={command => {
+            void sendMessage(command).catch(error => showToast(error instanceof Error ? error.message : "Work command failed"));
+          }} />
+        )}
+      </React.Suspense>}
+
       {/* Transcript or Authentic Grok Bot Welcome Hero */}
       {!hasMessages && loadingHistory ? (
         <div className="gb-welcome" role="status"><CursorIcon name="spinner" spin size={18} /><span>Loading conversation…</span></div>
+      ) : !hasMessages && work ? (
+        <div className="gb-welcome">
+          <CursorIcon name="code" size={30} />
+          <h1 className="gb-welcome__title">Work in {activeSession?.cwd?.split("/").filter(Boolean).at(-1) ?? "/"}</h1>
+          <p className="gb-welcome__sub">Describe a change, ask for a plan, or explore the project without edits.</p>
+        </div>
       ) : !hasMessages ? (
         <div className="gb-welcome">
           <button
@@ -421,12 +561,26 @@ export const ChatView: React.FC = () => {
                   className="gb-popover-item"
                   data-highlighted={idx === slashIndex ? "true" : undefined}
                   onMouseEnter={() => setSlashIndex(idx)}
-                  onClick={() => void handleSubmit(item.cmd)}
+                  onClick={() => work ? fillCommand(item.cmd) : void handleSubmit(item.cmd)}
                 >
                   <span style={{ fontFamily: "var(--cursor-font-family-mono)", fontWeight: 600 }}>{item.cmd}</span>
                   <span style={{ fontSize: 12, color: "var(--grok-bot-text-tertiary)", marginLeft: "auto" }}>
                     {item.desc}
                   </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {references.length > 0 && (
+            <div className="gb-popover" aria-label="Workspace references">
+              {references.map((item, index) => (
+                <button key={item.text} type="button" className="gb-popover-item"
+                  data-highlighted={index === referenceIndex ? "true" : undefined}
+                  onMouseEnter={() => setReferenceIndex(index)}
+                  onClick={() => chooseReference(item)}>
+                  {item.display}
+                  {item.meta && <span style={{ marginLeft: "auto" }}>{item.meta}</span>}
                 </button>
               ))}
             </div>
@@ -531,6 +685,7 @@ export const ChatView: React.FC = () => {
           </div>
 
           <UsageBar usage={sessionUsage} contextLimit={activeSession?.context_limit} />
+          {workExploring && <div className="gb-composer-strip" role="status">Exploring workspace in read-only mode…</div>}
           <input ref={fileInputRef} type="file" multiple hidden onChange={event => {
             const selected = Array.from(event.target.files ?? []);
             if (selected.some(file => file.size > 50 * 1024 * 1024)) {
@@ -548,6 +703,12 @@ export const ChatView: React.FC = () => {
           </div>}
           {attachMenuOpen && <div className="gb-attach-menu">
             <button type="button" className="gb-btn gb-btn--ghost" onClick={() => { fileInputRef.current?.click(); setAttachMenuOpen(false); }}><CursorIcon name="file" size={14} /> Attach files</button>
+            {work && <button type="button" className="gb-btn gb-btn--ghost" onClick={() => {
+              setDraft(value => `${value.trimEnd()}${value.trim() ? " " : ""}@`);
+              setDismissedReference(undefined);
+              setAttachMenuOpen(false);
+              textareaRef.current?.focus();
+            }}><CursorIcon name="at" size={14} /> Reference workspace files</button>}
             <button type="button" className="gb-btn gb-btn--ghost" onClick={() => { setDraft(prev => prev.startsWith("/") ? prev : `/${prev}`); setAttachMenuOpen(false); textareaRef.current?.focus(); }}>Slash commands</button>
           </div>}
           {/* Floating Frosted Glass Pill Composer */}
@@ -566,29 +727,36 @@ export const ChatView: React.FC = () => {
               ref={textareaRef}
               rows={1}
               className="gb-composer__textarea"
-              placeholder={`Message ${botAv?.displayName || (activeProfile === "default" ? "Hermes" : activeProfile)}... (type / for commands)`}
+              placeholder={work ? "Describe a code change or type / for commands" : `Message ${botAv?.displayName || (activeProfile === "default" ? "Hermes" : activeProfile)}... (type / for commands)`}
               value={draft}
               onChange={(e) => {
                 setDraft(e.target.value);
                 setSlashIndex(0);
+                if (work) setDismissedReference(undefined);
               }}
               onKeyDown={handleKeyDown}
             />
 
             {isStreaming ? (
-              <button
-                type="button"
-                className="gb-composer__send gb-composer__send--stop"
-                title="Stop generating"
-                onClick={() => void interruptStream()}
-              >
-                <CursorIcon name="stop" size={13} />
-              </button>
+              <>
+                {canQueueDraft && <>
+                  <button type="button" className="gb-chip-btn" onClick={() => void sendWorkFollowUp("steer")}>Steer turn</button>
+                  <button type="button" className="gb-chip-btn" title="Queue follow-up (Enter)" onClick={() => void sendWorkFollowUp("queue")}>Queue</button>
+                </>}
+                <button
+                  type="button"
+                  className="gb-composer__send gb-composer__send--stop"
+                  title="Stop generating"
+                  onClick={() => void interruptStream()}
+                >
+                  <CursorIcon name="stop" size={13} />
+                </button>
+              </>
             ) : (
               <button
                 type="button"
                 className="gb-composer__send"
-                disabled={!draft.trim() && attachments.length === 0}
+                disabled={workExploring || (!draft.trim() && attachments.length === 0)}
                 title="Send message (Enter)"
                 onClick={() => void handleSubmit()}
               >
