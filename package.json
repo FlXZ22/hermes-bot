@@ -28,7 +28,7 @@
     "test:chat-ui": "node scripts/chat-ui-check.cjs",
     "test:work-ui": "node scripts/work-ui-check.cjs",
     "test:desktop-perf": "node scripts/webkit-perf.mjs",
-    "desktop:chromium:build": "npm run build && cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --no-default-features --bin hermes-native && electron --version",
+    "desktop:chromium:build": "node scripts/prepare-electron.cjs && npm run build && cargo build --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --release --no-default-features --bin hermes-native --jobs 2",
     "desktop:chromium": "electron apps/chromium/main.cjs",
     "test:chromium:perf": "node scripts/chromium-perf.mjs",
     "test:chromium:smoke": "node scripts/chromium-smoke.mjs",

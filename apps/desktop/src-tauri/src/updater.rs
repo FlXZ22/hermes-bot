@@ -639,12 +639,20 @@ impl AppUpdater {
         let new_full = git_sync(&repo, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".into());
         let new_short = short_sha(&new_full);
 
-        // Install JS dependencies only if node_modules is missing or package-lock.json changed.
+        let chromium = host != "webkit";
+        // A failed or incomplete npm ci may leave node_modules present.
         if !repo.join("node_modules").is_dir()
+            || (chromium && !repo.join("node_modules/electron/package.json").is_file())
             || lockfile_changed_between(&repo, &installed_full, "HEAD")
         {
             self.set_step("Installing npm dependencies (npm ci)…");
             self.run_cmd(&repo, "npm", &["ci"], &[]).await?;
+        }
+
+        // Older checkouts may not have the preflight yet.
+        if chromium && repo.join("scripts/prepare-electron.cjs").is_file() {
+            self.set_step("Preparing Chromium runtime…");
+            self.run_cmd(&repo, "node", &["scripts/prepare-electron.cjs"], &[]).await?;
         }
 
         // Always build frontend packages (fast: ~2-3s).
@@ -662,7 +670,7 @@ impl AppUpdater {
 
         let mut installed_native_commit = native_full.clone();
 
-        if host == "webkit" {
+        if !chromium {
             self.set_step("Building Tauri WebKitGTK binary…");
             self.run_cmd(&repo, "npm", &["run", "desktop:build"], &[]).await?;
             self.set_step("Installing WebKitGTK release…");
@@ -675,6 +683,7 @@ impl AppUpdater {
                     "cargo",
                     &[
                         "build",
+                        "--locked",
                         "--manifest-path",
                         "apps/desktop/src-tauri/Cargo.toml",
                         "--release",
@@ -776,7 +785,7 @@ impl AppUpdater {
         let _ = tokio::join!(t1, t2);
         if !status.success() {
             return Err(format!(
-                "Command `{program} {}` exited with status {status}",
+                "Command `{program} {}` exited with {status}",
                 args.join(" ")
             ));
         }

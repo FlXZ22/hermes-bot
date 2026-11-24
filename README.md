@@ -20,9 +20,9 @@ npm run desktop:chromium:install
 hermes-grok-bot
 ```
 
-The installer writes only to `~/.local/share/hermes-grok-bot`, `~/.local/share/applications`, and `~/.local/bin`. It does not require root. `hermes-grok-bot` launches the Chromium release, while `hermes-grok-bot-webkit` launches the WebKitGTK binary. The app appears as **Hermes Grok Bot** in the application launcher. An optional local Arch package recipe is in `packaging/arch/PKGBUILD`.
+The installer does not require root. It places the release in `~/.local/share/hermes-grok-bot` by default and creates launchers in `~/.local/share/applications` and `~/.local/bin`. It prepares the pinned Electron runtime in `node_modules` using Electron's download cache if needed. `hermes-grok-bot` launches the Chromium release, while `hermes-grok-bot-webkit` launches the WebKitGTK binary. An optional local Arch package recipe is in `packaging/arch/PKGBUILD`.
 
-Build prerequisites on Arch are Node.js, npm, Rust, pkgconf, a C/C++ toolchain, GTK 3, WebKitGTK 4.1, and libsoup 3.
+Build prerequisites on Arch are Node.js 22.12 or newer, npm, Rust, pkgconf, a C/C++ toolchain, GTK 3, WebKitGTK 4.1, and libsoup 3.
 
 For desktop development, run `npm run desktop:chromium` (after `npm run desktop:chromium:build`) or `npm run desktop:dev` (Tauri/WebKitGTK). For the browser preview connected to the installed Hermes backend, run `npm run dev:connected`, then open `http://127.0.0.1:5173`. That command starts an owned gateway and a same-origin development proxy, and stops them on Ctrl+C. `npm run dev` starts the frontend alone.
 
@@ -34,6 +34,11 @@ checkout, builds the UI, rebuilds Rust when needed, and installs the app.
 **Restart App Now** launches the installed release. **Install Local Build**
 previews the current checkout without switching Git branches.
 
+The Chromium updater prepares Electron explicitly after installing npm
+dependencies. `npm ci` alone can leave the runtime undownloaded. If the
+download fails, the currently installed release remains active; check the
+installer output and retry once the Electron download is reachable.
+
 If the native service exits during an update, the stopped process cannot finish
 its own repair. Close the app and run these commands from the repository after
 committing or stashing local changes:
@@ -42,9 +47,8 @@ committing or stashing local changes:
 git switch main
 git pull --ff-only origin main
 npm ci
-npm run build
-cargo build --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --release --no-default-features --bin hermes-native --jobs 2
-bash scripts/install-chromium.sh
+npm run desktop:chromium:build
+npm run desktop:chromium:install
 hermes-grok-bot
 ```
 

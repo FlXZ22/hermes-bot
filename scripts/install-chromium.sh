@@ -6,10 +6,17 @@ bundle="$project_dir/node_modules/electron/dist"
 renderer="$project_dir/apps/web/dist"
 native="$project_dir/apps/desktop/src-tauri/target/release/hermes-native"
 
-if [[ ! -x "$bundle/electron" || ! -x "$native" || ! -r "$renderer/index.html" ]]; then
-  printf '%s\n' 'Build the Chromium app before installing it: npm run desktop:chromium:build' >&2
+if [[ ! -x "$native" ]]; then
+  printf 'Missing native binary: %s\nRun npm run desktop:chromium:build before installing.\n' "$native" >&2
   exit 1
 fi
+if [[ ! -r "$renderer/index.html" ]]; then
+  printf 'Missing renderer build: %s\nRun npm run build before installing.\n' "$renderer/index.html" >&2
+  exit 1
+fi
+# Also run here so an already-installed updater can repair a checkout after
+# fetching this version, even if that updater has no runtime preparation step.
+node "$project_dir/scripts/prepare-electron.cjs"
 
 install_root="${XDG_DATA_HOME:-$HOME/.local/share}/hermes-grok-bot"
 launcher_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
@@ -49,8 +56,6 @@ mv -T "$stage" "$release"
 stage=""
 
 # The previous binary stays available for the WebKit compatibility launcher.
-ln -sfn "$release" "$install_root/chromium/.next"
-mv -Tf "$install_root/chromium/.next" "$install_root/chromium/current"
 install -m644 "$icon" "$install_root/icon.png"
 ln -sfn "$install_root/chromium/current/hermes-chromium" "$bin_dir/hermes-grok-bot"
 if [[ -x "$install_root/hermes-grok-bot" ]]; then
@@ -67,7 +72,10 @@ Terminal=false
 Categories=Development;Utility;
 StartupWMClass=hermes-grok-bot
 DESKTOP
-if command -v update-desktop-database >/dev/null 2>&1; then
-  update-desktop-database "$launcher_dir"
+# Publish the new release only after the required files and launchers exist.
+ln -sfn "$release" "$install_root/chromium/.next"
+mv -Tf "$install_root/chromium/.next" "$install_root/chromium/current"
+if command -v update-desktop-database >/dev/null 2>&1 && ! update-desktop-database "$launcher_dir"; then
+  printf '%s\n' 'Warning: desktop menu cache refresh failed; the release is installed.' >&2
 fi
 printf 'Installed Chromium release %s\n' "$release"
