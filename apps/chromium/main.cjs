@@ -94,10 +94,12 @@ async function createWindow() {
   win = new BrowserWindow({
     width: 1360, height: 860, minWidth: 820, minHeight: 560,
     icon, frame: false, backgroundColor: '#171717', show: Boolean(benchmark), title: 'Hermes',
+    focusable: !benchmark,
     webPreferences: {
       ...(benchmark ? {} : { preload: join(__dirname, 'preload.cjs') }),
       contextIsolation: true, sandbox: true, nodeIntegration: false,
       webSecurity: true, webviewTag: false, navigateOnDragDrop: false, devTools: Boolean(benchmark),
+      backgroundThrottling: !benchmark,
     },
   });
   const contents = win.webContents;
@@ -131,6 +133,7 @@ async function createWindow() {
   win.once('ready-to-show', () => win.show());
 
   if (benchmark) {
+    win.setIgnoreMouseEvents(true);
     win.on('page-title-updated', (_event, title) => {
       if (!/^(RESULT|ERROR) /.test(title)) return;
       console.log(title);

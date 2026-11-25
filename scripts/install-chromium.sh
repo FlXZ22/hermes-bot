@@ -2,6 +2,23 @@
 set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Older running Electron builds always call this installer after fetching.
+# Only the versioned release selector can authorize the eventual cutover.
+release_host="$project_dir/apps/desktop/release-host"
+if [[ -f "$release_host" ]]; then
+  case "$(< "$release_host")" in
+    chromium) ;;
+    tauri)
+      printf '%s\n' 'Building the Tauri release; the previous Electron installation will be retained.'
+      (cd "$project_dir" && npm run desktop:build)
+      exec bash "$project_dir/scripts/install-linux.sh" --activate
+      ;;
+    *)
+      printf '%s\n' 'Invalid desktop release host; the current installation was not changed.' >&2
+      exit 1
+      ;;
+  esac
+fi
 bundle="$project_dir/node_modules/electron/dist"
 renderer="$project_dir/apps/web/dist"
 native="$project_dir/apps/desktop/src-tauri/target/release/hermes-native"

@@ -24,6 +24,10 @@ The installer does not require root. It places the release in `~/.local/share/he
 
 Build prerequisites on Arch are Node.js 22.12 or newer, npm, Rust, pkgconf, a C/C++ toolchain, GTK 3, WebKitGTK 4.1, and libsoup 3.
 
+To try the Tauri migration without replacing the current app, build with
+`npm run desktop:build`, then run `npm run desktop:tauri:preview:install` and
+launch `hermes-grok-bot-tauri`. See the [migration and release gate](docs/tauri-migration.md).
+
 For desktop development, run `npm run desktop:chromium` (after `npm run desktop:chromium:build`) or `npm run desktop:dev` (Tauri/WebKitGTK). For the browser preview connected to the installed Hermes backend, run `npm run dev:connected`, then open `http://127.0.0.1:5173`. That command starts an owned gateway and a same-origin development proxy, and stops them on Ctrl+C. `npm run dev` starts the frontend alone.
 
 ## App updates and recovery

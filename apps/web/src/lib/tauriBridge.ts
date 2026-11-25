@@ -27,6 +27,10 @@ export function isDesktopHost(): boolean {
   return Boolean(getChromiumDesktop() || getTauriInvoke());
 }
 
+export function isTauriHost(): boolean {
+  return Boolean(getTauriInvoke()) && !getChromiumDesktop();
+}
+
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const fn = getChromiumDesktop()?.invoke ?? getTauriInvoke();
   if (!fn) {
@@ -138,14 +142,6 @@ export type GitWorkspaceAction =
   | { type: "worktree"; path: string; branch: string };
 
 export type GitDiffScope = "unstaged" | "staged" | "uncommitted" | "branch" | "lastTurn";
-
-export interface ShellExecResult {
-  stdout: string;
-  stderr: string;
-  exit_code: number;
-  cwd: string;
-  duration_ms: number;
-}
 
 export interface LinuxSystemStats {
   hostname: string;
@@ -289,8 +285,9 @@ export const tauriBridge = {
   gitWorkTurnBaseline: (dirPath: string, ssh?: HermesSshTarget): Promise<string> =>
     invoke<string>("git_work_turn_baseline", { dirPath, ssh }),
 
-  runShellCommand: (cwd: string, command: string): Promise<ShellExecResult> =>
-    invoke<ShellExecResult>("run_shell_command", { cwd, command }),
+  openExternalLink: (address: string): Promise<void> => invoke<void>("open_external_link", { address }),
+  loadLegacyRendererState: (): Promise<Record<string, string>> => invoke<Record<string, string>>("load_legacy_renderer_state"),
+  saveWorkExport: (fileName: string, contents: string): Promise<string> => invoke<string>("save_work_export", { fileName, contents }),
 
   getLinuxSystemStats: (): Promise<LinuxSystemStats> =>
     invoke<LinuxSystemStats>("get_linux_system_stats"),

@@ -1,5 +1,8 @@
 const gateway = "http://hermes-perf.invalid";
 const ids = ["perf-a", "perf-b"];
+// The WebKit fixture opens the production renderer in a minimal GTK host.
+// Exercise the same desktop layout that the Tauri host selects.
+if (navigator.userAgent.includes("HermesWebKitFixture")) document.documentElement.dataset.desktopHost = "tauri";
 const originalFetch = window.fetch.bind(window);
 const histories = Object.fromEntries(ids.map(id => [id, Array.from({ length: 1000 }, (_, i) => ({
   id: `${id}-${i}`,
@@ -72,8 +75,16 @@ async function run() {
   await wait(400);
   const area = document.querySelector<HTMLTextAreaElement>(".gb-composer__textarea")!;
   const scroll = document.querySelector<HTMLElement>(".gb-transcript")!;
+  const idleFrames: number[] = [];
+  let idlePrevious = await frame();
+  for (let i = 0; i < 24; i++) {
+    const time = await frame();
+    idleFrames.push(time - idlePrevious);
+    idlePrevious = time;
+  }
   const frames: number[] = [];
   const typing: number[] = [];
+  const scrolling: number[] = [];
   const nativeSetValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
   let measuring = true;
   let previous = await frame();
@@ -90,7 +101,9 @@ async function run() {
       activeSocket.event("text.delta", { delta: token === 0
         ? `\n\n### Part ${batch}\n\n` : "A longer **formatted** response with `code` and links. " });
     }
+    const scrollingAt = performance.now();
     scroll.scrollTop = batch % 10 < 8 ? scroll.scrollHeight : scroll.scrollTop - 270;
+    scrolling.push(performance.now() - scrollingAt);
     const typedAt = performance.now();
     nativeSetValue.call(area, "Draft " + "x".repeat(batch));
     area.dispatchEvent(new InputEvent("input", { bubbles: true, data: "x" }));
@@ -110,10 +123,12 @@ async function run() {
   await frame();
   await frame();
   return {
+    idleFrameP95Ms: percentile(idleFrames, 0.95),
     frameP95Ms: percentile(frames, 0.95),
     framesOver34Ms: frames.filter(value => value > 34).length,
     frames: frames.length,
     inputToFrameP95Ms: percentile(typing, 0.95),
+    scrollUpdateP95Ms: percentile(scrolling, 0.95),
     cachedSwitchToSecondFrameMs: Math.round(performance.now() - switchStarted),
     mountedRows: mounted,
   };

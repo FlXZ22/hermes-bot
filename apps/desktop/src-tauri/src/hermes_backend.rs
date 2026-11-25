@@ -345,10 +345,17 @@ impl HermesSupervisor {
     }
 
     pub async fn proxy_http(&self, req: NativeHttpRequest) -> Result<NativeHttpResponse, String> {
+        let url = reqwest::Url::parse(&req.url).map_err(|_| "Invalid gateway address")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("Gateway requests require an HTTP or HTTPS address without embedded credentials".into());
+        }
         let method = reqwest::Method::from_bytes(req.method.to_uppercase().as_bytes())
             .map_err(|e| format!("Invalid HTTP method: {e}"))?;
 
-        let mut builder = self.http.request(method, &req.url);
+        let mut builder = self.http.request(method, url);
         if let Some(headers) = req.headers {
             for (k, v) in headers {
                 builder = builder.header(k, v);

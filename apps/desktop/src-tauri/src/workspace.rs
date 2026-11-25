@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
-#[cfg(feature = "tauri-host")]
-use std::time::Instant;
 use tokio::process::Command;
 
 #[derive(Debug, Serialize)]
@@ -53,16 +51,6 @@ pub enum GitWorkspaceAction {
     Push,
     SwitchBranch { branch: String },
     Worktree { path: String, branch: String },
-}
-
-#[cfg(feature = "tauri-host")]
-#[derive(Debug, Serialize)]
-pub struct ShellExecResult {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-    pub cwd: String,
-    pub duration_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,36 +298,6 @@ pub async fn git_work_turn_baseline(dir_path: &str, ssh: Option<&crate::ssh::Ssh
         "stash", "create", "Hermes Work request baseline",
     ]).await?)?;
     Ok(if snapshot.is_empty() { head } else { snapshot })
-}
-
-#[cfg(feature = "tauri-host")]
-pub async fn run_shell_command(cwd: &str, command: &str) -> Result<ShellExecResult, String> {
-    let dir = expand_dir(cwd);
-    let working_dir = if dir.is_dir() {
-        dir
-    } else {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
-    };
-
-    let started = Instant::now();
-    let child = Command::new("bash")
-        .args(["-lc", command])
-        .kill_on_drop(true)
-        .current_dir(&working_dir)
-        .output();
-
-    let output = tokio::time::timeout(Duration::from_secs(30), child)
-        .await
-        .map_err(|_| "Command timed out after 30s".to_string())?
-        .map_err(|e| format!("Failed executing command: {e}"))?;
-
-    Ok(ShellExecResult {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: output.status.code().unwrap_or(-1),
-        cwd: working_dir.to_string_lossy().to_string(),
-        duration_ms: started.elapsed().as_millis() as u64,
-    })
 }
 
 pub fn get_linux_system_stats() -> LinuxSystemStats {

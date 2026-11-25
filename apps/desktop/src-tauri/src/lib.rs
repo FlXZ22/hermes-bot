@@ -4,6 +4,8 @@ mod workspace;
 mod remote;
 mod ssh;
 mod terminal;
+#[cfg(feature = "tauri-host")]
+mod legacy_storage;
 pub mod updater;
 #[cfg(feature = "tauri-host")]
 mod tauri_host;

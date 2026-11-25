@@ -2318,6 +2318,16 @@ button:disabled {
 [data-desktop-host="chromium"] [data-tauri-drag-region] { -webkit-app-region: drag; }
 [data-desktop-host="chromium"] [data-tauri-drag-region] :is(button, a, input, textarea, select, [role="button"]) { -webkit-app-region: no-drag; }
 
+/* Keep scrolling content separate from the desktop chrome on WebKitGTK.
+   Translucent overlays force large parts of the scroller to repaint. */
+[data-desktop-host="tauri"] .gb-chat-header,
+[data-desktop-host="tauri"] .gb-composer-wrap { position: relative; flex: none; }
+[data-desktop-host="tauri"] .gb-composer-wrap { background: var(--grok-bot-chat-fill); padding-top: 8px; }
+[data-desktop-host="tauri"] .gb-transcript-top { padding-top: 10px; }
+[data-desktop-host="tauri"] .gb-transcript-bottom { padding-bottom: 10px; }
+[data-desktop-host="tauri"] .gb-jump-latest { bottom: 12px; }
+[data-desktop-host="tauri"] .gb-transcript { contain: layout paint; transform: translateZ(0); }
+
 /* Compact process disclosure: icons and text stay readable at narrow widths. */
 .gb-activity-group { width: 100%; min-width: 0; }
 .gb-activity-summary { display: flex; align-items: center; gap: 8px; max-width: 100%; min-height: 28px; padding: 3px 0; text-align: left; font-size: 13px; color: var(--grok-bot-text-tertiary); }

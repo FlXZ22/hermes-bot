@@ -1,5 +1,5 @@
 import type { ChatSnapshot } from "../state/chatStore";
-import React, { memo, useEffect, useCallback, useDeferredValue, useId, useMemo, useRef, useState } from "react";
+import React, { memo, useEffect, useCallback, useId, useMemo, useRef, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import { ApprovalCard, ClarifyCard, CursorIcon } from "@grok-bot/theme";
 import { AnimatedBotFace } from "./AnimatedBotFace";
@@ -88,8 +88,6 @@ const MessageItem = memo(function MessageItem({ msg, respondApproval, respondCla
   respondApproval: ReturnType<typeof useApp>["respondApproval"];
   respondClarify: ReturnType<typeof useApp>["respondClarify"];
 }) {
-  const deferredContent = useDeferredValue(msg.content);
-  const renderedContent = msg.streaming ? deferredContent : msg.content;
   if (msg.role === "tool") {
     return <div className="gb-entry gb-entry--assistant"><ToolActivityCard tool={{ id: msg.id, name: msg.toolName ?? "tool", output: msg.content, status: "done" }} /></div>;
   }
@@ -131,7 +129,7 @@ const MessageItem = memo(function MessageItem({ msg, respondApproval, respondCla
 
       {msg.content ? (
         <div className="gb-bubble-agent">
-          <MarkdownBody content={renderedContent} streaming={msg.streaming} />
+          <MarkdownBody content={msg.content} streaming={msg.streaming} />
         </div>
       ) : null}
 

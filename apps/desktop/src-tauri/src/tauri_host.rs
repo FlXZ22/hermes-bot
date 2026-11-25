@@ -2,8 +2,8 @@ use super::{hermes_backend, profile_home, remote, sqlite_store, ssh, terminal, w
 use hermes_backend::{BackendInfo, HermesSupervisor, NativeHttpRequest, NativeHttpResponse};
 use serde_json::Value;
 use sqlite_store::{LocalBootstrapPayload, LocalMessageRow, LocalSessionRow};
-use tauri::{Manager, RunEvent, State, Window};
-use workspace::{GitWorkspaceStatus, LinuxSystemStats, ShellExecResult, WorkspaceFileEntry};
+use tauri::{webview::NewWindowResponse, Manager, RunEvent, State, WebviewWindowBuilder, Window};
+use workspace::{GitWorkspaceStatus, LinuxSystemStats, WorkspaceFileEntry};
 
 #[tauri::command]
 async fn terminal_start(
@@ -234,9 +234,86 @@ async fn git_workspace_action(
     workspace::git_workspace_action(&dir_path, ssh.as_ref(), action).await
 }
 
+fn navigation_allowed(url: &reqwest::Url, dev: Option<&reqwest::Url>) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let local_app = url.scheme() == "tauri"
+        && url.host_str() == Some("localhost")
+        && url.port().is_none()
+        && matches!(url.path(), "" | "/" | "/index.html")
+        && url.query().is_none();
+    local_app || dev.is_some_and(|dev| url.origin() == dev.origin())
+}
+
+fn external_web_url(address: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(address).map_err(|_| "Invalid link".to_string())?;
+    if matches!(url.scheme(), "https" | "http")
+        && url.host_str().is_some()
+        && url.username().is_empty() && url.password().is_none()
+    {
+        Ok(url)
+    } else {
+        Err("Only HTTP and HTTPS links without credentials can be opened.".into())
+    }
+}
+
 #[tauri::command]
-async fn run_shell_command(cwd: String, command: String) -> Result<ShellExecResult, String> {
-    workspace::run_shell_command(&cwd, &command).await
+async fn open_external_link(address: String) -> Result<(), String> {
+    let url = external_web_url(&address)?;
+    let status = tokio::process::Command::new("xdg-open")
+        .arg(url.as_str())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status().await.map_err(|error| format!("Could not open the browser: {error}"))?;
+    if status.success() { Ok(()) } else { Err("Could not open the browser.".into()) }
+}
+
+#[tauri::command]
+async fn load_legacy_renderer_state() -> Result<std::collections::BTreeMap<String, String>, String> {
+    if tauri::is_dev() {
+        return Ok(Default::default());
+    }
+    tauri::async_runtime::spawn_blocking(super::legacy_storage::from_electron).await
+        .map_err(|_| "Could not migrate previous renderer storage.".to_string())?
+}
+
+#[tauri::command]
+async fn save_work_export(file_name: String, contents: String) -> Result<String, String> {
+    let directory = dirs::download_dir().or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
+        .ok_or("Could not find the Downloads directory")?;
+    tauri::async_runtime::spawn_blocking(move || save_export(&directory, &file_name, &contents)).await
+        .map_err(|error| error.to_string())?
+}
+
+fn save_export(directory: &std::path::Path, file_name: &str, contents: &str) -> Result<String, String> {
+    use std::io::{ErrorKind, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let name = file_name.strip_suffix(".json").filter(|name| {
+        !name.is_empty() && name.len() <= 64
+            && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    }).ok_or("Invalid Work export filename")?;
+    if contents.len() > 32 * 1024 * 1024 {
+        return Err("The Work export exceeds 32 MiB.".into());
+    }
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    for number in 0..100 {
+        let path = if number == 0 { directory.join(file_name) }
+            else { directory.join(format!("{name} ({number}).json")) };
+        match std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(contents.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error.to_string());
+                }
+                return Ok(path.display().to_string());
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("Too many Work exports with this name in Downloads.".into())
 }
 
 #[tauri::command]
@@ -301,8 +378,20 @@ fn apply_app_update(
 
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    std::process::Command::new(exe)
+    let exe = if let Some(launcher) = super::updater::managed_tauri_launcher() {
+        dirs::home_dir().ok_or("Could not find the Tauri launcher")?.join(".local/bin").join(launcher)
+    } else {
+        std::env::current_exe().map_err(|e| e.to_string())?
+    };
+    if !exe.is_file() {
+        return Err("The installed Tauri launcher is missing. Reinstall the app before restarting.".into());
+    }
+    // Wait for Tauri's exit handler to stop the owned gateway and release
+    // the single-instance lock before starting the newly installed release.
+    std::process::Command::new("/proc/self/exe")
+        .arg("--relaunch-after")
+        .arg(std::process::id().to_string())
+        .arg(exe)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -320,13 +409,44 @@ pub fn run() {
     let terminals_for_exit = terminals.clone();
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(supervisor)
         .manage(terminals)
         .manage(remote::RemoteLogin::default())
         .manage(super::updater::AppUpdater::new())
-        .setup(move |app| {
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.set_title("Hermes");
+        .setup(|app| {
+            let window_config = app.config().app.windows.iter().find(|window| window.label == "main")
+                .ok_or("Missing main window configuration")?;
+            let dev_url = tauri::is_dev().then(|| app.config().build.dev_url.clone()).flatten();
+            let builder = WebviewWindowBuilder::from_config(app, window_config)?
+                .on_navigation(move |url| navigation_allowed(url, dev_url.as_ref()))
+                .on_new_window(|_, _| NewWindowResponse::Deny);
+            #[cfg(feature = "desktop-qa")]
+            let builder = if std::env::var_os("HERMES_TAURI_QA").is_some() {
+                builder
+                    .focused(false)
+                    .focusable(false)
+                    .skip_taskbar(true)
+                    .initialization_script(include_str!("../qa/smoke.js"))
+                    .on_document_title_changed(|window, title| {
+                        if let Some(result) = title.strip_prefix("HERMES QA: ") {
+                            println!("{result}");
+                            window.app_handle().exit(if result.starts_with("PASS") { 0 } else { 1 });
+                        }
+                    })
+            } else {
+                builder
+            };
+            let _window = builder.build()?;
+            #[cfg(feature = "desktop-qa")]
+            if std::env::var_os("HERMES_TAURI_QA").is_some() {
+                let _ = _window.set_ignore_cursor_events(true);
             }
             Ok(())
         })
@@ -359,7 +479,9 @@ pub fn run() {
             git_workspace_status,
             git_work_turn_baseline,
             git_workspace_action,
-            run_shell_command,
+            open_external_link,
+            load_legacy_renderer_state,
+            save_work_export,
             get_linux_system_stats,
             window_minimize,
             window_toggle_maximize,
@@ -383,4 +505,38 @@ pub fn run() {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_desktop_window_stays_on_its_own_origin() {
+        let url = |address| reqwest::Url::parse(address).unwrap();
+        let dev = url("http://127.0.0.1:5173");
+        assert!(navigation_allowed(&url("tauri://localhost/"), None));
+        assert!(navigation_allowed(&url("tauri://localhost/index.html#app"), None));
+        assert!(!navigation_allowed(&url("tauri://localhost/assets/index.js"), None));
+        assert!(!navigation_allowed(&url("tauri://localhost.attacker.test/"), None));
+        assert!(!navigation_allowed(&url("https://example.test/"), None));
+        assert!(!navigation_allowed(&dev, None));
+        assert!(navigation_allowed(&dev, Some(&dev)));
+        assert!(!navigation_allowed(&url("http://127.0.0.1:5174"), Some(&dev)));
+        assert!(external_web_url("https://example.test/project").is_ok());
+        assert!(external_web_url("file:///etc/hosts").is_err());
+        assert!(external_web_url("https://name:secret@example.test").is_err());
+    }
+
+    #[test]
+    fn work_export_cannot_overwrite_or_escape_downloads() {
+        let root = std::env::temp_dir().join(format!("hermes-export-test-{}", rand::random::<u64>()));
+        let downloads = root.join("Downloads");
+        assert!(save_export(&downloads, "../outside.json", "{}").is_err());
+        assert!(!root.exists());
+        assert!(save_export(&downloads, "work.json", "first").unwrap().ends_with("/work.json"));
+        assert!(save_export(&downloads, "work.json", "second").unwrap().ends_with("/work (1).json"));
+        assert_eq!(std::fs::read_to_string(downloads.join("work.json")).unwrap(), "first");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

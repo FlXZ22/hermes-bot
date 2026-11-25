@@ -26,7 +26,7 @@ import {
   type HermesWebhook,
 } from "@grok-bot/hermes-client";
 import { resolveBotColor, type GrokBotColorId } from "@grok-bot/theme";
-import { tauriBridge, type LinuxSystemStats, type RustBackendInfo } from "../lib/tauriBridge";
+import { isTauriHost, tauriBridge, type LinuxSystemStats, type RustBackendInfo } from "../lib/tauriBridge";
 import { slugify } from "../lib/format";
 import { dispatchWorkCommand } from "../lib/workCommands";
 import { importedWorkId, isImportedWorkId, type WorkImport } from "../lib/workImport";
@@ -1650,15 +1650,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       session: { id: session.id, title: session.title, cwd: session.cwd, profile: activeProfile, model: session.model },
       messages: pages.reverse().flat(),
     };
-    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+    const fileName = `${slugify(session.title ?? "Hermes Work")}.json`;
+    const contents = JSON.stringify(data, null, 2);
+    if (isTauriHost()) {
+      const path = await tauriBridge.saveWorkExport(fileName, contents);
+      showToast(`Work export saved to ${path}`);
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([contents], { type: "application/json" }));
     const download = document.createElement("a");
     download.href = url;
-    download.download = `${slugify(session.title ?? "") || "hermes-work"}.json`;
+    download.download = fileName;
     document.body.append(download);
     download.click();
     download.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1_000);
-  }, [activeProfile, activeSession, chat, sessionSection]);
+  }, [activeProfile, activeSession, chat, sessionSection, showToast]);
 
   const importWorkSession = useCallback(async (session: WorkImport, path: string) => {
     const client = clientRef.current;

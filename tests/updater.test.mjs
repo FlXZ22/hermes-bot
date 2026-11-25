@@ -185,3 +185,50 @@ test('native service exit reports the exit code instead of a generic closed erro
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('Tauri preview leaves the default alone and legacy updater handoff retains Electron rollback', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hermes-tauri-preview-'));
+  try {
+    const data = join(dir, 'data');
+    const home = join(dir, 'home');
+    const original = join(home, '.local/bin/hermes-grok-bot');
+    const previous = join(data, 'hermes-grok-bot/chromium/current');
+    const files = {
+      [original]: 'current launcher',
+      [join(previous, 'hermes-chromium')]: 'rollback release',
+      [join(dir, 'apps/desktop/src-tauri/target/release/hermes-grok-bot')]: '#!/bin/sh\nprintf tauri\n',
+      [join(dir, 'packages/grok-bot-theme/assets/icons/grok-bot-256.png')]: 'icon',
+      [join(dir, 'package.json')]: JSON.stringify({ version: "1.0.0", scripts: { "desktop:build": "node -e \"console.log('tauri build fixture')\"" } }),
+    };
+    for (const [path, contents] of Object.entries(files)) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, contents, { mode: 0o755 });
+    }
+    await mkdir(join(dir, 'scripts'));
+    for (const script of ['install-linux.sh', 'install-chromium.sh']) {
+      await copyFile(new URL(`../scripts/${script}`, import.meta.url), join(dir, 'scripts', script));
+    }
+    const result = spawnSync('bash', ['scripts/install-linux.sh', '--preview'], {
+      cwd: dir, env: { ...process.env, HOME: home, XDG_DATA_HOME: data }, encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(await readFile(original, 'utf8'), 'current launcher');
+    assert.equal(await readFile(join(previous, 'hermes-chromium'), 'utf8'), 'rollback release');
+    const meta = JSON.parse(await readFile(join(data, 'hermes-grok-bot/tauri-preview/current/release-meta.json'), 'utf8'));
+    assert.equal(meta.host, 'tauri-preview');
+    assert.equal(execFileSync(join(home, '.local/bin/hermes-grok-bot-tauri'), { encoding: 'utf8' }), 'tauri');
+
+    await writeFile(join(dir, 'apps/desktop/release-host'), 'tauri\n');
+    const activate = spawnSync('bash', ['scripts/install-chromium.sh'], {
+      cwd: dir, env: { ...process.env, HOME: home, XDG_DATA_HOME: data }, encoding: 'utf8',
+    });
+    assert.equal(activate.status, 0, activate.stderr);
+    assert.match(activate.stdout, /tauri build fixture/);
+    assert.equal(execFileSync(original, { encoding: 'utf8' }), 'tauri');
+    assert.equal(await readFile(join(home, '.local/bin/hermes-grok-bot-electron'), 'utf8'), 'rollback release');
+    const activated = JSON.parse(await readFile(join(data, 'hermes-grok-bot/tauri/current/release-meta.json'), 'utf8'));
+    assert.equal(activated.host, 'tauri');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

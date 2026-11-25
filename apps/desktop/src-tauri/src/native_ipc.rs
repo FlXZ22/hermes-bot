@@ -78,13 +78,6 @@ impl Service {
                     req: NativeHttpRequest,
                 }
                 let Args { req } = args(value)?;
-                let url = reqwest::Url::parse(&req.url).map_err(|_| "Invalid gateway address")?;
-                if !matches!(url.scheme(), "http" | "https")
-                    || !url.username().is_empty()
-                    || url.password().is_some()
-                {
-                    return Err("Gateway requests require an HTTP or HTTPS address without embedded credentials".into());
-                }
                 result(self.supervisor.proxy_http(req).await?)
             }
             "load_connection" => {

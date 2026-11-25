@@ -12,7 +12,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = ["tauri-host"]
-tauri-host = ["dep:tauri", "dep:tauri-build"]
+tauri-host = ["dep:tauri", "dep:tauri-build", "dep:rusty-leveldb", "dep:tauri-plugin-single-instance"]
+desktop-qa = ["tauri-host", "tauri/custom-protocol"]
 
 [[bin]]
 name = "hermes-grok-bot"
@@ -28,6 +29,8 @@ tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
 tauri = { version = "2", features = [], optional = true }
+rusty-leveldb = { version = "4.0.2", default-features = false, optional = true }
+tauri-plugin-single-instance = { version = "2.5.5", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

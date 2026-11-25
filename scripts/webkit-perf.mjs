@@ -10,6 +10,8 @@ import { build } from "vite";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptDir, "../apps/web");
+const runs = Number(process.argv[2] ?? 1);
+if (!Number.isInteger(runs) || runs < 1 || runs > 10) throw new Error("Expected a run count from 1 to 10.");
 const scratch = await mkdtemp(join(tmpdir(), "hermes-webkit-perf-"));
 const outDir = join(scratch, "dist");
 const executable = join(scratch, "webkit-perf");
@@ -38,9 +40,14 @@ try {
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const { spawn } = await import("node:child_process");
-  const run = spawn(executable, [`http://127.0.0.1:${server.address().port}/qa/performance.html`], { stdio: "inherit" });
-  const [status] = await once(run, "exit");
-  if (status !== 0) process.exitCode = status || 1;
+  for (let i = 0; i < runs; i++) {
+    const run = spawn(executable, [`http://127.0.0.1:${server.address().port}/qa/performance.html`], { stdio: "inherit" });
+    const [status] = await once(run, "exit");
+    if (status !== 0) {
+      process.exitCode = status || 1;
+      break;
+    }
+  }
 } finally {
   server?.close();
   await rm(scratch, { recursive: true, force: true });

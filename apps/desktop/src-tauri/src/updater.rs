@@ -206,7 +206,7 @@ fn read_release_meta() -> Option<ReleaseMeta> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")));
-    if let Some(base) = data_home {
+    if let Some(base) = data_home.filter(|_| detect_host() == "chromium") {
         candidates.push(base.join("hermes-grok-bot/chromium/current/resources/release-meta.json"));
     }
     for path in candidates {
@@ -217,6 +217,15 @@ fn read_release_meta() -> Option<ReleaseMeta> {
         }
     }
     None
+}
+
+#[cfg(feature = "tauri-host")]
+pub fn managed_tauri_launcher() -> Option<&'static str> {
+    match read_release_meta()?.host.as_deref()? {
+        "tauri-preview" => Some("hermes-grok-bot-tauri"),
+        "tauri" => Some("hermes-grok-bot"),
+        _ => None,
+    }
 }
 
 fn git_sync(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -639,10 +648,13 @@ impl AppUpdater {
         let new_full = git_sync(&repo, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".into());
         let new_short = short_sha(&new_full);
 
-        let chromium = host != "webkit";
+        let chromium = host == "chromium";
+        let migrate = chromium
+            && fs::read_to_string(repo.join("apps/desktop/release-host"))
+                .is_ok_and(|target| target.trim() == "tauri");
         // A failed or incomplete npm ci may leave node_modules present.
         if !repo.join("node_modules").is_dir()
-            || (chromium && !repo.join("node_modules/electron/package.json").is_file())
+            || (chromium && !migrate && !repo.join("node_modules/electron/package.json").is_file())
             || lockfile_changed_between(&repo, &installed_full, "HEAD")
         {
             self.set_step("Installing npm dependencies (npm ci)…");
@@ -650,14 +662,16 @@ impl AppUpdater {
         }
 
         // Older checkouts may not have the preflight yet.
-        if chromium && repo.join("scripts/prepare-electron.cjs").is_file() {
+        if chromium && !migrate && repo.join("scripts/prepare-electron.cjs").is_file() {
             self.set_step("Preparing Chromium runtime…");
             self.run_cmd(&repo, "node", &["scripts/prepare-electron.cjs"], &[]).await?;
         }
 
-        // Always build frontend packages (fast: ~2-3s).
-        self.set_step("Building UI packages (npm run build)…");
-        self.run_cmd(&repo, "npm", &["run", "build"], &[]).await?;
+        if chromium && !migrate {
+            // The Tauri build already builds the renderer via beforeBuildCommand.
+            self.set_step("Building UI packages (npm run build)…");
+            self.run_cmd(&repo, "npm", &["run", "build"], &[]).await?;
+        }
 
         let native_bin = repo.join("apps/desktop/src-tauri/target/release/hermes-native");
         let rust_changed = force_native_rebuild
@@ -670,11 +684,21 @@ impl AppUpdater {
 
         let mut installed_native_commit = native_full.clone();
 
-        if !chromium {
+        if migrate {
+            self.set_step("Migrating to Tauri (retaining Electron rollback)…");
+            self.run_cmd(&repo, "bash", &["scripts/install-chromium.sh"], &[]).await?;
+        } else if !chromium {
             self.set_step("Building Tauri WebKitGTK binary…");
             self.run_cmd(&repo, "npm", &["run", "desktop:build"], &[]).await?;
             self.set_step("Installing WebKitGTK release…");
-            self.run_cmd(&repo, "bash", &["scripts/install-linux.sh"], &[]).await?;
+            if host == "tauri-preview" {
+                // Older branches must fail here, not silently install over the default.
+                self.run_cmd(&repo, "npm", &["run", "desktop:tauri:preview:install"], &[]).await?;
+            } else if host == "tauri" {
+                self.run_cmd(&repo, "npm", &["run", "desktop:tauri:activate"], &[]).await?;
+            } else {
+                self.run_cmd(&repo, "bash", &["scripts/install-linux.sh"], &[]).await?;
+            }
         } else {
             if rust_changed {
                 self.set_step("Rust backend changed — rebuilding hermes-native…");

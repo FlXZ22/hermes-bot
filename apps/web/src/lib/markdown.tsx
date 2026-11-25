@@ -1,7 +1,6 @@
-import React, { memo, startTransition, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, startTransition, useEffect, useRef, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import remend from "remend";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
 import { toJsxRuntime } from "hast-util-to-jsx-runtime";
 import { renderInWorker } from "./renderWorker";
@@ -104,13 +103,14 @@ const previewLimit = 1_000_000;
 export const MarkdownBody = memo(function MarkdownBody({ content, streaming = false }: { content: string; streaming?: boolean }) {
   const input = content.slice(0, previewLimit);
   const large = input.length > inlineLimit;
+  const workerBacked = large || streaming;
   const [blocks, setBlocks] = useState<string[] | null>(null);
   const [failed, setFailed] = useState(false);
   const latest = useRef({ kind: "markdown" as const, content: input, streaming });
   const requestNext = useRef<() => void>(() => {});
   latest.current = { kind: "markdown", content: input, streaming };
   useEffect(() => {
-    if (!large) { setBlocks(null); return; }
+    if (!workerBacked) { setBlocks(null); return; }
     let disposed = false;
     let inFlight = false;
     let previous: typeof latest.current | undefined;
@@ -131,7 +131,7 @@ export const MarkdownBody = memo(function MarkdownBody({ content, streaming = fa
           });
           schedule();
         });
-      }, latest.current.streaming ? 110 : 0);
+      }, latest.current.streaming ? (previous ? 120 : 25) : 0);
     };
     requestNext.current = schedule;
     schedule();
@@ -139,19 +139,17 @@ export const MarkdownBody = memo(function MarkdownBody({ content, streaming = fa
       disposed = true; clearTimeout(timer); cancel?.();
       requestNext.current = () => {};
     };
-  }, [large]);
+  }, [workerBacked]);
   useEffect(() => { requestNext.current(); }, [input, streaming]);
 
-  const inline = useMemo(() => {
-    const preview = input.slice(0, inlineLimit);
-    return streaming || large ? remend(preview, { katex: false }) : preview;
-  }, [input, streaming, large]);
-
+  // Never parse a growing response on the UI thread. Before the first worker
+  // result, show a bounded plain-text preview; short settled messages keep
+  // their synchronous Markdown rendering.
   return <div className="gb-markdown" data-chunked={large && blocks && !failed ? "true" : undefined}>
-    {large && failed ? <div className="gb-markdown-fallback">{input}</div>
-      : large && blocks
+    {!workerBacked ? <ReactMarkdown remarkPlugins={plugins} components={components} skipHtml>{input}</ReactMarkdown>
+      : blocks && !failed
       ? blocks.map((block, index) => <MarkdownBlock key={index} serialized={block} />)
-      : <ReactMarkdown remarkPlugins={plugins} components={components} skipHtml>{inline}</ReactMarkdown>}
+      : <div className="gb-markdown-fallback">{!streaming && failed ? input : input.slice(0, inlineLimit)}</div>}
     {content.length > previewLimit && <p>Preview limited. Use Copy message for the full response.</p>}
   </div>;
 });

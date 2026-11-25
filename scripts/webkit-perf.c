@@ -26,11 +26,15 @@ int main(int argc, char **argv) {
   }
   GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
   gtk_window_set_default_size(GTK_WINDOW(window), 1360, 860);
+  gtk_window_set_accept_focus(GTK_WINDOW(window), FALSE);
   WebKitWebContext *context = webkit_web_context_new_ephemeral();
   GtkWidget *view = webkit_web_view_new_with_context(context);
+  webkit_settings_set_user_agent_with_application_details(
+    webkit_web_view_get_settings(WEBKIT_WEB_VIEW(view)), "HermesWebKitFixture", "1");
   g_signal_connect(view, "notify::title", G_CALLBACK(title_changed), NULL);
   gtk_container_add(GTK_CONTAINER(window), view);
   gtk_widget_show_all(window);
+  gdk_window_set_pass_through(gtk_widget_get_window(window), TRUE);
   webkit_web_view_load_uri(WEBKIT_WEB_VIEW(view), argv[1]);
   g_timeout_add_seconds(30, expired, NULL);
   gtk_main();
