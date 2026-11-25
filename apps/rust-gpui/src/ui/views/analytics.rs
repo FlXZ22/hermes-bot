@@ -217,11 +217,14 @@ impl Render for AnalyticsView {
                                             .children(chart_points.iter().enumerate().map(|(idx, (date, tokens, _cost))| {
                                                 let ratio = (*tokens as f32 / max_bar as f32).clamp(0.04, 1.0);
                                                 let bar_h = (ratio * 132.0).max(6.0);
-                                                let short_date = if date.len() >= 5 {
-                                                    &date[date.len() - 5..]
-                                                } else {
-                                                    date.as_str()
-                                                };
+                                                let short_date: String = date
+                                                    .chars()
+                                                    .rev()
+                                                    .take(5)
+                                                    .collect::<Vec<_>>()
+                                                    .into_iter()
+                                                    .rev()
+                                                    .collect();
                                                 let color = theme.dataviz_color(idx);
                                                 div()
                                                     .flex_1()

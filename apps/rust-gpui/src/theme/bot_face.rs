@@ -73,10 +73,12 @@ pub enum BotFaceState {
     Sleeping,
     Happy,
     Celebrate,
+    #[allow(dead_code)]
     Excited,
 }
 
 impl BotFaceState {
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",

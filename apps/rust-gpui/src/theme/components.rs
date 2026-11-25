@@ -24,6 +24,7 @@ pub fn cursor_icon(name: &str, size_px: f32, color: Hsla) -> impl IntoElement {
         .child(ch.to_string())
 }
 
+#[allow(dead_code)]
 pub fn cursor_icon_filled(name: &str, size_px: f32, color: Hsla) -> impl IntoElement {
     let ch = cursor_icon_char(name, true);
     div()

@@ -174,6 +174,7 @@ pub struct AvatarEditorTarget {
 #[derive(Debug, Clone)]
 pub struct AttachmentFile {
     pub name: String,
+    #[allow(dead_code)]
     pub path: String,
     pub mime: String,
     pub bytes: Vec<u8>,
@@ -647,7 +648,11 @@ impl AppState {
                     s.client = Some(client);
                     s.realtime = Some(ws);
                     s.hermes_status = Some(status);
-                    s.connection_status = ConnectionStatus::Connected;
+                    s.connection_status = if s.connection.is_local() {
+                        ConnectionStatus::Local
+                    } else {
+                        ConnectionStatus::Connected
+                    };
                     s.connection_detail = s.connection.name.clone();
                     s.initializing = false;
                     if auto_close_setup {
@@ -801,7 +806,7 @@ impl AppState {
         let active_prof = self.active_profile.clone();
 
         cx.spawn(async move |this, cx| {
-            let (
+            let Ok((
                 status,
                 profiles,
                 sessions,
@@ -819,7 +824,7 @@ impl AppState {
                 raw_cfg,
                 env_list,
                 logs_list,
-            ) = rt
+            )) = rt
                 .spawn(async move {
                     tokio::join!(
                         client.get_status(),
@@ -842,7 +847,9 @@ impl AppState {
                     )
                 })
                 .await
-                .unwrap();
+            else {
+                return;
+            };
 
             // Also fetch tasks for each kanban board
             let board_tasks = if let Ok(ref b_list) = boards {

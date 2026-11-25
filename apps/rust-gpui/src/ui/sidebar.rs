@@ -29,6 +29,7 @@ pub struct SidebarView {
     app: Entity<AppState>,
     search_input: Entity<InputState>,
     show_archived: bool,
+    hovered_session_id: Option<String>,
     renaming_id: Option<String>,
     rename_input: Entity<InputState>,
     // Add Bot modal state
@@ -85,6 +86,7 @@ impl SidebarView {
             app,
             search_input,
             show_archived: false,
+            hovered_session_id: None,
             renaming_id: None,
             rename_input,
             new_bot_open: false,
@@ -247,10 +249,11 @@ impl SidebarView {
             .or_else(|| sess.model.clone())
             .unwrap_or_else(|| format!("{} messages", sess.message_count.unwrap_or(0)));
         let hover_bg = theme.sidebar_hover;
+        let is_hovered = self.hovered_session_id.as_deref() == Some(sess.id.as_str());
+        let sid_hover = sess.id.clone();
 
         div()
             .id(SharedString::from(format!("sess-row-{}", sess.id)))
-            .group("sess-row")
             .w_full()
             .flex()
             .items_center()
@@ -264,6 +267,17 @@ impl SidebarView {
             })
             .cursor_pointer()
             .hover(move |st| st.bg(hover_bg))
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                if *hovered {
+                    if this.hovered_session_id.as_deref() != Some(sid_hover.as_str()) {
+                        this.hovered_session_id = Some(sid_hover.clone());
+                        cx.notify();
+                    }
+                } else if this.hovered_session_id.as_deref() == Some(sid_hover.as_str()) {
+                    this.hovered_session_id = None;
+                    cx.notify();
+                }
+            }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.renaming_id.as_deref() != Some(sid.as_str()) {
                     this.app
@@ -317,76 +331,70 @@ impl SidebarView {
                                         .child(sess.display_title().to_string())
                                         .into_any_element()
                                 })
-                                .child(
+                                .child(if is_hovered && !is_renaming {
                                     div()
                                         .flex()
                                         .items_center()
                                         .gap(px(2.0))
                                         .flex_shrink_0()
                                         .child(
-                                            div()
-                                                .group_hover("sess-row", |st| st.invisible().w(px(0.0)))
-                                                .text_size(px(11.0))
-                                                .text_color(theme.sidebar_text_tertiary)
-                                                .child(time_str),
+                                            gb_mini_icon_btn(
+                                                SharedString::from(format!("pin-{}", sess.id)),
+                                                theme,
+                                                false,
+                                            )
+                                            .child(cursor_icon(
+                                                if pinned { "pin-slash" } else { "pin" },
+                                                12.0,
+                                                theme.sidebar_text_secondary,
+                                            ))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.app.update(cx, |s, cx| {
+                                                    s.toggle_pin_session(sid_pin.clone(), cx);
+                                                });
+                                            })),
                                         )
                                         .child(
-                                            div()
-                                                .hidden()
-                                                .group_hover("sess-row", |st| st.flex())
-                                                .items_center()
-                                                .gap(px(2.0))
-                                                .child(
-                                                    gb_mini_icon_btn(
-                                                        SharedString::from(format!("pin-{}", sess.id)),
-                                                        theme,
-                                                        false,
-                                                    )
-                                                    .child(cursor_icon(
-                                                        if pinned { "pin-slash" } else { "pin" },
-                                                        12.0,
-                                                        theme.sidebar_text_secondary,
-                                                    ))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.app.update(cx, |s, cx| {
-                                                            s.toggle_pin_session(sid_pin.clone(), cx);
-                                                        });
-                                                    })),
-                                                )
-                                                .child(
-                                                    gb_mini_icon_btn(
-                                                        SharedString::from(format!("ren-{}", sess.id)),
-                                                        theme,
-                                                        false,
-                                                    )
-                                                    .child(cursor_icon("pencil", 12.0, theme.sidebar_text_secondary))
-                                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                                        cx.stop_propagation();
-                                                        this.renaming_id = Some(sid_ren.clone());
-                                                        let init_t = title_for_ren.clone();
-                                                        this.rename_input.update(cx, |st, cx| {
-                                                            st.set_value(init_t, window, cx);
-                                                        });
-                                                        cx.notify();
-                                                    })),
-                                                )
-                                                .child(
-                                                    gb_mini_icon_btn(
-                                                        SharedString::from(format!("arch-{}", sess.id)),
-                                                        theme,
-                                                        true,
-                                                    )
-                                                    .child(cursor_icon("archive", 12.0, theme.sidebar_text_secondary))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.app.update(cx, |s, cx| {
-                                                            s.archive_session(sid_arch.clone(), !archived, cx);
-                                                        });
-                                                    })),
-                                                ),
-                                        ),
-                                ),
+                                            gb_mini_icon_btn(
+                                                SharedString::from(format!("ren-{}", sess.id)),
+                                                theme,
+                                                false,
+                                            )
+                                            .child(cursor_icon("pencil", 12.0, theme.sidebar_text_secondary))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.renaming_id = Some(sid_ren.clone());
+                                                let init_t = title_for_ren.clone();
+                                                this.rename_input.update(cx, |st, cx| {
+                                                    st.set_value(init_t, window, cx);
+                                                });
+                                                cx.notify();
+                                            })),
+                                        )
+                                        .child(
+                                            gb_mini_icon_btn(
+                                                SharedString::from(format!("arch-{}", sess.id)),
+                                                theme,
+                                                true,
+                                            )
+                                            .child(cursor_icon("archive", 12.0, theme.sidebar_text_secondary))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.app.update(cx, |s, cx| {
+                                                    s.archive_session(sid_arch.clone(), !archived, cx);
+                                                });
+                                            })),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.sidebar_text_tertiary)
+                                        .child(time_str)
+                                        .into_any_element()
+                                }),
                         )
                         .child(if is_working {
                             div()
@@ -421,7 +429,7 @@ impl SidebarView {
 }
 
 impl Render for SidebarView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let s = self.app.read(cx);
         let theme = s.sand_theme();
         let mode = s.theme_mode();
@@ -517,7 +525,6 @@ impl Render for SidebarView {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .relative()
             // Top bar: Traffic lights + collapse + new chat
             .child(
                 div()
@@ -1093,22 +1100,30 @@ impl Render for SidebarView {
             )
             // Inline Add Bot Modal
             .when(self.new_bot_open, |d| {
-                d.child(self.render_new_bot_modal(&theme, cx))
+                d.child(self.render_new_bot_modal(&theme, window.viewport_size(), cx))
             })
             // Inline New Session Board Modal
             .when(self.new_board_open, |d| {
-                d.child(self.render_new_board_modal(&theme, cx))
+                d.child(self.render_new_board_modal(&theme, window.viewport_size(), cx))
             })
     }
 }
 
 impl SidebarView {
-    fn render_new_bot_modal(&self, theme: &SandTheme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_new_bot_modal(
+        &self,
+        theme: &SandTheme,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         deferred(
             div()
                 .id("new-bot-backdrop")
                 .absolute()
-                .inset_0()
+                .top_0()
+                .left_0()
+                .w(viewport.width)
+                .h(viewport.height)
                 .bg(theme.bg_scrim)
                 .flex()
                 .items_center()
@@ -1232,12 +1247,20 @@ impl SidebarView {
         )
     }
 
-    fn render_new_board_modal(&self, theme: &SandTheme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_new_board_modal(
+        &self,
+        theme: &SandTheme,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         deferred(
             div()
                 .id("new-board-backdrop")
                 .absolute()
-                .inset_0()
+                .top_0()
+                .left_0()
+                .w(viewport.width)
+                .h(viewport.height)
                 .bg(theme.bg_scrim)
                 .flex()
                 .items_center()

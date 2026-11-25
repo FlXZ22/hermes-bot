@@ -386,7 +386,7 @@ impl Render for TerminalView {
             .as_deref()
             .and_then(|id| self.tabs.iter().find(|t| t.id == id));
 
-        let (rendered_rows, meta_shell, meta_cwd, exit_code, error_msg) =
+        let (rendered_rows, meta_shell, meta_cwd, meta_remote, exit_code, error_msg) =
             if let Some(tab) = active_tab {
                 let mut rows_out: Vec<Vec<(String, Hsla, Option<Hsla>, bool)>> = Vec::new();
                 let mut exit_c = None;
@@ -439,11 +439,12 @@ impl Render for TerminalView {
                     rows_out,
                     tab.shell.clone(),
                     tab.cwd.clone(),
+                    tab.remote,
                     exit_c,
                     err_m,
                 )
             } else {
-                (Vec::new(), "shell".into(), String::new(), None, None)
+                (Vec::new(), "shell".into(), String::new(), false, None, None)
             };
 
         div()
@@ -558,6 +559,8 @@ impl Render for TerminalView {
                                 &theme,
                                 if exit_code.is_some() {
                                     BadgeTone::Warning
+                                } else if meta_remote {
+                                    BadgeTone::Info
                                 } else {
                                     BadgeTone::Success
                                 },

@@ -33,6 +33,7 @@ impl HermesClient {
         self.conn.read().unwrap().clone()
     }
 
+    #[allow(dead_code)]
     pub fn set_credentials(
         &self,
         token: Option<String>,
@@ -403,6 +404,7 @@ impl HermesClient {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn delete_session(&self, session_id: &str) -> Result<Value, String> {
         let enc = urlencoding_segment(session_id);
         self.request_json(

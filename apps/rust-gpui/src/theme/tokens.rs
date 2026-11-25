@@ -14,6 +14,7 @@ impl Default for ThemeMode {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct BotColorPreset {
     pub id: &'static str,
@@ -228,6 +229,7 @@ pub struct SandTheme {
     pub text_primary: Hsla,
     pub text_secondary: Hsla,
     pub text_tertiary: Hsla,
+    #[allow(dead_code)]
     pub text_quaternary: Hsla,
     pub text_on_primary: Hsla,
     // Borders

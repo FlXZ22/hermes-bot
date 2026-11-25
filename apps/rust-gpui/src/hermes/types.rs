@@ -401,6 +401,7 @@ impl HermesKanbanStatus {
         (Self::Done, "Done", 0x00C972),
     ];
 
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Triage => "Triage",
