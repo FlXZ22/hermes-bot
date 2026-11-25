@@ -1,10 +1,11 @@
 use crate::state::app_state::{AppState, AvatarEditorTarget, RightPaneTabId};
-use crate::theme::bot_face::bot_face;
+use crate::theme::bot_face::{bot_face_with_options, BotFaceOptions};
 use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_mini_icon_btn, gb_section_card, gb_section_card_head,
     gb_segmented_item, gb_segmented_shell, BadgeTone, BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::ui::inspector::terminal_view::TerminalView;
+use crate::ui::motion::{gpu_spinner, view_enter, EntranceKey, SpringValue};
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -19,7 +20,10 @@ pub struct RightSidePaneView {
     soul_input: Entity<TextareaState>,
     synced_cwd: String,
     synced_soul: String,
-    width_px: f32,
+    target_width_px: f32,
+    width: SpringValue,
+    open_progress: f32,
+    tab_entrance: EntranceKey<RightPaneTabId>,
     files_scroll: ScrollHandle,
     files_smooth: SmoothScroller,
     preview_scroll: ScrollHandle,
@@ -86,7 +90,10 @@ impl RightSidePaneView {
             soul_input,
             synced_cwd: cwd,
             synced_soul: soul,
-            width_px: 380.0,
+            target_width_px: 360.0,
+            width: SpringValue::new(360.0).with_precision(0.1),
+            open_progress: 0.0,
+            tab_entrance: EntranceKey::new(),
             files_scroll,
             files_smooth,
             preview_scroll,
@@ -113,14 +120,24 @@ impl RightSidePaneView {
         }
     }
 
+    pub fn open_progress(&self) -> f32 {
+        self.open_progress
+    }
+
+    pub fn set_open_progress(&mut self, progress: f32, cx: &mut Context<Self>) {
+        self.open_progress = progress;
+        cx.notify();
+    }
+
     fn cycle_width(&mut self, cx: &mut Context<Self>) {
-        self.width_px = if self.width_px < 420.0 {
+        self.target_width_px = if self.target_width_px < 420.0 {
             480.0
-        } else if self.width_px < 560.0 {
+        } else if self.target_width_px < 560.0 {
             600.0
         } else {
             360.0
         };
+        self.width.set_target(self.target_width_px);
         cx.notify();
     }
 }
@@ -142,7 +159,6 @@ impl Render for RightSidePaneView {
             bot_seed,
             bot_override,
             bot_state,
-            anim_tick,
             active_profile,
             soul_md,
             sys_stats,
@@ -170,7 +186,6 @@ impl Render for RightSidePaneView {
                 seed,
                 ov,
                 chat_state,
-                s.anim_tick,
                 s.active_profile.clone(),
                 s.soul_md.clone(),
                 s.system_stats.clone(),
@@ -199,8 +214,11 @@ impl Render for RightSidePaneView {
             (RightPaneTabId::Bot, "Bot"),
         ];
 
-        div()
-            .w(px(self.width_px))
+        let width = self.width.advance(window);
+        let tab_id = self.tab_entrance.id("inspector-tab", tab);
+
+        let panel = div()
+            .w(px(width))
             .h_full()
             .flex_shrink_0()
             .bg(theme.side_pane_bg)
@@ -268,7 +286,7 @@ impl Render for RightSidePaneView {
                     ),
             )
             // Body
-            .child(match tab {
+            .child(view_enter(tab_id, div().flex_1().min_h_0().w_full().flex().flex_col().child(match tab {
                 RightPaneTabId::Files => {
                     div()
                         .flex_1()
@@ -525,7 +543,8 @@ impl Render for RightSidePaneView {
                                 )
                                 .child(
                                     gb_btn("git-refresh-btn", &theme, BtnVariant::Secondary, true, git_loading)
-                                        .child(cursor_icon("refresh", 12.0, theme.text_primary))
+                                        .when(git_loading, |d| d.child(gpu_spinner(12.0, theme.text_primary)))
+                                        .when(!git_loading, |d| d.child(cursor_icon("refresh", 12.0, theme.text_primary)))
                                         .child(if git_loading { "Loading…" } else { "Refresh" })
                                         .on_click(cx.listener(|v, _, _, cx| {
                                             v.app.update(cx, |s, cx| s.refresh_inspector_git(cx));
@@ -698,14 +717,14 @@ impl Render for RightSidePaneView {
                                     .flex_col()
                                     .items_center()
                                     .gap(px(10.0))
-                                    .child(bot_face(
+                                    .child(bot_face_with_options(
                                         &theme,
                                         &bot_seed,
                                         bot_override.as_ref().and_then(|o| o.shape_id.as_deref()),
                                         bot_override.as_ref().and_then(|o| o.color_id.as_deref()),
                                         56.0,
                                         bot_state,
-                                        anim_tick,
+                                        BotFaceOptions { slot_key: "inspector", follow_pointer: true, clickable_spin: true, ..Default::default() },
                                     ))
                                     .child(
                                         div()
@@ -741,6 +760,7 @@ impl Render for RightSidePaneView {
                                                     true,
                                                     refreshing_models,
                                                 )
+                                                .when(refreshing_models, |d| d.child(gpu_spinner(12.0, theme.text_primary)))
                                                 .child(if refreshing_models {
                                                     "Refreshing…"
                                                 } else {
@@ -758,7 +778,8 @@ impl Render for RightSidePaneView {
                                                     true,
                                                     restarting_backend,
                                                 )
-                                                .child("Restart Backend")
+                                                .when(restarting_backend, |d| d.child(gpu_spinner(12.0, theme.text_primary)))
+                                                .child(if restarting_backend { "Restarting…" } else { "Restart Backend" })
                                                 .on_click(cx.listener(|v, _, _, cx| {
                                                     v.app.update(cx, |s, cx| s.restart_backend(cx));
                                                 })),
@@ -839,7 +860,17 @@ impl Render for RightSidePaneView {
                         .child(smooth_scroll_layer(&self.bot_smooth))
                         .into_any_element()
                 }
-            })
+            })));
+
+        // Clip a full-width panel so the slide doesn't squeeze its controls or PTY.
+        div()
+            .w(px(width * self.open_progress))
+            .h_full()
+            .flex_shrink_0()
+            .overflow_hidden()
+            .opacity(self.open_progress)
+            .flex()
+            .child(panel)
     }
 }
 

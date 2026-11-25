@@ -333,12 +333,17 @@ impl HermesRealtimeSession {
                     .or_else(|| payload.get("content"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if d.is_empty() {
+                // Delta whitespace is significant; do not trim it before concatenation.
+                let thinking = ["thinking", "reasoning_content"].into_iter().find_map(|key| {
+                    payload.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+                });
+                if d.is_empty() && thinking.is_none() {
                     None
                 } else {
                     Some(HermesStreamEvent::TextDelta {
                         session_id,
                         delta: d.to_string(),
+                        thinking: thinking.map(String::from),
                     })
                 }
             }
@@ -348,6 +353,8 @@ impl HermesRealtimeSession {
                     .or_else(|| payload.get("text"))
                     .or_else(|| payload.get("reasoning"))
                     .and_then(Value::as_str)
+                    .or_else(|| payload.get("thinking").and_then(Value::as_str))
+                    .or_else(|| payload.get("reasoning_content").and_then(Value::as_str))
                     .unwrap_or("");
                 if d.is_empty() {
                     None
@@ -364,12 +371,14 @@ impl HermesRealtimeSession {
                     .or_else(|| payload.get("text"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if c.is_empty() {
+                let thinking = thinking_from_fields(&payload);
+                if c.is_empty() && thinking.is_none() {
                     None
                 } else {
                     Some(HermesStreamEvent::MessageInterim {
                         session_id,
                         content: c.to_string(),
+                        thinking,
                     })
                 }
             }
@@ -574,6 +583,7 @@ impl HermesRealtimeSession {
                         .or_else(|| payload.get("text"))
                         .and_then(Value::as_str)
                         .map(String::from),
+                    thinking: thinking_from_fields(&payload),
                 })
             }
             "error" => Some(HermesStreamEvent::Error {

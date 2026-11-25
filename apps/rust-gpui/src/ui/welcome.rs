@@ -2,11 +2,12 @@ use crate::backend::ssh::SshTarget;
 use crate::hermes::client::HermesClient;
 use crate::hermes::types::{AuthProviderInfo, HermesAuthType, HermesConnection, HermesServerMode};
 use crate::state::app_state::{AppState, AppViewId, ConnectionStatus};
-use crate::theme::bot_face::{bot_face, BotFaceState};
+use crate::theme::bot_face::{bot_face_with_options, BotFaceOptions, BotFaceState};
 use crate::theme::components::{
     cursor_icon, gb_btn, gb_traffic_lights, BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::theme::tokens::{SandTheme, ThemeMode};
+use crate::ui::motion::{gpu_spinner, view_enter, EntranceKey};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState};
@@ -42,6 +43,7 @@ impl RemoteAuthKind {
 pub struct WelcomeView {
     app: Entity<AppState>,
     step: WelcomeStep,
+    step_entrance: EntranceKey<(WelcomeStep, bool)>,
     auth: RemoteAuthKind,
     url_input: Entity<InputState>,
     name_input: Entity<InputState>,
@@ -163,6 +165,7 @@ impl WelcomeView {
         Self {
             app,
             step: init_step,
+            step_entrance: EntranceKey::new(),
             auth: RemoteAuthKind::Browser,
             url_input,
             name_input,
@@ -467,9 +470,9 @@ impl Render for WelcomeView {
                 && (m.id == active_model || m.id.ends_with(&format!("/{active_model}")))
                 && (active_provider == "auto" || m.provider == active_provider)
         });
-        let tick = s.anim_tick;
 
         let step = self.step;
+        let step_id = self.step_entrance.id("welcome-step", (step, initializing));
         let is_busy = !self.busy.is_empty();
         let title = if initializing {
             "Opening Hermes…"
@@ -499,11 +502,6 @@ impl Render for WelcomeView {
         };
 
         let show_friends = matches!(step, WelcomeStep::Welcome | WelcomeStep::Choose);
-        let hero_size = if step == WelcomeStep::Welcome {
-            96.0
-        } else {
-            74.0
-        };
         let hero_color = if step == WelcomeStep::Ready {
             "blue"
         } else {
@@ -593,7 +591,7 @@ impl Render for WelcomeView {
                     .justify_center()
                     .px(px(24.0))
                     .py(px(24.0))
-                    .child(
+                    .child(view_enter(step_id,
                         div()
                             .w(px(460.0))
                             .max_w_full()
@@ -643,7 +641,7 @@ impl Render for WelcomeView {
                             .child(
                                 div()
                                     .w(px(250.0))
-                                    .h(px(if step == WelcomeStep::Remote { 86.0 } else { 112.0 }))
+                                    .h(px(112.0))
                                     .relative()
                                     .flex()
                                     .items_center()
@@ -654,14 +652,14 @@ impl Render for WelcomeView {
                                                 .absolute()
                                                 .left(px(18.0))
                                                 .top(px(9.0))
-                                                .child(bot_face(
+                                                .child(bot_face_with_options(
                                                     &theme,
                                                     "welcome-red",
                                                     Some("blob"),
                                                     Some("red"),
                                                     42.0,
                                                     BotFaceState::Idle,
-                                                    tick,
+                                                    BotFaceOptions { slot_key: "welcome-red", ..Default::default() },
                                                 )),
                                         )
                                         .child(
@@ -669,25 +667,25 @@ impl Render for WelcomeView {
                                                 .absolute()
                                                 .right(px(18.0))
                                                 .top(px(62.0))
-                                                .child(bot_face(
+                                                .child(bot_face_with_options(
                                                     &theme,
                                                     "welcome-cyan",
                                                     Some("blob"),
                                                     Some("cyan"),
                                                     34.0,
                                                     BotFaceState::Idle,
-                                                    tick,
+                                                    BotFaceOptions { slot_key: "welcome-cyan", ..Default::default() },
                                                 )),
                                         )
                                     })
-                                    .child(bot_face(
+                                    .child(bot_face_with_options(
                                         &theme,
                                         "welcome",
                                         Some("blob"),
                                         Some(hero_color),
-                                        hero_size,
+                                        96.0,
                                         hero_state,
-                                        tick,
+                                        BotFaceOptions { slot_key: "welcome-hero", follow_pointer: true, clickable_spin: true, ..Default::default() },
                                     )),
                             )
                             // Heading
@@ -968,7 +966,7 @@ impl Render for WelcomeView {
                                         .gap(px(10.0))
                                         .text_size(px(13.0))
                                         .text_color(theme.text_secondary)
-                                        .child(cursor_icon("spinner", 16.0, theme.text_secondary))
+                                        .child(gpu_spinner(16.0, theme.text_secondary))
                                         .child(if is_busy { self.busy.clone() } else { conn_detail }),
                                 )
                             })
@@ -1032,7 +1030,7 @@ impl Render for WelcomeView {
                                         .child(div().flex_1().child(self.error.clone())),
                                 )
                             }),
-                    ),
+                    )),
             )
             // Footer
             .child(

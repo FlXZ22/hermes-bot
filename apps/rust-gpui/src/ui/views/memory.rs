@@ -3,6 +3,7 @@ use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_row, gb_section_card, gb_section_card_head,
     gb_segmented_item, gb_segmented_shell, BadgeTone, BtnVariant, FONT_SANS,
 };
+use crate::ui::motion::{gpu_spinner, view_enter, EntranceKey};
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -20,6 +21,8 @@ enum MemoryTab {
 pub struct MemoryView {
     app: Entity<AppState>,
     tab: MemoryTab,
+    tab_entrance: EntranceKey<MemoryTab>,
+    graph_loading: bool,
     mem_input: Entity<TextareaState>,
     user_input: Entity<TextareaState>,
     soul_input: Entity<TextareaState>,
@@ -68,6 +71,8 @@ impl MemoryView {
         Self {
             app,
             tab: MemoryTab::Memory,
+            tab_entrance: EntranceKey::new(),
+            graph_loading: false,
             mem_input,
             user_input,
             soul_input,
@@ -80,6 +85,9 @@ impl MemoryView {
     }
 
     fn load_graph(&mut self, cx: &mut Context<Self>) {
+        if self.graph_loading {
+            return;
+        }
         let (client, rt) = {
             let s = self.app.read(cx);
             (s.client.clone(), s.tokio_rt.clone())
@@ -87,18 +95,21 @@ impl MemoryView {
         let Some(client) = client else {
             return;
         };
+        self.graph_loading = true;
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(g)) = rt
+            let result = rt
                 .spawn(async move { client.get_learning_graph().await })
-                .await
-            {
-                let _ = this.update(cx, |v, cx| {
+                .await;
+            let _ = this.update(cx, |v, cx| {
+                v.graph_loading = false;
+                if let Ok(Ok(g)) = result {
                     v.app.update(cx, |s, cx| {
                         s.learning_graph = Some(g);
                         cx.notify();
                     });
-                });
-            }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -133,11 +144,11 @@ impl Render for MemoryView {
             self.soul_input
                 .update(cx, |st, cx| st.set_value(soul, window, cx));
         }
+        let tab_id = self.tab_entrance.id("memory-tab", self.tab);
 
         div()
-            .flex_1()
+            .size_full()
             .min_w_0()
-            .h_full()
             .bg(theme.bg_pane)
             .text_color(theme.text_primary)
             .font_family(FONT_SANS)
@@ -239,7 +250,7 @@ impl Render for MemoryView {
                     .py(px(20.0))
                     .flex()
                     .justify_center()
-                    .child(
+                    .child(view_enter(tab_id,
                         div()
                             .w(px(920.0))
                             .max_w_full()
@@ -329,8 +340,9 @@ impl Render for MemoryView {
                                                 .items_center()
                                                 .gap(px(8.0))
                                                 .text_color(theme.text_tertiary)
-                                                .child(cursor_icon("brain", 28.0, theme.text_tertiary))
-                                                .child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_primary).child("Learning graph is building"))
+                                                .when(self.graph_loading, |d| d.child(gpu_spinner(28.0, theme.text_tertiary)))
+                                                .when(!self.graph_loading, |d| d.child(cursor_icon("brain", 28.0, theme.text_tertiary)))
+                                                .child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_primary).child(if self.graph_loading { "Loading learning graph…" } else { "Learning graph is building" }))
                                                 .child("As you work with Hermes, learned skills and memories appear here.")
                                                 .into_any_element()]
                                         } else {
@@ -359,7 +371,7 @@ impl Render for MemoryView {
                                         }),
                                 )
                             }),
-                    ),
+                    )),
                     )
                     .vertical_scrollbar(&self.scroll_handle)
                     .child(smooth_scroll_layer(&self.smooth_scroller)),

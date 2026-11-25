@@ -1,6 +1,7 @@
 use crate::state::app_state::{AppState, AppViewId};
 use crate::theme::components::{cursor_icon, FONT_SANS};
 use crate::theme::tokens::{SandTheme, ThemeMode};
+use crate::ui::motion::ModalMotion;
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -28,6 +29,8 @@ struct PaletteItem {
 
 pub struct CommandPaletteModal {
     app: Entity<AppState>,
+    motion: ModalMotion,
+    need_focus: bool,
     query_input: Entity<InputState>,
     selected_idx: usize,
     scroll_handle: ScrollHandle,
@@ -40,8 +43,14 @@ impl CommandPaletteModal {
             InputState::new(window, cx)
                 .placeholder("Jump to a session, board, model, or command...")
         });
-        cx.observe(&app, |_, app_e, cx| {
-            if app_e.read(cx).command_palette_open {
+        cx.observe(&app, |this, app_e, cx| {
+            let open = app_e.read(cx).command_palette_open;
+            let was_open = this.motion.is_open();
+            this.motion.set_open(open);
+            if open {
+                if !was_open {
+                    this.need_focus = true;
+                }
                 cx.notify();
             }
         })
@@ -66,6 +75,8 @@ impl CommandPaletteModal {
 
         Self {
             app,
+            motion: ModalMotion::default(),
+            need_focus: true,
             query_input,
             selected_idx: 0,
             scroll_handle,
@@ -221,12 +232,26 @@ impl CommandPaletteModal {
 }
 
 impl Render for CommandPaletteModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let s = self.app.read(cx);
-        if !s.command_palette_open {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (is_open, theme) = {
+            let s = self.app.read(cx);
+            (s.command_palette_open, s.sand_theme())
+        };
+        let was_open = self.motion.is_open();
+        self.motion.set_open(is_open);
+        if !is_open {
             return div().into_any_element();
         }
-        let theme = s.sand_theme();
+        if !was_open || self.need_focus {
+            self.need_focus = false;
+            self.selected_idx = 0;
+            self.query_input
+                .update(cx, |st, cx| st.set_value("", window, cx));
+            let fh = self.query_input.read(cx).focus_handle(cx);
+            window.on_next_frame(move |window, cx| {
+                window.focus(&fh, cx);
+            });
+        }
         let items = self.build_items(cx);
 
         deferred(
@@ -234,7 +259,7 @@ impl Render for CommandPaletteModal {
                 .id("cmd-palette-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(theme.bg_scrim)
+                .child(self.motion.backdrop("cmd-palette-scrim-enter", theme.bg_scrim))
                 .flex()
                 .items_start()
                 .justify_center()
@@ -248,7 +273,7 @@ impl Render for CommandPaletteModal {
                         cx.notify();
                     });
                 }))
-                .child(
+                .child(self.motion.card("cmd-palette-card-enter",
                     div()
                         .id("cmd-palette-modal")
                         .w(px(560.0))
@@ -296,12 +321,14 @@ impl Render for CommandPaletteModal {
                             div()
                                 .w_full()
                                 .max_h(px(360.0))
+                                .overflow_hidden()
                                 .relative()
                                 .child(
                                     div()
                                         .id("cmd-palette-list")
                                         .track_scroll(&self.scroll_handle)
                                         .p(px(8.0))
+                                        .pb(px(12.0))
                                         .max_h(px(360.0))
                                         .overflow_y_scroll()
                                         .flex()
@@ -352,7 +379,7 @@ impl Render for CommandPaletteModal {
                                 .vertical_scrollbar(&self.scroll_handle)
                                 .child(smooth_scroll_layer(&self.smooth_scroller)),
                         ),
-                ),
+                )),
         )
         .into_any_element()
     }

@@ -306,11 +306,12 @@ impl HermesClient {
                     Some(Value::Null) | None => String::new(),
                     Some(other) => other.to_string(),
                 };
-                let thinking = m
-                    .get("thinking")
-                    .or_else(|| m.get("reasoning_content"))
-                    .and_then(Value::as_str)
-                    .map(String::from);
+                let (thinking, content) = if role == MessageRole::Assistant {
+                    let fields = thinking_from_fields(&m);
+                    extract_thinking_from_content(&content, fields.as_deref(), false)
+                } else {
+                    (None, content)
+                };
                 let tool_name = m.get("name").and_then(Value::as_str).map(String::from);
                 let timestamp = m
                     .get("timestamp")

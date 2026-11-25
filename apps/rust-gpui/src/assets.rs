@@ -7,8 +7,6 @@ use std::borrow::Cow;
 #[folder = "assets"]
 #[include = "fonts/*.ttf"]
 #[include = "icons/*.png"]
-#[include = "shapes/*.svg"]
-#[include = "states/*.svg"]
 pub struct EmbeddedAssets;
 
 pub struct AppAssets;

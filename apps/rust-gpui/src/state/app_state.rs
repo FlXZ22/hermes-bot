@@ -105,6 +105,53 @@ pub enum TurnSettlementOutcome {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Default)]
+struct StreamText {
+    raw_content: String,
+    raw_thinking: String,
+    snapshot_thinking: Option<String>,
+}
+
+impl StreamText {
+    fn structured_thinking(&self, snapshot: Option<&str>) -> Option<String> {
+        let existing = merge_thinking(self.snapshot_thinking.as_deref(), Some(&self.raw_thinking));
+        merge_thinking(existing.as_deref(), snapshot)
+    }
+
+    fn publish(&self, message: &mut HermesMessage) {
+        let structured = self.structured_thinking(None);
+        (message.thinking, message.content) =
+            extract_thinking_from_content(&self.raw_content, structured.as_deref(), true);
+    }
+
+    fn apply_snapshot(
+        &self,
+        message: &mut HermesMessage,
+        content: Option<&str>,
+        thinking: Option<&str>,
+    ) {
+        let structured = self.structured_thinking(thinking);
+        if let Some(content) = content.filter(|text| text.starts_with(&self.raw_content)) {
+            // A final snapshot extending the raw stream already contains its inline thoughts,
+            // including the completed version of any block that was still in progress.
+            (message.thinking, message.content) =
+                extract_thinking_from_content(content, structured.as_deref(), false);
+            return;
+        }
+        let (stream_thinking, stream_content) =
+            extract_thinking_from_content(&self.raw_content, structured.as_deref(), false);
+        if let Some(content) = content {
+            let (thinking, visible) =
+                extract_thinking_from_content(content, stream_thinking.as_deref(), false);
+            message.thinking = thinking;
+            message.content = if visible.trim().is_empty() { stream_content } else { visible };
+        } else {
+            message.thinking = stream_thinking;
+            message.content = stream_content;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionChatState {
     pub messages: Vec<HermesMessage>,
@@ -118,6 +165,7 @@ pub struct SessionChatState {
     pub last_settlement: Option<(TurnSettlementOutcome, Instant)>,
     pub todos: Vec<HermesTodoItem>,
     pub session_usage: Option<HermesSessionUsage>,
+    stream_text: StreamText,
 }
 
 impl Default for SessionChatState {
@@ -134,11 +182,83 @@ impl Default for SessionChatState {
             last_settlement: None,
             todos: Vec::new(),
             session_usage: None,
+            stream_text: StreamText::default(),
         }
     }
 }
 
 impl SessionChatState {
+    fn streaming_message_index(&mut self) -> usize {
+        if let Some(index) = self.messages.iter().rposition(|m| m.streaming) {
+            index
+        } else {
+            self.messages.push(HermesMessage::new_assistant(format!(
+                "asst-{}", uuid::Uuid::new_v4().simple()
+            )));
+            self.messages.len() - 1
+        }
+    }
+
+    fn append_stream_text(&mut self, text: &str, thinking: Option<&str>) {
+        let index = self.streaming_message_index();
+        self.stream_text.raw_content.push_str(text);
+        if let Some(thinking) = thinking {
+            self.stream_text.raw_thinking.push_str(thinking);
+        }
+        let message = &mut self.messages[index];
+        self.stream_text.publish(message);
+        self.has_streamed_text = !message.content.trim().is_empty();
+    }
+
+    fn apply_interim_snapshot(&mut self, content: &str, thinking: Option<&str>) {
+        let (extracted, visible, incomplete) = split_thinking_content(content, thinking, true);
+        if !visible.trim().is_empty() && !incomplete {
+            self.settle_stream_text(Some(content), thinking);
+            self.has_streamed_text = true;
+            return;
+        }
+
+        // Reasoning-only snapshots and snapshots ending mid-tag do not end the message.
+        let index = self.streaming_message_index();
+        let extra = if incomplete || (!self.has_streamed_text && !content.is_empty()) {
+            if !self.stream_text.raw_content.starts_with(content) {
+                self.stream_text.raw_content = content.to_owned();
+            }
+            thinking
+        } else {
+            extracted.as_deref()
+        };
+        self.stream_text.snapshot_thinking =
+            merge_thinking(self.stream_text.snapshot_thinking.as_deref(), extra);
+        self.stream_text.publish(&mut self.messages[index]);
+        self.has_streamed_text = !self.messages[index].content.trim().is_empty();
+    }
+
+    fn settle_stream_text(&mut self, content: Option<&str>, thinking: Option<&str>) -> Option<usize> {
+        let stream = std::mem::take(&mut self.stream_text);
+        let index = self.messages.iter().rposition(|m| m.streaming).or_else(|| {
+            let (thought, visible) = extract_thinking_from_content(content.unwrap_or_default(), thinking, false);
+            if thought.is_none() && visible.trim().is_empty() {
+                return None;
+            }
+            // Some gateways repeat the interim snapshot when the turn completes.
+            if let Some(index) = self.messages.len().checked_sub(1) {
+                let last = &mut self.messages[index];
+                let matches_last = last.content == visible && !visible.is_empty();
+                let completes_interim = self.has_streamed_text && visible.is_empty() && !last.content.is_empty();
+                if last.role == MessageRole::Assistant && (matches_last || completes_interim) {
+                    last.thinking = merge_thinking(last.thinking.as_deref(), thought.as_deref());
+                    return None;
+                }
+            }
+            Some(self.streaming_message_index())
+        })?;
+        let message = &mut self.messages[index];
+        stream.apply_snapshot(message, content, thinking);
+        message.streaming = false;
+        Some(index)
+    }
+
     pub fn bot_state(&self) -> BotFaceState {
         if self.awaiting_user_response {
             return BotFaceState::Blocked;
@@ -206,7 +326,7 @@ pub struct AppState {
     pub model_picker_open: bool,
     pub avatar_editor_target: Option<AvatarEditorTarget>,
     pub toast: Option<(String, Instant)>,
-    pub anim_tick: u64,
+    /// Retained for the legacy chat call sites; face animations are compositor-driven.
 
     // Onboarding & Connection
     pub setup_open: bool,
@@ -282,14 +402,14 @@ pub struct AppState {
 const HISTORY_PAGE_SIZE: usize = 48;
 
 impl AppState {
-    pub fn new(tokio_rt: Arc<tokio::runtime::Runtime>, cx: &mut Context<Self>) -> Self {
+    pub fn new(tokio_rt: Arc<tokio::runtime::Runtime>, _cx: &mut Context<Self>) -> Self {
         let prefs = load_ui_prefs();
         let supervisor = HermesSupervisor::new();
         let home_dir = dirs::home_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "/home".into());
 
-        let state = Self {
+        Self {
             tokio_rt,
             supervisor,
             remote_login: RemoteLogin::default(),
@@ -307,7 +427,6 @@ impl AppState {
             model_picker_open: false,
             avatar_editor_target: None,
             toast: None,
-            anim_tick: 0,
             setup_open: true,
             initializing: true,
             connection: HermesConnection::default(),
@@ -370,43 +489,7 @@ impl AppState {
             inspector_git: None,
             inspector_git_loading: false,
             inspector_git_error: None,
-        };
-
-        // Start animation ticker (only notifies when animations or toast are active to keep idle CPU/RAM ~0)
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(260))
-                    .await;
-                let ok = this.update(cx, |s, cx| {
-                    let mut changed = false;
-                    if let Some((_, at)) = &s.toast {
-                        if at.elapsed() > Duration::from_secs(3) {
-                            s.toast = None;
-                            changed = true;
-                        }
-                    }
-                    let has_active_anim = s.setup_open
-                        || s.initializing
-                        || s.active_chat().is_streaming
-                        || s.restarting_backend
-                        || s.refreshing_models;
-                    if has_active_anim {
-                        s.anim_tick = s.anim_tick.wrapping_add(1);
-                        changed = true;
-                    }
-                    if changed {
-                        cx.notify();
-                    }
-                });
-                if ok.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-
-        state
+        }
     }
 
     pub fn theme_mode(&self) -> ThemeMode {
@@ -1198,7 +1281,7 @@ impl AppState {
                                         _ => MessageRole::Assistant,
                                     },
                                     content: r.content,
-                                    thinking: None,
+                                    thinking: r.thinking,
                                     tool_name: None,
                                     timestamp: r.timestamp,
                                     model: r.model,
@@ -1763,9 +1846,7 @@ impl AppState {
         if let Some(c) = self.chats.get_mut(&sid) {
             c.is_streaming = false;
             c.last_settlement = Some((TurnSettlementOutcome::Cancelled, Instant::now()));
-            for m in &mut c.messages {
-                m.streaming = false;
-            }
+            c.settle_stream_text(None, None);
         }
         cx.notify();
         cx.spawn(async move |_, _| {
@@ -1794,6 +1875,7 @@ impl AppState {
                         self.wire_to_stored.clear();
                         for chat in self.chats.values_mut() {
                             chat.is_streaming = false;
+                            chat.settle_stream_text(None, None);
                         }
                     }
                     _ => {
@@ -1872,41 +1954,20 @@ impl AppState {
                     )));
                 }
             }
-            HermesStreamEvent::TextDelta { delta, .. } => {
+            HermesStreamEvent::TextDelta { delta, thinking, .. } => {
                 let chat = self.chats.entry(target_sid).or_default();
                 chat.is_streaming = true;
-                chat.has_streamed_text = true;
-                if let Some(m) = chat.messages.iter_mut().rev().find(|m| m.streaming) {
-                    m.content.push_str(&delta);
-                } else {
-                    let mut m =
-                        HermesMessage::new_assistant(format!("asst-{}", uuid::Uuid::new_v4().simple()));
-                    m.content.push_str(&delta);
-                    chat.messages.push(m);
-                }
+                chat.append_stream_text(&delta, thinking.as_deref());
             }
             HermesStreamEvent::ThinkingDelta { delta, .. } => {
                 let chat = self.chats.entry(target_sid).or_default();
                 chat.is_streaming = true;
-                chat.has_streamed_text = false;
-                chat.active_tool_name = None;
-                if let Some(m) = chat.messages.iter_mut().rev().find(|m| m.streaming) {
-                    m.thinking.get_or_insert_with(String::new).push_str(&delta);
-                } else {
-                    let mut m =
-                        HermesMessage::new_assistant(format!("asst-{}", uuid::Uuid::new_v4().simple()));
-                    m.thinking = Some(delta);
-                    chat.messages.push(m);
-                }
+                chat.append_stream_text("", Some(&delta));
             }
-            HermesStreamEvent::MessageInterim { content, .. } => {
+            HermesStreamEvent::MessageInterim { content, thinking, .. } => {
                 let chat = self.chats.entry(target_sid).or_default();
-                for m in &mut chat.messages {
-                    if m.streaming {
-                        m.content = content.clone();
-                        m.streaming = false;
-                    }
-                }
+                chat.is_streaming = true;
+                chat.apply_interim_snapshot(&content, thinking.as_deref());
             }
             HermesStreamEvent::ToolStart { tool_call, .. } => {
                 let chat = self.chats.entry(target_sid).or_default();
@@ -2015,49 +2076,22 @@ impl AppState {
                         || m.clarify.as_ref().is_some_and(|c| c.answered.is_none())
                 });
             }
-            HermesStreamEvent::MessageComplete { content, .. } => {
-                let chat = self.chats.entry(target_sid.clone()).or_default();
+            HermesStreamEvent::MessageComplete { content, thinking, .. } => {
+                let chat = self.chats.entry(target_sid).or_default();
                 chat.is_streaming = false;
-                chat.has_streamed_text = false;
                 chat.active_tool_name = None;
                 chat.live_status_text.clear();
                 chat.last_settlement = Some((TurnSettlementOutcome::Success, Instant::now()));
-                let mut found_streaming = false;
-                for m in chat.messages.iter_mut().rev() {
-                    if m.streaming {
-                        if let Some(ref c) = content {
-                            if m.content.is_empty() || c.len() >= m.content.len() {
-                                m.content = c.clone();
-                            }
-                        }
-                        m.streaming = false;
-                        if m.model.is_none() {
-                            m.model = Some(self.active_model.clone());
-                        }
-                        found_streaming = true;
-                        break;
-                    }
+                if let Some(index) = chat.settle_stream_text(content.as_deref(), thinking.as_deref()) {
+                    chat.messages[index].model.get_or_insert_with(|| self.active_model.clone());
                 }
-                if !found_streaming {
-                    if let Some(c) = content.filter(|s| !s.is_empty()) {
-                        let mut m = HermesMessage::new_assistant(format!(
-                            "asst-{}",
-                            uuid::Uuid::new_v4().simple()
-                        ));
-                        m.content = c;
-                        m.streaming = false;
-                        m.model = Some(self.active_model.clone());
-                        chat.messages.push(m);
-                    }
-                }
+                chat.has_streamed_text = false;
             }
             HermesStreamEvent::Error { message, .. } => {
                 let chat = self.chats.entry(target_sid).or_default();
                 chat.is_streaming = false;
                 chat.last_settlement = Some((TurnSettlementOutcome::Error, Instant::now()));
-                for m in &mut chat.messages {
-                    m.streaming = false;
-                }
+                chat.settle_stream_text(None, None);
                 let mut m =
                     HermesMessage::new_assistant(format!("err-{}", uuid::Uuid::new_v4().simple()));
                 m.content = message.clone();
@@ -2773,5 +2807,50 @@ impl AppState {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod stream_text_tests {
+    use super::SessionChatState;
+
+    #[test]
+    fn split_delimiters_and_structured_deltas_do_not_leak_into_the_answer() {
+        let mut chat = SessionChatState::default();
+        chat.append_stream_text("<TH", Some("step"));
+        chat.append_stream_text("INK>step one</th", Some(" one"));
+        assert!(!chat.has_streamed_text);
+        assert_eq!(chat.messages[0].thinking.as_deref(), Some("step one"));
+        chat.append_stream_text("ink>\n\nこんにちは", None);
+        assert!(chat.has_streamed_text);
+        assert_eq!(chat.messages[0].content, "こんにちは");
+        chat.settle_stream_text(None, None);
+        assert_eq!(chat.messages[0].content, "こんにちは");
+        assert!(!chat.messages[0].streaming);
+    }
+
+    #[test]
+    fn final_snapshot_can_correct_visible_text_without_losing_live_thinking() {
+        let mut chat = SessionChatState::default();
+        chat.append_stream_text("<think>one</think>longer draft", None);
+        chat.settle_stream_text(Some("<reasoning>two</reasoning>Final"), Some("one"));
+        assert_eq!(chat.messages[0].content, "Final");
+        assert_eq!(chat.messages[0].thinking.as_deref(), Some("one\n\ntwo"));
+        chat.settle_stream_text(Some("Final"), Some("two"));
+        assert_eq!(chat.messages.len(), 1);
+    }
+
+    #[test]
+    fn interim_snapshot_can_end_mid_tag_and_final_snapshot_can_finish_it() {
+        let mut chat = SessionChatState::default();
+        chat.apply_interim_snapshot("Part one<", None);
+        assert_eq!(chat.messages[0].content, "Part one");
+        assert!(chat.messages[0].streaming);
+        chat.append_stream_text("think>private dr", None);
+        assert_eq!(chat.messages[0].content, "Part one");
+        chat.settle_stream_text(Some("Part one<think>private draft</think> and two"), None);
+        assert_eq!(chat.messages[0].content, "Part one and two");
+        assert_eq!(chat.messages[0].thinking.as_deref(), Some("private draft"));
+        assert_eq!(chat.messages.len(), 1);
     }
 }

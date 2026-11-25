@@ -6,6 +6,7 @@ use crate::theme::components::{
     BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::theme::tokens::SandTheme;
+use crate::ui::motion::{gpu_spinner, ModalMotion};
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -15,6 +16,8 @@ use std::collections::BTreeMap;
 
 pub struct ModelPickerModal {
     app: Entity<AppState>,
+    motion: ModalMotion,
+    need_focus: bool,
     search_input: Entity<InputState>,
     custom_input: Entity<InputState>,
     provider_filter: String,
@@ -34,8 +37,14 @@ impl ModelPickerModal {
             InputState::new(window, cx)
                 .placeholder("Custom model ID (e.g. openrouter/anthropic/claude-opus-4.6)")
         });
-        cx.observe(&app, |_, app_e, cx| {
-            if app_e.read(cx).model_picker_open {
+        cx.observe(&app, |this, app_e, cx| {
+            let open = app_e.read(cx).model_picker_open;
+            let was_open = this.motion.is_open();
+            this.motion.set_open(open);
+            if open {
+                if !was_open {
+                    this.need_focus = true;
+                }
                 cx.notify();
             }
         })
@@ -68,6 +77,8 @@ impl ModelPickerModal {
 
         Self {
             app,
+            motion: ModalMotion::default(),
+            need_focus: true,
             search_input,
             custom_input,
             provider_filter: "all".into(),
@@ -80,11 +91,21 @@ impl ModelPickerModal {
 }
 
 impl Render for ModelPickerModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let s = self.app.read(cx);
-        if !s.model_picker_open {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_open = self.app.read(cx).model_picker_open;
+        let was_open = self.motion.is_open();
+        self.motion.set_open(is_open);
+        if !is_open {
             return div().into_any_element();
         }
+        if !was_open || self.need_focus {
+            self.need_focus = false;
+            let fh = self.search_input.read(cx).focus_handle(cx);
+            window.on_next_frame(move |window, cx| {
+                window.focus(&fh, cx);
+            });
+        }
+        let s = self.app.read(cx);
         let theme = s.sand_theme();
         let models = s.models.clone();
         let active_model = s.active_model.clone();
@@ -145,7 +166,7 @@ impl Render for ModelPickerModal {
                 .id("model-picker-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(theme.bg_scrim)
+                .child(self.motion.backdrop("model-picker-scrim-enter", theme.bg_scrim))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -158,7 +179,7 @@ impl Render for ModelPickerModal {
                         cx.notify();
                     });
                 }))
-                .child(
+                .child(self.motion.card("model-picker-card-enter",
                     div()
                         .id("model-picker-modal")
                         .w(px(640.0))
@@ -224,7 +245,8 @@ impl Render for ModelPickerModal {
                                                 true,
                                                 refreshing || restarting,
                                             )
-                                            .child(cursor_icon("refresh", 12.0, theme.text_primary))
+                                            .when(refreshing, |d| d.child(gpu_spinner(12.0, theme.text_primary)))
+                                            .when(!refreshing, |d| d.child(cursor_icon("refresh", 12.0, theme.text_primary)))
                                             .child(if refreshing { "Refreshing…" } else { "Refresh" })
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.app.update(cx, |s, cx| s.refresh_models(cx));
@@ -238,7 +260,8 @@ impl Render for ModelPickerModal {
                                                 true,
                                                 restarting,
                                             )
-                                            .child(cursor_icon("refresh", 12.0, theme.text_primary))
+                                            .when(restarting, |d| d.child(gpu_spinner(12.0, theme.text_primary)))
+                                            .when(!restarting, |d| d.child(cursor_icon("refresh", 12.0, theme.text_primary)))
                                             .child(if restarting { "Restarting…" } else { "Restart" })
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.app.update(cx, |s, cx| s.restart_backend(cx));
@@ -496,7 +519,7 @@ impl Render for ModelPickerModal {
                                         ),
                                 ),
                         ),
-                ),
+                )),
         )
         .into_any_element()
     }

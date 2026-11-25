@@ -213,6 +213,7 @@ pub fn smooth_scroll_layer(scroller: &SmoothScroller) -> SmoothScrollLayer {
     SmoothScrollLayer {
         scroller: scroller.clone(),
         horizontal: false,
+        handles_event: None,
     }
 }
 
@@ -220,12 +221,21 @@ pub fn smooth_scroll_layer_xy(scroller: &SmoothScroller) -> SmoothScrollLayer {
     SmoothScrollLayer {
         scroller: scroller.clone(),
         horizontal: true,
+        handles_event: None,
     }
 }
 
 pub struct SmoothScrollLayer {
     scroller: SmoothScroller,
     horizontal: bool,
+    handles_event: Option<Rc<dyn Fn(&ScrollEvent, &Window) -> bool>>,
+}
+
+impl SmoothScrollLayer {
+    pub fn filter_events(mut self, filter: impl Fn(&ScrollEvent, &Window) -> bool + 'static) -> Self {
+        self.handles_event = Some(Rc::new(filter));
+        self
+    }
 }
 
 impl Element for SmoothScrollLayer {
@@ -279,9 +289,14 @@ impl Element for SmoothScrollLayer {
     ) {
         let scroller = self.scroller.clone();
         let horizontal = self.horizontal;
+        let handles_event = self.handles_event.clone();
         let hitbox = hitbox.clone();
         window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
+                return;
+            }
+            if handles_event.as_ref().is_some_and(|filter| !filter(event, window)) {
+                scroller.cancel();
                 return;
             }
             match event.delta {

@@ -165,7 +165,7 @@ pub fn parse_timestamp_secs(v: &Value) -> Option<f64> {
     None
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolCallStatus {
     Running,
@@ -179,7 +179,7 @@ impl Default for ToolCallStatus {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Hash, Serialize, Deserialize)]
 pub struct HermesToolCall {
     pub id: String,
     pub name: String,
@@ -191,7 +191,7 @@ pub struct HermesToolCall {
     pub preview: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalDecision {
     Allowed,
@@ -199,7 +199,7 @@ pub enum ApprovalDecision {
     Denied,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize)]
 pub struct HermesApprovalRequest {
     pub id: String,
     pub tool: Option<String>,
@@ -209,7 +209,7 @@ pub struct HermesApprovalRequest {
     pub settled: Option<ApprovalDecision>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize)]
 pub struct HermesClarifyRequest {
     pub id: String,
     pub question: String,
@@ -217,13 +217,146 @@ pub struct HermesClarifyRequest {
     pub answered: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     User,
     Assistant,
     System,
     Tool,
+}
+
+const THINK_TAGS: [(&str, &str); 4] = [
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<thought>", "</thought>"),
+];
+
+pub fn merge_thinking(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    let mut blocks = Vec::new();
+    push_thinking(&mut blocks, first.unwrap_or_default());
+    push_thinking(&mut blocks, second.unwrap_or_default());
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+}
+
+fn push_thinking<'a>(blocks: &mut Vec<&'a str>, block: &'a str) {
+    let block = block.trim();
+    // A provider may repeat an inline block within a field containing multiple paragraphs.
+    let contains_block = |text: &str, block: &str| {
+        text.match_indices(block).any(|(start, _)| {
+            let end = start + block.len();
+            (start == 0 || text[..start].ends_with("\n\n"))
+                && (end == text.len() || text[end..].starts_with("\n\n"))
+        })
+    };
+    if !block.is_empty() && !blocks.iter().any(|old| contains_block(old, block)) {
+        blocks.retain(|old| !contains_block(block, old));
+        blocks.push(block);
+    }
+}
+
+pub fn thinking_from_fields(value: &Value) -> Option<String> {
+    merge_thinking(
+        value.get("thinking").and_then(Value::as_str),
+        value.get("reasoning_content").and_then(Value::as_str),
+    )
+}
+
+/// Split reasoning markup out of an assistant response. Call on the accumulated raw text,
+/// not the visible text from an earlier call: a tag may span any number of stream deltas.
+pub fn extract_thinking_from_content(
+    raw_content: &str,
+    existing_thinking: Option<&str>,
+    is_streaming: bool,
+) -> (Option<String>, String) {
+    let (thinking, visible, _) = split_thinking_content(raw_content, existing_thinking, is_streaming);
+    (thinking, visible)
+}
+
+/// The third return value indicates that a subsequent delta can still finish a tag or block.
+pub(crate) fn split_thinking_content(
+    raw_content: &str,
+    existing_thinking: Option<&str>,
+    is_streaming: bool,
+) -> (Option<String>, String, bool) {
+    let mut blocks = Vec::new();
+    push_thinking(&mut blocks, existing_thinking.unwrap_or_default());
+    let mut visible = String::new();
+    let mut thought = String::new();
+    let mut open_tags = Vec::new();
+    let mut inline_blocks = Vec::new();
+    let mut rest = raw_content;
+    let mut removed_markup = false;
+    let mut partial_tag = false;
+
+    while let Some(at) = rest.find('<') {
+        let dest = if open_tags.is_empty() { &mut visible } else { &mut thought };
+        dest.push_str(&rest[..at]);
+        rest = &rest[at..];
+
+        let starts_tag = |tag: &str| {
+            rest.as_bytes().get(..tag.len()).is_some_and(|prefix| {
+                prefix.eq_ignore_ascii_case(tag.as_bytes())
+            })
+        };
+        if let Some((open, close)) = THINK_TAGS.iter().find(|(open, _)| starts_tag(open)) {
+            rest = &rest[open.len()..];
+            open_tags.push(*close);
+        } else if let Some((_, close)) = THINK_TAGS.iter().find(|(_, close)| starts_tag(close)) {
+            rest = &rest[close.len()..];
+            if let Some(index) = open_tags.iter().rposition(|tag| tag == close) {
+                open_tags.truncate(index);
+                if open_tags.is_empty() {
+                    inline_blocks.push(std::mem::take(&mut thought));
+                }
+            }
+        } else if (is_streaming || rest.len() > 2 || !open_tags.is_empty())
+            && THINK_TAGS.iter().any(|(open, close)| {
+                [open, close].into_iter().any(|tag| {
+                    tag.as_bytes().get(..rest.len()).is_some_and(|prefix| {
+                        prefix.eq_ignore_ascii_case(rest.as_bytes())
+                    })
+                })
+            })
+        {
+            // Hide an incomplete tag until the next delta proves what it is.
+            removed_markup = true;
+            partial_tag = true;
+            rest = "";
+            break;
+        } else {
+            dest.push('<');
+            rest = &rest[1..];
+            continue;
+        }
+        removed_markup = true;
+    }
+
+    if open_tags.is_empty() {
+        visible.push_str(rest);
+    } else {
+        // Keep even a truncated final block private if the turn is interrupted.
+        thought.push_str(rest);
+        inline_blocks.push(thought);
+    }
+    for block in &inline_blocks {
+        push_thinking(&mut blocks, block);
+    }
+
+    if removed_markup {
+        // Strip blank framing lines without changing indentation or Markdown hard breaks.
+        if let Some(first) = visible.find(|c: char| !c.is_whitespace()) {
+            let start = visible[..first].rfind('\n').map_or(0, |index| index + 1);
+            let last = visible.trim_end().len();
+            let end = visible[last..].find('\n').map_or(visible.len(), |index| last + index);
+            visible.truncate(end);
+            visible.drain(..start);
+        } else {
+            visible.clear();
+        }
+    }
+    ((!blocks.is_empty()).then(|| blocks.join("\n\n")), visible, partial_tag || !open_tags.is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,7 +651,7 @@ pub struct HermesSessionUsage {
     pub cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Hash, Serialize, Deserialize)]
 pub struct HermesTodoItem {
     pub id: Option<String>,
     pub content: String,
@@ -557,6 +690,7 @@ pub enum HermesStreamEvent {
     TextDelta {
         session_id: Option<String>,
         delta: String,
+        thinking: Option<String>,
     },
     ThinkingDelta {
         session_id: Option<String>,
@@ -565,6 +699,7 @@ pub enum HermesStreamEvent {
     MessageInterim {
         session_id: Option<String>,
         content: String,
+        thinking: Option<String>,
     },
     ToolStart {
         session_id: Option<String>,
@@ -607,9 +742,54 @@ pub enum HermesStreamEvent {
     MessageComplete {
         session_id: Option<String>,
         content: Option<String>,
+        thinking: Option<String>,
     },
     Error {
         session_id: Option<String>,
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_thinking_from_content as extract, thinking_from_fields};
+
+    #[test]
+    fn extracts_all_tag_spellings_case_insensitively_and_keeps_answer_order() {
+        assert_eq!(
+            extract("A<ThInK> 一 </THINK>B<Thinking>二</thinking><REASONING>三</reasoning><thought>四</Thought>C", None, false),
+            (Some("一\n\n二\n\n三\n\n四".into()), "ABC".into()),
+        );
+    }
+
+    #[test]
+    fn partial_tags_never_enter_visible_text() {
+        let raw = "<reasoning>検討中</ReAsOnInG>Answer";
+        for (end, _) in raw.char_indices().skip(1) {
+            let (_, visible) = extract(&raw[..end], None, true);
+            assert!("Answer".starts_with(&visible), "prefix leaked: {visible:?}");
+        }
+        assert_eq!(extract("<think>leté… </th", None, true), (Some("leté…".into()), String::new()));
+        assert_eq!(extract("A<reasoning>unfinished", None, false), (Some("unfinished".into()), "A".into()));
+        assert_eq!(extract("length <", None, false), (None, "length <".into()));
+    }
+
+    #[test]
+    fn merges_fields_and_inline_blocks_without_duplicate_paragraphs() {
+        let fields = thinking_from_fields(&serde_json::json!({
+            "thinking": null, "reasoning_content": "\n Step one\n\nStep two \n"
+        }));
+        assert_eq!(
+            extract("<think>Step two</think><think>Step three</think><think>Step three</think>\n\nAnswer", fields.as_deref(), false),
+            (Some("Step one\n\nStep two\n\nStep three".into()), "Answer".into()),
+        );
+    }
+
+    #[test]
+    fn preserves_plain_text_and_markdown_indentation() {
+        let plain = "\n    café < 42\n<b>text</b>  \n";
+        assert_eq!(extract(plain, Some(" \n "), false), (None, plain.into()));
+        assert_eq!(extract("<think>why</think>\n\n    code", None, false), (Some("why".into()), "    code".into()));
+        assert_eq!(extract("<think> \n </think>", None, false), (None, String::new()));
+    }
 }

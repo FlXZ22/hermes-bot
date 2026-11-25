@@ -1,16 +1,18 @@
 use crate::hermes::types::HermesSession;
 use crate::state::app_state::{AppState, AppViewId, AvatarEditorTarget, ConnectionStatus};
-use crate::theme::bot_face::{bot_face, BotFaceState};
+use crate::theme::bot_face::{bot_face_with_options, BotFaceOptions, BotFaceState};
 use crate::theme::components::{
     cursor_icon, format_relative_time, gb_board_pill, gb_btn, gb_circle_btn, gb_dot,
     gb_mini_icon_btn, gb_traffic_lights, BtnVariant, FONT_SANS,
 };
 use crate::theme::tokens::{resolve_bot_color, SandTheme, ThemeMode};
+use crate::ui::motion::{gpu_spinner, live_pulse_dot, ModalMotion, SpringValue};
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
+use std::time::{Duration, Instant};
 
 // Exact Grok Bot navigation dock WITHOUT Work (as requested by user)
 const NAV_ITEMS: &[(AppViewId, &str, &str)] = &[
@@ -29,6 +31,9 @@ const BOARD_COLORS: &[&str] = &[
 
 pub struct SidebarView {
     app: Entity<AppState>,
+    sidebar_width: SpringValue,
+    connection_status: Option<ConnectionStatus>,
+    connected_at: Option<Instant>,
     search_input: Entity<InputState>,
     show_archived: bool,
     hovered_session_id: Option<String>,
@@ -39,13 +44,13 @@ pub struct SidebarView {
     session_smooth: SmoothScroller,
     visible_sessions: Vec<HermesSession>,
     // Add Bot modal state
-    new_bot_open: bool,
+    new_bot_modal: ModalMotion,
     bot_name_input: Entity<InputState>,
     bot_desc_input: Entity<InputState>,
     bot_busy: bool,
     bot_error: String,
     // New Board modal state
-    new_board_open: bool,
+    new_board_modal: ModalMotion,
     board_name_input: Entity<InputState>,
     board_desc_input: Entity<InputState>,
     board_path_input: Entity<InputState>,
@@ -91,8 +96,12 @@ impl SidebarView {
         let session_scroll = UniformListScrollHandle::new();
         let session_smooth = SmoothScroller::for_uniform_list(session_scroll.clone());
 
+        let initial_width = if app.read(cx).sidebar_collapsed { 68.0 } else { 280.0 };
         Self {
             app,
+            sidebar_width: SpringValue::new(initial_width).with_precision(0.1),
+            connection_status: None,
+            connected_at: None,
             search_input,
             show_archived: false,
             hovered_session_id: None,
@@ -101,17 +110,22 @@ impl SidebarView {
             session_scroll,
             session_smooth,
             visible_sessions: Vec::new(),
-            new_bot_open: false,
+            new_bot_modal: ModalMotion::default(),
             bot_name_input,
             bot_desc_input,
             bot_busy: false,
             bot_error: String::new(),
-            new_board_open: false,
+            new_board_modal: ModalMotion::default(),
             board_name_input,
             board_desc_input,
             board_path_input,
             board_color: "violet".into(),
         }
+    }
+
+    pub(crate) fn measure_width(&mut self, window: &mut Window, cx: &App) -> f32 {
+        self.sidebar_width.set_target(if self.app.read(cx).sidebar_collapsed { 68.0 } else { 280.0 });
+        self.sidebar_width.advance(window)
     }
 
     fn create_bot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -166,7 +180,7 @@ impl SidebarView {
                 v.bot_busy = false;
                 match res {
                     Ok(_) => {
-                        v.new_bot_open = false;
+                        v.new_bot_modal.set_open(false);
                         v.app.update(cx, |s, cx| {
                             s.refresh_capabilities(false, cx);
                             s.switch_profile(name, cx);
@@ -196,7 +210,7 @@ impl SidebarView {
             .update(cx, |st, cx| st.set_value("", window, cx));
         self.board_path_input
             .update(cx, |st, cx| st.set_value("", window, cx));
-        self.new_board_open = false;
+        self.new_board_modal.set_open(false);
         cx.notify();
     }
 
@@ -210,7 +224,6 @@ impl SidebarView {
         active_streaming: bool,
         active_bot_state: BotFaceState,
         active_board_slug: &str,
-        tick: u64,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let s = self.app.read(cx);
@@ -231,17 +244,17 @@ impl SidebarView {
             .filter(|sl| *sl != "default" && active_board_slug == "all")
             .and_then(|sl| s.boards.iter().find(|b| b.slug == sl).map(|b| b.name.clone()));
 
-        let face_size = if collapsed {
-            22.0
-        } else if sess.archived {
+        let face_size = if sess.archived {
             24.0
+        } else if collapsed {
+            22.0
         } else {
             36.0
         };
-        let face_state = if is_active {
-            active_bot_state
-        } else if sess.archived {
+        let face_state = if sess.archived {
             BotFaceState::Sleeping
+        } else if is_active {
+            active_bot_state
         } else {
             BotFaceState::Idle
         };
@@ -297,7 +310,7 @@ impl SidebarView {
                         .update(cx, |s, cx| s.select_session(Some(sid.clone()), cx));
                 }
             }))
-            .child(bot_face(
+            .child(bot_face_with_options(
                 theme,
                 seed,
                 av.and_then(|a| a.shape_id.as_deref()),
@@ -308,7 +321,7 @@ impl SidebarView {
                 },
                 face_size,
                 face_state,
-                tick,
+                BotFaceOptions { slot_key: "sidebar-session", is_static: !is_active || sess.archived, ..Default::default() },
             ))
             .when(!collapsed, |d| {
                 d.child(
@@ -416,7 +429,7 @@ impl SidebarView {
                                 .gap(px(5.0))
                                 .text_size(px(12.0))
                                 .text_color(theme.accent_text)
-                                .child(cursor_icon("spinner", 11.0, theme.accent_text))
+                                .child(gpu_spinner(11.0, theme.accent_text))
                                 .child("Working...")
                                 .into_any_element()
                         } else {
@@ -443,17 +456,24 @@ impl SidebarView {
 
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::face::FaceLayer::begin_pane();
         let s = self.app.read(cx);
         let theme = s.sand_theme();
         let mode = s.theme_mode();
-        let collapsed = s.sidebar_collapsed;
+        let collapsed = self.sidebar_width.value() < 145.0;
         let active_view = s.active_view;
         let active_session_id = s.active_session_id.clone();
         let active_profile = s.active_profile.clone();
         let active_board_slug = s.active_board_slug.clone();
         let profile_switching = s.profile_switching;
         let conn_status = s.connection_status;
-        let tick = s.anim_tick;
+        if self.connection_status != Some(conn_status) {
+            self.connection_status = Some(conn_status);
+            self.connected_at = (conn_status == ConnectionStatus::Connected).then(Instant::now);
+        }
+        // Pulse when a connection becomes live, then keep a static green status dot.
+        let pulse_connection = conn_status == ConnectionStatus::Connecting
+            || self.connected_at.is_some_and(|at| at.elapsed() < Duration::from_millis(1600));
         let active_chat = s.active_chat();
         let active_bot_state = active_chat.bot_state();
         let active_streaming = active_chat.is_streaming;
@@ -528,11 +548,10 @@ impl Render for SidebarView {
             format!("Board · {bname}")
         };
 
-        let sidebar_w = if collapsed { 68.0 } else { 280.0 };
-
-        div()
-            .w(px(sidebar_w))
+        let content = div()
+            .w_full()
             .h_full()
+            .overflow_hidden()
             .bg(theme.bg_sidebar)
             .text_color(theme.sidebar_text_primary)
             .border_r_1()
@@ -678,7 +697,7 @@ impl Render for SidebarView {
                             gb_board_pill("sb-board-add", &theme, false)
                                 .child(cursor_icon("plus", 11.0, theme.sidebar_text_secondary))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.new_board_open = true;
+                                    this.new_board_modal.set_open(true);
                                     cx.notify();
                                 })),
                         ),
@@ -719,7 +738,7 @@ impl Render for SidebarView {
                                                 .child(cursor_icon("plus", 13.0, theme.sidebar_text_tertiary))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.bot_error.clear();
-                                                    this.new_bot_open = true;
+                                                    this.new_bot_modal.set_open(true);
                                                     cx.notify();
                                                 })),
                                         )
@@ -804,14 +823,18 @@ impl Render for SidebarView {
                                                 });
                                             }),
                                         )
-                                        .child(bot_face(
+                                        .child(bot_face_with_options(
                                             &theme,
                                             &prof.name,
                                             av.and_then(|a| a.shape_id.as_deref()),
                                             av.and_then(|a| a.color_id.as_deref()),
-                                            50.0,
+                                            60.0,
                                             tile_state,
-                                            tick,
+                                            BotFaceOptions {
+                                                slot_key: "sidebar-pinned",
+                                                max_fps: (!active).then_some(30.0),
+                                                ..Default::default()
+                                            },
                                         ))
                                         .child(
                                             div()
@@ -907,7 +930,6 @@ impl Render for SidebarView {
                                             active_streaming,
                                             active_bot_state,
                                             &active_board_u,
-                                            tick,
                                             cx,
                                         ));
                                     }
@@ -1004,14 +1026,7 @@ impl Render for SidebarView {
                                     cx.notify();
                                 });
                             }))
-                            .child(
-                                div()
-                                    .w(px(8.0))
-                                    .h(px(8.0))
-                                    .rounded_full()
-                                    .bg(status_dot_color)
-                                    .flex_shrink_0(),
-                            )
+                            .child(live_pulse_dot(status_dot_color, 8.0, pulse_connection))
                             .when(!collapsed, |d| {
                                 d.child(
                                     div()
@@ -1027,6 +1042,7 @@ impl Render for SidebarView {
                     .child(
                         div()
                             .flex()
+                            .when(collapsed, |d| d.flex_col())
                             .items_center()
                             .gap(px(2.0))
                             .child(
@@ -1093,13 +1109,15 @@ impl Render for SidebarView {
                                     })),
                             ),
                     ),
-            )
+            );
+
+        div().size_full().child(content)
             // Inline Add Bot Modal
-            .when(self.new_bot_open, |d| {
+            .when(self.new_bot_modal.is_open(), |d| {
                 d.child(self.render_new_bot_modal(&theme, window.viewport_size(), cx))
             })
             // Inline New Session Board Modal
-            .when(self.new_board_open, |d| {
+            .when(self.new_board_modal.is_open(), |d| {
                 d.child(self.render_new_board_modal(&theme, window.viewport_size(), cx))
             })
     }
@@ -1120,18 +1138,18 @@ impl SidebarView {
                 .left_0()
                 .w(viewport.width)
                 .h(viewport.height)
-                .bg(theme.bg_scrim)
+                .child(self.new_bot_modal.backdrop("new-bot-scrim-enter", theme.bg_scrim))
                 .flex()
                 .items_center()
                 .justify_center()
                 .p(px(20.0))
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     if !this.bot_busy {
-                        this.new_bot_open = false;
+                        this.new_bot_modal.set_open(false);
                         cx.notify();
                     }
                 }))
-                .child(
+                .child(self.new_bot_modal.card("new-bot-card-enter",
                     div()
                         .id("new-bot-modal")
                         .w(px(440.0))
@@ -1163,7 +1181,7 @@ impl SidebarView {
                                         .child(cursor_icon("close", 14.0, theme.text_secondary))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if !this.bot_busy {
-                                                this.new_bot_open = false;
+                                                 this.new_bot_modal.set_open(false);
                                                 cx.notify();
                                             }
                                         })),
@@ -1226,12 +1244,13 @@ impl SidebarView {
                                             gb_btn("cancel-bot-btn", theme, BtnVariant::Ghost, false, self.bot_busy)
                                                 .child("Cancel")
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.new_bot_open = false;
+                                                    this.new_bot_modal.set_open(false);
                                                     cx.notify();
                                                 })),
                                         )
                                         .child(
                                             gb_btn("submit-bot-btn", theme, BtnVariant::Primary, false, self.bot_busy)
+                                                .when(self.bot_busy, |d| d.child(gpu_spinner(13.0, theme.text_on_primary)))
                                                 .child(if self.bot_busy { "Creating…" } else { "Create bot" })
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.create_bot(window, cx);
@@ -1239,7 +1258,7 @@ impl SidebarView {
                                         ),
                                 ),
                         ),
-                ),
+                )),
         )
     }
 
@@ -1257,16 +1276,16 @@ impl SidebarView {
                 .left_0()
                 .w(viewport.width)
                 .h(viewport.height)
-                .bg(theme.bg_scrim)
+                .child(self.new_board_modal.backdrop("new-board-scrim-enter", theme.bg_scrim))
                 .flex()
                 .items_center()
                 .justify_center()
                 .p(px(20.0))
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.new_board_open = false;
+                    this.new_board_modal.set_open(false);
                     cx.notify();
                 }))
-                .child(
+                .child(self.new_board_modal.card("new-board-card-enter",
                     div()
                         .id("new-board-modal")
                         .w(px(460.0))
@@ -1297,7 +1316,7 @@ impl SidebarView {
                                     gb_mini_icon_btn("close-board-modal", theme, false)
                                         .child(cursor_icon("close", 14.0, theme.text_secondary))
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.new_board_open = false;
+                                            this.new_board_modal.set_open(false);
                                             cx.notify();
                                         })),
                                 ),
@@ -1376,7 +1395,7 @@ impl SidebarView {
                                             gb_btn("cancel-board-btn", theme, BtnVariant::Ghost, false, false)
                                                 .child("Cancel")
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.new_board_open = false;
+                                                    this.new_board_modal.set_open(false);
                                                     cx.notify();
                                                 })),
                                         )
@@ -1389,7 +1408,7 @@ impl SidebarView {
                                         ),
                                 ),
                         ),
-                ),
+                )),
         )
     }
 }

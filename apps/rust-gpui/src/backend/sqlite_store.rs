@@ -1,3 +1,4 @@
+use crate::hermes::types::{extract_thinking_from_content, merge_thinking};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +28,7 @@ pub struct LocalMessageRow {
     pub id: String,
     pub role: String,
     pub content: String,
+    pub thinking: Option<String>,
     pub timestamp: Option<f64>,
     pub model: Option<String>,
 }
@@ -229,21 +231,32 @@ pub fn load_local_session_messages(
         "NULL"
     };
     let sel_model = if has_col("model") { "model" } else { "NULL" };
+    let sel_thinking = if has_col("thinking") { "thinking" } else { "NULL" };
+    let sel_reasoning = if has_col("reasoning_content") { "reasoning_content" } else { "NULL" };
 
     let sql = format!(
-        "SELECT CAST(id AS TEXT), role, COALESCE(content, ''), {sel_ts}, {sel_model} \
+        "SELECT CAST(id AS TEXT), role, COALESCE(content, ''), {sel_ts}, {sel_model}, {sel_thinking}, {sel_reasoning} \
          FROM (SELECT * FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2) ORDER BY id ASC"
     );
 
     let mut out = Vec::new();
     if let Ok(mut stmt) = conn.prepare(&sql) {
         if let Ok(rows) = stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
+            let role = row.get::<_, String>(1).unwrap_or_else(|_| "assistant".into());
+            let content = row.get::<_, String>(2).unwrap_or_default();
+            let (thinking, content) = if matches!(role.as_str(), "user" | "system" | "tool") {
+                (None, content)
+            } else {
+                let thinking: Option<String> = row.get(5).ok().flatten();
+                let reasoning: Option<String> = row.get(6).ok().flatten();
+                let fields = merge_thinking(thinking.as_deref(), reasoning.as_deref());
+                extract_thinking_from_content(&content, fields.as_deref(), false)
+            };
             Ok(LocalMessageRow {
                 id: row.get::<_, String>(0)?,
-                role: row
-                    .get::<_, String>(1)
-                    .unwrap_or_else(|_| "assistant".into()),
-                content: row.get::<_, String>(2).unwrap_or_default(),
+                role,
+                content,
+                thinking,
                 timestamp: row.get::<_, Option<f64>>(3).ok().flatten(),
                 model: row.get::<_, Option<String>>(4).ok().flatten(),
             })
@@ -616,6 +629,30 @@ mod tests {
                 .unwrap(),
             9
         );
+    }
+
+    #[test]
+    fn loads_structured_and_inline_thinking_on_both_schema_versions() {
+        let fixture = Fixture::new();
+        let db = Connection::open(fixture.0.join("state.db")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT);
+             INSERT INTO messages VALUES (1, 'chat', 'user', '<think>literal prompt</think>');
+             INSERT INTO messages VALUES (2, 'chat', 'assistant', '<think>first</think><reasoning>second</reasoning>Answer');",
+        ).unwrap();
+        let rows = load_local_session_messages(&fixture.0, "chat", 10);
+        assert_eq!(rows[0].content, "<think>literal prompt</think>");
+        assert_eq!(rows[1].thinking.as_deref(), Some("first\n\nsecond"));
+        db.execute_batch(
+            "ALTER TABLE messages ADD COLUMN thinking TEXT;
+             ALTER TABLE messages ADD COLUMN reasoning_content TEXT;
+             UPDATE messages SET reasoning_content = 'first' WHERE id = 2;
+             INSERT INTO messages VALUES (3, 'chat', 'assistant', 'Next answer', 'structured', NULL);",
+        ).unwrap();
+        let rows = load_local_session_messages(&fixture.0, "chat", 10);
+        assert_eq!(rows[1].content, "Answer");
+        assert_eq!(rows[1].thinking.as_deref(), Some("first\n\nsecond"));
+        assert_eq!(rows[2].thinking.as_deref(), Some("structured"));
     }
 
     #[test]

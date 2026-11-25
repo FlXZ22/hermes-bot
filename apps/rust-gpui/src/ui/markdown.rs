@@ -1,5 +1,6 @@
 use crate::theme::components::{cursor_icon, FONT_MONO, FONT_SANS};
 use crate::theme::tokens::SandTheme;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::cell::RefCell;
@@ -14,6 +15,7 @@ struct RichRun {
     italic: bool,
     code: bool,
     strikethrough: bool,
+    link: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -40,8 +42,8 @@ enum MdBlock {
         code: String,
     },
     Table {
-        headers: Vec<String>,
-        rows: Vec<Vec<String>>,
+        headers: Vec<RichText>,
+        rows: Vec<Vec<RichText>>,
     },
     Rule,
 }
@@ -115,16 +117,16 @@ fn parse_markdown_ast(source: &str) -> Vec<MdBlock> {
     let mut task_checked: Option<bool> = None;
 
     let mut in_table = false;
-    let mut table_headers: Vec<String> = Vec::new();
-    let mut table_rows: Vec<Vec<String>> = Vec::new();
-    let mut current_row: Vec<String> = Vec::new();
-    let mut current_cell = String::new();
+    let mut table_headers = Vec::new();
+    let mut table_rows = Vec::new();
+    let mut current_row = Vec::new();
 
     let mut text_buf = String::new();
     let mut runs: Vec<RichRun> = Vec::new();
     let mut bold = false;
     let mut italic = false;
     let mut strikethrough = false;
+    let mut link = false;
 
     let flush_rich = |blocks: &mut Vec<MdBlock>,
                       buf: &mut String,
@@ -209,7 +211,7 @@ fn parse_markdown_ast(source: &str) -> Vec<MdBlock> {
                 };
                 blocks.push(MdBlock::CodeBlock {
                     lang,
-                    code: code_buf.trim_end_matches('\n').to_string(),
+                    code: code_buf.strip_suffix('\n').unwrap_or(&code_buf).to_string(),
                 });
                 code_buf.clear();
                 code_lang.clear();
@@ -298,7 +300,7 @@ fn parse_markdown_ast(source: &str) -> Vec<MdBlock> {
                     task_checked,
                 );
                 if let Some(ref mut n) = list_ordered_idx {
-                    *n += 1;
+                    *n = n.saturating_add(1);
                 }
                 in_list_item = false;
                 task_checked = None;
@@ -356,10 +358,14 @@ fn parse_markdown_ast(source: &str) -> Vec<MdBlock> {
                 table_rows.push(std::mem::take(&mut current_row));
             }
             Event::Start(Tag::TableCell) => {
-                current_cell.clear();
+                text_buf.clear();
+                runs.clear();
             }
             Event::End(TagEnd::TableCell) => {
-                current_row.push(std::mem::take(&mut current_cell));
+                current_row.push(RichText {
+                    text: std::mem::take(&mut text_buf),
+                    runs: std::mem::take(&mut runs),
+                });
             }
             Event::Start(Tag::Strong) => bold = true,
             Event::End(TagEnd::Strong) => bold = false,
@@ -367,58 +373,47 @@ fn parse_markdown_ast(source: &str) -> Vec<MdBlock> {
             Event::End(TagEnd::Emphasis) => italic = false,
             Event::Start(Tag::Strikethrough) => strikethrough = true,
             Event::End(TagEnd::Strikethrough) => strikethrough = false,
+            Event::Start(Tag::Link { .. }) => link = true,
+            Event::End(TagEnd::Link) => link = false,
             Event::Text(t) => {
                 if in_code_block {
                     code_buf.push_str(&t);
-                } else if in_table {
-                    current_cell.push_str(&t);
                 } else {
                     let start = text_buf.len();
                     text_buf.push_str(&t);
                     let end = text_buf.len();
-                    if (bold || italic || strikethrough) && start < end {
+                    if (bold || italic || strikethrough || link) && start < end {
                         runs.push(RichRun {
                             range: start..end,
                             bold,
                             italic,
                             code: false,
                             strikethrough,
+                            link,
                         });
                     }
                 }
             }
             Event::Code(c) => {
-                if in_table {
-                    current_cell.push_str(&c);
-                } else {
-                    let start = text_buf.len();
-                    text_buf.push_str(&c);
-                    let end = text_buf.len();
-                    if start < end {
-                        runs.push(RichRun {
-                            range: start..end,
-                            bold,
-                            italic: false,
-                            code: true,
-                            strikethrough,
-                        });
-                    }
+                let start = text_buf.len();
+                text_buf.push_str(&c);
+                let end = text_buf.len();
+                if start < end {
+                    runs.push(RichRun {
+                        range: start..end,
+                        bold,
+                        italic,
+                        code: true,
+                        strikethrough,
+                        link,
+                    });
                 }
             }
-            Event::SoftBreak => {
+            event @ (Event::SoftBreak | Event::HardBreak) => {
                 if in_code_block {
                     code_buf.push('\n');
-                } else if in_table {
-                    current_cell.push(' ');
-                } else {
-                    text_buf.push('\n');
-                }
-            }
-            Event::HardBreak => {
-                if in_code_block {
-                    code_buf.push('\n');
-                } else if in_table {
-                    current_cell.push(' ');
+                } else if in_table || matches!(event, Event::SoftBreak) {
+                    text_buf.push(' ');
                 } else {
                     text_buf.push('\n');
                 }
@@ -491,6 +486,14 @@ fn styled_rich_text(rich: &RichText, theme: &SandTheme) -> StyledText {
                 style.background_color = Some(theme.bg_tertiary);
                 style.color = Some(theme.agent_accent);
             }
+            if run.link {
+                style.color = Some(theme.accent_text);
+                style.underline = Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(theme.accent_text),
+                    wavy: false,
+                });
+            }
             (run.range.clone(), style)
         })
         .collect();
@@ -501,21 +504,31 @@ fn styled_rich_text(rich: &RichText, theme: &SandTheme) -> StyledText {
 /// Supporting GFM tables, headings, blockquotes, lists, task lists, rich inline runs,
 /// and fenced code blocks with copy button at O(1) cache lookup speed.
 pub fn render_markdown(id_prefix: &str, source: &str, theme: &SandTheme) -> Div {
-    let blocks = parse_markdown_cached(source);
+    render_markdown_body(id_prefix, source, theme, false)
+}
 
-    let mut container = div()
-        .w_full()
-        .min_w_0()
+pub fn render_thinking_markdown(id_prefix: &str, source: &str, theme: &SandTheme) -> Div {
+    render_markdown_body(id_prefix, source, theme, true)
+}
+
+fn markdown_block() -> Div {
+    div().w_full().min_w_0().overflow_hidden()
+}
+
+fn render_markdown_body(id_prefix: &str, source: &str, theme: &SandTheme, muted: bool) -> Div {
+    let blocks = parse_markdown_cached(source);
+    let ink = if muted { theme.text_secondary } else { theme.text_primary };
+
+    let mut container = markdown_block()
         .flex()
         .flex_col()
         .gap(px(8.0))
         .font_family(FONT_SANS)
-        .text_size(px(14.5))
-        .line_height(px(23.0))
-        .text_color(theme.text_primary);
+        .text_size(px(if muted { 12.5 } else { 14.5 }))
+        .line_height(px(if muted { 19.0 } else { 23.0 }))
+        .text_color(ink);
 
-    let mut code_idx = 0usize;
-    for block in blocks.iter() {
+    for (index, block) in blocks.iter().enumerate() {
         match block {
             MdBlock::Heading { level, content } => {
                 let (sz, lh) = match level {
@@ -525,22 +538,20 @@ pub fn render_markdown(id_prefix: &str, source: &str, theme: &SandTheme) -> Div 
                     _ => (14.5, 21.0),
                 };
                 container = container.child(
-                    div()
-                        .pt(px(4.0))
-                        .text_size(px(sz))
-                        .line_height(px(lh))
+                    markdown_block()
+                        .when(index > 0, |d| d.pt(px(4.0)))
+                        .text_size(px(if muted { sz - 2.0 } else { sz }))
+                        .line_height(px(if muted { lh - 3.0 } else { lh }))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.text_primary)
                         .child(styled_rich_text(content, theme)),
                 );
             }
             MdBlock::Paragraph(content) => {
-                container = container.child(div().w_full().child(styled_rich_text(content, theme)));
+                container = container.child(markdown_block().child(styled_rich_text(content, theme)));
             }
             MdBlock::Blockquote(content) => {
                 container = container.child(
-                    div()
-                        .w_full()
+                    markdown_block()
                         .pl(px(12.0))
                         .py(px(2.0))
                         .border_l_2()
@@ -562,14 +573,14 @@ pub fn render_markdown(id_prefix: &str, source: &str, theme: &SandTheme) -> Div 
                     "•".to_string()
                 };
                 container = container.child(
-                    div()
-                        .w_full()
+                    markdown_block()
                         .pl(px(6.0))
                         .flex()
                         .items_start()
                         .gap(px(8.0))
                         .child(
                             div()
+                                .min_w_0()
                                 .text_color(theme.text_tertiary)
                                 .flex_shrink_0()
                                 .child(bullet),
@@ -578,20 +589,21 @@ pub fn render_markdown(id_prefix: &str, source: &str, theme: &SandTheme) -> Div 
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .overflow_hidden()
                                 .child(styled_rich_text(content, theme)),
                         ),
                 );
             }
             MdBlock::CodeBlock { lang, code } => {
-                let cid = SharedString::from(format!("{id_prefix}-code-{code_idx}"));
-                code_idx += 1;
+                let cid = SharedString::from(format!("{id_prefix}-code-{index}"));
                 container = container.child(render_code_block(cid, lang, code, theme));
             }
             MdBlock::Table { headers, rows } => {
-                container = container.child(render_table(headers, rows, theme));
+                let id = SharedString::from(format!("{id_prefix}-table-scroll-{index}"));
+                container = container.child(render_table(id, headers, rows, theme));
             }
             MdBlock::Rule => {
-                container = container.child(div().w_full().h(px(1.0)).my(px(4.0)).bg(theme.border_default));
+                container = container.child(markdown_block().h(px(1.0)).my(px(4.0)).bg(theme.border_default));
             }
         }
     }
@@ -601,19 +613,17 @@ pub fn render_markdown(id_prefix: &str, source: &str, theme: &SandTheme) -> Div 
 
 pub fn render_code_block(id: SharedString, lang: &str, code: &str, theme: &SandTheme) -> Div {
     let code_for_copy = code.to_string();
-    div()
-        .w_full()
+    let scroll_id = SharedString::from(format!("{id}-scroll"));
+    markdown_block()
         .my(px(4.0))
         .rounded(px(12.0))
         .border_1()
         .border_color(theme.border_default)
         .bg(theme.bg_chrome)
-        .overflow_hidden()
         .flex()
         .flex_col()
         .child(
-            div()
-                .w_full()
+            markdown_block()
                 .px(px(10.0))
                 .py(px(5.0))
                 .border_b_1()
@@ -623,10 +633,11 @@ pub fn render_code_block(id: SharedString, lang: &str, code: &str, theme: &SandT
                 .justify_between()
                 .text_size(px(11.5))
                 .text_color(theme.text_tertiary)
-                .child(lang.to_string())
+                .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(lang.to_string()))
                 .child(
                     div()
                         .id(id)
+                        .flex_shrink_0()
                         .px(px(6.0))
                         .py(px(2.0))
                         .rounded(px(6.0))
@@ -644,67 +655,133 @@ pub fn render_code_block(id: SharedString, lang: &str, code: &str, theme: &SandT
         )
         .child(
             div()
+                .id(scroll_id)
                 .w_full()
-                .px(px(12.0))
-                .py(px(10.0))
-                .font_family(FONT_MONO)
-                .text_size(px(12.5))
-                .line_height(px(19.0))
-                .text_color(theme.text_primary)
-                .child(code.to_string()),
+                .min_w_0()
+                .overflow_x_scroll()
+                .flex()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(12.0))
+                        .py(px(10.0))
+                        .font_family(FONT_MONO)
+                        .text_size(px(12.5))
+                        .line_height(px(19.0))
+                        .whitespace_nowrap()
+                        .text_color(theme.text_primary)
+                        .child(StyledText::new(code.to_string())),
+                ),
         )
 }
 
-fn render_table(headers: &[String], rows: &[Vec<String>], theme: &SandTheme) -> Div {
-    let mut table = div()
-        .w_full()
+fn render_table(id: SharedString, headers: &[RichText], rows: &[Vec<RichText>], theme: &SandTheme) -> Div {
+    // Every row uses the same column count and minimum width. The grid, not the
+    // message bubble, grows when those columns no longer fit in the viewport.
+    const MIN_CELL_WIDTH: f32 = 112.0;
+    let columns = headers.len().max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    let render_row = |cells: &[RichText], header: bool| {
+        div()
+            .w_full()
+            .min_w_0()
+            .border_b_1()
+            .border_color(theme.border_hairline)
+            .when(header, |d| d.bg(theme.bg_card).font_weight(FontWeight::SEMIBOLD))
+            .flex()
+            .children((0..columns).map(|index| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .text_color(if header { theme.text_primary } else { theme.text_secondary })
+                    .when_some(cells.get(index), |d, c| d.child(styled_rich_text(c, theme)))
+            }))
+    };
+
+    markdown_block()
         .my(px(4.0))
         .rounded(px(9.0))
         .border_1()
         .border_color(theme.border_default)
-        .overflow_hidden()
-        .flex()
-        .flex_col()
-        .text_size(px(13.0));
-
-    if !headers.is_empty() {
-        table = table.child(
+        .text_size(px(13.0))
+        .line_height(px(19.0))
+        .child(
             div()
+                .id(id)
                 .w_full()
-                .bg(theme.bg_card)
-                .border_b_1()
-                .border_color(theme.border_default)
-                .flex()
-                .children(headers.iter().map(|h| {
+                .min_w_0()
+                .overflow_x_scroll()
+                .child(
                     div()
-                        .flex_1()
-                        .min_w(px(80.0))
-                        .px(px(10.0))
-                        .py(px(7.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(h.clone())
-                })),
-        );
+                        .w_full()
+                        .min_w(px(MIN_CELL_WIDTH * columns as f32))
+                        .flex()
+                        .flex_col()
+                        .when(!headers.is_empty(), |d| d.child(render_row(headers, true)))
+                        .children(rows.iter().map(|row| render_row(row, false))),
+                ),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_markdown_ast, parse_markdown_cached, MdBlock};
+    use std::sync::Arc;
+
+    #[test]
+    fn rich_text_links_and_highlight_ranges_are_utf8_safe() {
+        let blocks = parse_markdown_ast("# **日本語**\n\nSee [*café* and `🔧`](https://example.com)  \nnext\nline");
+        let [MdBlock::Heading { content: heading, .. }, MdBlock::Paragraph(paragraph)] = blocks.as_slice() else {
+            panic!("expected two rich blocks: {blocks:?}");
+        };
+        assert_eq!(&heading.text[heading.runs[0].range.clone()], "日本語");
+        assert_eq!(paragraph.text, "See café and 🔧\nnext line");
+        assert!(paragraph.runs.iter().any(|run| {
+            run.link && run.italic && &paragraph.text[run.range.clone()] == "café"
+        }));
+        assert!(paragraph.runs.iter().any(|run| {
+            run.link && run.code && &paragraph.text[run.range.clone()] == "🔧"
+        }));
     }
 
-    for row in rows {
-        table = table.child(
-            div()
-                .w_full()
-                .border_b_1()
-                .border_color(theme.border_hairline)
-                .flex()
-                .children(row.iter().map(|c| {
-                    div()
-                        .flex_1()
-                        .min_w(px(80.0))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .text_color(theme.text_secondary)
-                        .child(c.clone())
-                })),
-        );
+    #[test]
+    fn wide_table_preserves_rich_cells_and_missing_values() {
+        let headings = ["A", "B", "C", "D", "E", "F", "G", "H"];
+        let url = format!("https://example.com/{}", "世界".repeat(100));
+        let source = format!("{}\n{}\n<{url}> | `值`", headings.join(" | "), ["---"; 8].join(" | "));
+        let blocks = parse_markdown_ast(&source);
+        let [MdBlock::Table { headers, rows }] = blocks.as_slice() else {
+            panic!("expected a table: {blocks:?}");
+        };
+        assert_eq!(headers.len(), headings.len());
+        assert_eq!(rows[0].len(), headings.len());
+        assert_eq!(rows[0][0].text, url);
+        assert!(rows[0][0].runs[0].link);
+        assert!(rows[0][1].runs[0].code);
+        assert!(rows[0][7].text.is_empty());
     }
 
-    table
+    #[test]
+    fn unfinished_fence_keeps_long_lines_indentation_and_blank_lines() {
+        let line = format!("    {}  ", "🦀".repeat(512));
+        let source = format!("```rust\n{line}\n\n");
+        let doc = parse_markdown_cached(&source);
+        let [MdBlock::CodeBlock { lang, code }] = doc.as_slice() else {
+            panic!("expected a code block: {doc:?}");
+        };
+        assert_eq!(lang, "rust");
+        assert_eq!(code, &format!("{line}\n"));
+        assert!(Arc::ptr_eq(&doc, &parse_markdown_cached(&source)));
+    }
+
+    #[test]
+    fn blockquotes_and_task_items_keep_text_at_block_boundaries() {
+        let blocks = parse_markdown_ast("> first\n>\n> second\n\n- [x] done\n- [ ] pending");
+        let [MdBlock::Blockquote(first), MdBlock::Blockquote(second), MdBlock::ListItem { task_checked: Some(true), content: done, .. }, MdBlock::ListItem { task_checked: Some(false), content: pending, .. }] = blocks.as_slice() else {
+            panic!("expected quotes and task items: {blocks:?}");
+        };
+        assert_eq!((&first.text[..], &second.text[..], &done.text[..], &pending.text[..]), ("first", "second", "done", "pending"));
+    }
 }

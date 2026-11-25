@@ -2,6 +2,7 @@ pub mod chat;
 pub mod inspector;
 pub mod markdown;
 pub mod modals;
+pub mod motion;
 pub mod shell;
 pub mod sidebar;
 pub mod smooth_scroll;

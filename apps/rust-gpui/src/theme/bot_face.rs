@@ -1,5 +1,8 @@
 use crate::theme::tokens::SandTheme;
-use gpui::{div, prelude::*, px, svg, Hsla, IntoElement, SharedString};
+use crate::face::BotFaceElement;
+pub use crate::face::BotFaceOptions;
+use gpui::{Hsla, IntoElement};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 pub const ALL_GROK_BOT_SHAPES: &[(&str, &str)] = &[
     ("blob", "Blob"),
@@ -73,12 +76,17 @@ pub enum BotFaceState {
     Sleeping,
     Happy,
     Celebrate,
-    #[allow(dead_code)]
     Excited,
+    Spawning,
+    Dictating,
+    Receiving,
+    Uploading,
+    Bouncing,
+    Alerting,
+    PoweringDown,
 }
 
 impl BotFaceState {
-    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -102,9 +110,17 @@ impl BotFaceState {
             Self::Happy => "happy",
             Self::Celebrate => "celebrate",
             Self::Excited => "excited",
+            Self::Spawning => "spawning",
+            Self::Dictating => "dictating",
+            Self::Receiving => "receiving",
+            Self::Uploading => "uploading",
+            Self::Bouncing => "bouncing",
+            Self::Alerting => "alerting",
+            Self::PoweringDown => "powering-down",
         }
     }
 
+    #[allow(dead_code)] // Legacy lookup preserved for callers of BotFaceState.
     pub fn morph_prefix(self) -> Option<&'static str> {
         match self {
             Self::Thinking => Some("thinking"),
@@ -176,16 +192,15 @@ pub fn classify_hermes_activity(tool_name: Option<&str>, status_text: Option<&st
     }
 }
 
-/// Renders an authentic Grok Bot 1.2.3 cutout SVG face (all 26 shapes + live morph states),
-/// tinted in the exact bot color on the GPU.
-pub fn bot_face(
+#[track_caller]
+pub fn bot_face_with_options(
     theme: &SandTheme,
     seed: &str,
     shape_id: Option<&str>,
     color_id: Option<&str>,
     size_px: f32,
     state: BotFaceState,
-    anim_tick: u64,
+    options: BotFaceOptions,
 ) -> impl IntoElement {
     let shape = resolve_bot_shape(shape_id, seed);
     let ink: Hsla = if state == BotFaceState::Sleeping {
@@ -194,44 +209,15 @@ pub fn bot_face(
         theme.bot_ink(seed, color_id)
     };
 
-    // Use authentic morph SVGs for active morph states, otherwise the bot's shape SVG.
-    let asset_path: SharedString = if let Some(prefix) = state.morph_prefix() {
-        let frame = anim_tick % 4;
-        SharedString::from(format!("states/{prefix}_{frame}.svg"))
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    size_px.to_bits().hash(&mut hasher);
+    if options.slot_key.is_empty() {
+        std::panic::Location::caller().hash(&mut hasher);
     } else {
-        SharedString::from(format!("shapes/{shape}.svg"))
-    };
-
-    // Match Grok Bot's .gb-animated-face__renderer 153.33% canvas scale so the inner body
-    // occupies the exact visual diameter as in the Electron/Web renderer!
-    let render_px = size_px * 1.5333;
-
-    // Gentle vertical bob for live active / celebrate states
-    let bob_y = match state {
-        BotFaceState::Idle | BotFaceState::Sleeping => 0.0,
-        BotFaceState::Celebrate | BotFaceState::Finished | BotFaceState::Excited => {
-            ((anim_tick as f32) * 0.9).sin() * 2.5
-        }
-        _ => ((anim_tick as f32) * 0.6).sin() * 1.5,
-    };
-
-    div()
-        .w(px(size_px))
-        .h(px(size_px))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .relative()
-        .child(
-            svg()
-                .path(asset_path)
-                .w(px(render_px))
-                .h(px(render_px))
-                .flex_shrink_0()
-                .mt(px(bob_y))
-                .text_color(ink),
-        )
+        options.slot_key.hash(&mut hasher);
+    }
+    BotFaceElement::new(seed, shape, state.as_str(), size_px, ink, options, hasher.finish())
 }
 
 /// Describe a tool call identically to `apps/web/src/lib/toolActivity.ts`.

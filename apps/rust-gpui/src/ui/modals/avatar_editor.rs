@@ -1,9 +1,10 @@
 use crate::state::app_state::AppState;
 use crate::theme::bot_face::{
-    bot_face, resolve_bot_shape, BotFaceState, ALL_GROK_BOT_SHAPES,
+    bot_face_with_options, resolve_bot_shape, BotFaceOptions, BotFaceState, ALL_GROK_BOT_SHAPES,
 };
 use crate::theme::components::{cursor_icon, gb_btn, gb_mini_icon_btn, BtnVariant, FONT_SANS};
 use crate::theme::tokens::{resolve_bot_color, SandTheme, BOT_COLOR_PRESETS};
+use crate::ui::motion::ModalMotion;
 use gpui::*;
 use gpui_component::input::{Input, InputState};
 
@@ -13,13 +14,27 @@ const PREVIEW_STATES: &[(BotFaceState, &str)] = &[
     (BotFaceState::Writing, "Writing"),
     (BotFaceState::Searching, "Searching"),
     (BotFaceState::Streaming, "Streaming"),
+    (BotFaceState::Orbit, "Orbit"),
+    (BotFaceState::Progress, "Progress"),
+    (BotFaceState::Sending, "Sending"),
+    (BotFaceState::Receiving, "Receiving"),
+    (BotFaceState::Uploading, "Uploading"),
+    (BotFaceState::Spawning, "Spawning"),
+    (BotFaceState::Dictating, "Dictating"),
+    (BotFaceState::Alerting, "Alerting"),
+    (BotFaceState::Bouncing, "Bouncing"),
+    (BotFaceState::PoweringDown, "Powering down"),
+    (BotFaceState::Blocked, "Blocked"),
+    (BotFaceState::Working, "Working"),
     (BotFaceState::Happy, "Happy"),
+    (BotFaceState::Excited, "Excited"),
     (BotFaceState::Celebrate, "Celebrate"),
     (BotFaceState::Sleeping, "Sleeping"),
 ];
 
 pub struct AvatarEditorModal {
     app: Entity<AppState>,
+    motion: ModalMotion,
     synced_seed: Option<String>,
     name_input: Entity<InputState>,
     shape_id: String,
@@ -30,14 +45,19 @@ pub struct AvatarEditorModal {
 impl AvatarEditorModal {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Bot name"));
-        cx.observe(&app, |_, app_e, cx| {
-            if app_e.read(cx).avatar_editor_target.is_some() {
+        cx.observe(&app, |this, app_e, cx| {
+            let open = app_e.read(cx).avatar_editor_target.is_some();
+            this.motion.set_open(open);
+            if open {
                 cx.notify();
+            } else {
+                this.synced_seed = None;
             }
         })
         .detach();
         Self {
             app,
+            motion: ModalMotion::default(),
             synced_seed: None,
             name_input,
             shape_id: "blob".into(),
@@ -49,13 +69,14 @@ impl AvatarEditorModal {
 
 impl Render for AvatarEditorModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (target_opt, theme, tick, existing) = {
+        let (target_opt, theme, existing) = {
             let s = self.app.read(cx);
             let t = s.avatar_editor_target.clone();
             let ex = t.as_ref().and_then(|x| s.bot_avatars.get(&x.seed).cloned());
-            (t, s.sand_theme(), s.anim_tick, ex)
+            (t, s.sand_theme(), ex)
         };
 
+        self.motion.set_open(target_opt.is_some());
         let Some(target) = target_opt else {
             self.synced_seed = None;
             return div().into_any_element();
@@ -89,7 +110,7 @@ impl Render for AvatarEditorModal {
                 .id("avatar-editor-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(theme.bg_scrim)
+                .child(self.motion.backdrop("avatar-editor-scrim-enter", theme.bg_scrim))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -102,7 +123,7 @@ impl Render for AvatarEditorModal {
                         cx.notify();
                     });
                 }))
-                .child(
+                .child(self.motion.card("avatar-editor-card-enter",
                     div()
                         .id("avatar-editor-modal")
                         .w(px(480.0))
@@ -157,14 +178,14 @@ impl Render for AvatarEditorModal {
                                         .flex()
                                         .items_center()
                                         .gap(px(16.0))
-                                        .child(bot_face(
+                                        .child(bot_face_with_options(
                                             &theme,
                                             &seed,
                                             Some(&self.shape_id),
                                             Some(&self.color_id),
                                             72.0,
                                             self.preview_state,
-                                            tick,
+                                            BotFaceOptions { slot_key: "avatar-preview", follow_pointer: true, clickable_spin: true, ..Default::default() },
                                         ))
                                         .child(
                                             div()
@@ -263,14 +284,14 @@ impl Render for AvatarEditorModal {
                                                             this.shape_id = sid.to_string();
                                                             cx.notify();
                                                         }))
-                                                        .child(bot_face(
+                                                        .child(bot_face_with_options(
                                                             &theme,
                                                             &seed,
                                                             Some(sid),
                                                             Some(&self.color_id),
-                                                            32.0,
+                                                            36.0,
                                                             BotFaceState::Idle,
-                                                            0,
+                                                            BotFaceOptions { slot_key: sid, is_static: true, ..Default::default() },
                                                         ))
                                                 })),
                                         ),
@@ -359,7 +380,7 @@ impl Render for AvatarEditorModal {
                                         ),
                                 ),
                         ),
-                ),
+                )),
         )
         .into_any_element()
     }

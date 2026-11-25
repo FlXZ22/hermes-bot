@@ -1,11 +1,12 @@
 use crate::hermes::types::{HermesKanbanStatus, HermesKanbanTask};
 use crate::state::app_state::{AppState, AppViewId};
-use crate::theme::bot_face::{bot_face, BotFaceState};
+use crate::theme::bot_face::{bot_face_with_options, BotFaceOptions, BotFaceState};
 use crate::theme::components::{
     cursor_icon, format_relative_time, gb_badge, gb_board_pill, gb_btn, gb_dot, gb_mini_icon_btn,
     gb_segmented_item, gb_segmented_shell, short_model_name, BadgeTone, BtnVariant, FONT_SANS,
 };
 use crate::theme::tokens::{resolve_bot_color, SandTheme};
+use crate::ui::motion::ModalMotion;
 use crate::ui::smooth_scroll::{smooth_scroll_layer, smooth_scroll_layer_xy, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -27,7 +28,7 @@ pub struct BoardsView {
     app: Entity<AppState>,
     mode: BoardsMode,
     // Task editor modal
-    task_modal_open: bool,
+    task_modal: ModalMotion,
     editing_task_id: Option<String>,
     task_title: Entity<InputState>,
     task_body: Entity<TextareaState>,
@@ -38,7 +39,7 @@ pub struct BoardsView {
     task_model: String,
     task_provider: String,
     // New Board modal
-    board_modal_open: bool,
+    board_modal: ModalMotion,
     new_board_name: Entity<InputState>,
     new_board_desc: Entity<InputState>,
     new_board_path: Entity<InputState>,
@@ -87,7 +88,7 @@ impl BoardsView {
         Self {
             app,
             mode: BoardsMode::Kanban,
-            task_modal_open: false,
+            task_modal: ModalMotion::default(),
             editing_task_id: None,
             task_title,
             task_body,
@@ -97,7 +98,7 @@ impl BoardsView {
             task_assignee: "default".into(),
             task_model: String::new(),
             task_provider: "auto".into(),
-            board_modal_open: false,
+            board_modal: ModalMotion::default(),
             new_board_name,
             new_board_desc,
             new_board_path,
@@ -129,7 +130,7 @@ impl BoardsView {
         self.task_assignee = prof;
         self.task_model = model;
         self.task_provider = prov;
-        self.task_modal_open = true;
+        self.task_modal.set_open(true);
         cx.notify();
     }
 
@@ -151,7 +152,7 @@ impl BoardsView {
         self.task_assignee = task.assignee.clone().unwrap_or(prof);
         self.task_model = task.model.clone().unwrap_or(model);
         self.task_provider = task.provider.clone().unwrap_or(prov);
-        self.task_modal_open = true;
+        self.task_modal.set_open(true);
         cx.notify();
     }
 
@@ -213,7 +214,7 @@ impl BoardsView {
                 );
             });
         }
-        self.task_modal_open = false;
+        self.task_modal.set_open(false);
         cx.notify();
     }
 }
@@ -277,9 +278,8 @@ impl Render for BoardsView {
             });
 
         div()
-            .flex_1()
+            .size_full()
             .min_w_0()
-            .h_full()
             .bg(theme.bg_pane)
             .text_color(theme.text_primary)
             .font_family(FONT_SANS)
@@ -417,7 +417,7 @@ impl Render for BoardsView {
                                     .child(cursor_icon("plus", 11.0, theme.text_secondary))
                                     .child("New Board")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.board_modal_open = true;
+                                        this.board_modal.set_open(true);
                                         cx.notify();
                                     })),
                             ),
@@ -582,14 +582,14 @@ impl Render for BoardsView {
                                                             .flex()
                                                             .items_center()
                                                             .gap(px(5.0))
-                                                            .child(bot_face(
+                                                            .child(bot_face_with_options(
                                                                 &theme,
                                                                 seed,
                                                                 av.and_then(|a| a.shape_id.as_deref()),
                                                                 av.and_then(|a| a.color_id.as_deref()),
                                                                 20.0,
                                                                 BotFaceState::Idle,
-                                                                0,
+                                                                BotFaceOptions { slot_key: "board-card", is_static: true, ..Default::default() },
                                                             ))
                                                             .child(gb_badge(&theme, prio_tone, prio.to_string()))
                                                             .when_some(task.model.as_ref(), |d, m| {
@@ -723,14 +723,14 @@ impl Render for BoardsView {
                                             .flex()
                                             .items_center()
                                             .gap(px(10.0))
-                                            .child(bot_face(
+                                            .child(bot_face_with_options(
                                                 &theme,
                                                 seed,
                                                 av.and_then(|a| a.shape_id.as_deref()),
                                                 av.and_then(|a| a.color_id.as_deref()),
                                                 36.0,
                                                 BotFaceState::Idle,
-                                                0,
+                                                BotFaceOptions { slot_key: "board-session", is_static: true, ..Default::default() },
                                             ))
                                             .child(
                                                 div()
@@ -783,11 +783,11 @@ impl Render for BoardsView {
                     .into_any_element()
             })
             // Task Editor Modal
-            .when(self.task_modal_open, |d| {
+            .when(self.task_modal.is_open(), |d| {
                 d.child(self.render_task_modal(&theme, &profiles, cx))
             })
             // New Board Modal
-            .when(self.board_modal_open, |d| {
+            .when(self.board_modal.is_open(), |d| {
                 d.child(self.render_new_board_modal(&theme, cx))
             })
     }
@@ -808,16 +808,16 @@ impl BoardsView {
                 .id("task-modal-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(theme.bg_scrim)
+                .child(self.task_modal.backdrop("task-modal-scrim-enter", theme.bg_scrim))
                 .flex()
                 .items_center()
                 .justify_center()
                 .p(px(20.0))
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.task_modal_open = false;
+                    this.task_modal.set_open(false);
                     cx.notify();
                 }))
-                .child(
+                .child(self.task_modal.card("task-modal-card-enter",
                     div()
                         .id("task-modal")
                         .w(px(520.0))
@@ -849,7 +849,7 @@ impl BoardsView {
                                     gb_mini_icon_btn("close-task-modal", theme, false)
                                         .child(cursor_icon("close", 14.0, theme.text_secondary))
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.task_modal_open = false;
+                                            this.task_modal.set_open(false);
                                             cx.notify();
                                         })),
                                 ),
@@ -965,7 +965,7 @@ impl BoardsView {
                                                 .child("Delete")
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.app.update(cx, |s, cx| s.delete_task(eid.clone(), cx));
-                                                    this.task_modal_open = false;
+                                                    this.task_modal.set_open(false);
                                                     cx.notify();
                                                 }))
                                                 .into_any_element()
@@ -980,7 +980,7 @@ impl BoardsView {
                                                     gb_btn("tm-cancel", theme, BtnVariant::Ghost, false, false)
                                                         .child("Cancel")
                                                         .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.task_modal_open = false;
+                                                            this.task_modal.set_open(false);
                                                             cx.notify();
                                                         })),
                                                 )
@@ -994,7 +994,7 @@ impl BoardsView {
                                         ),
                                 ),
                         ),
-                ),
+                )),
         )
     }
 
@@ -1004,16 +1004,16 @@ impl BoardsView {
                 .id("bd-new-board-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(theme.bg_scrim)
+                .child(self.board_modal.backdrop("board-view-scrim-enter", theme.bg_scrim))
                 .flex()
                 .items_center()
                 .justify_center()
                 .p(px(20.0))
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.board_modal_open = false;
+                    this.board_modal.set_open(false);
                     cx.notify();
                 }))
-                .child(
+                .child(self.board_modal.card("board-view-card-enter",
                     div()
                         .id("bd-new-board-modal")
                         .w(px(460.0))
@@ -1064,7 +1064,7 @@ impl BoardsView {
                                     gb_btn("nb-cancel", theme, BtnVariant::Ghost, false, false)
                                         .child("Cancel")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.board_modal_open = false;
+                                            this.board_modal.set_open(false);
                                             cx.notify();
                                         })),
                                 )
@@ -1083,12 +1083,12 @@ impl BoardsView {
                                             this.new_board_name.update(cx, |st, cx| st.set_value("", window, cx));
                                             this.new_board_desc.update(cx, |st, cx| st.set_value("", window, cx));
                                             this.new_board_path.update(cx, |st, cx| st.set_value("", window, cx));
-                                            this.board_modal_open = false;
+                                            this.board_modal.set_open(false);
                                             cx.notify();
                                         })),
                                 ),
                         ),
-                ),
+                )),
         )
     }
 }

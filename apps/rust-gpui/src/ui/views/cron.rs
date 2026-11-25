@@ -3,6 +3,7 @@ use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_row, gb_section_card, BadgeTone, BtnVariant, FONT_MONO,
     FONT_SANS,
 };
+use crate::ui::motion::ModalMotion;
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -11,7 +12,7 @@ use gpui_component::scroll::ScrollableElement;
 
 pub struct CronView {
     app: Entity<AppState>,
-    modal_open: bool,
+    new_job_modal: ModalMotion,
     name_input: Entity<InputState>,
     schedule_input: Entity<InputState>,
     prompt_input: Entity<TextareaState>,
@@ -43,7 +44,7 @@ impl CronView {
         let smooth_scroller = SmoothScroller::for_handle(scroll_handle.clone());
         Self {
             app,
-            modal_open: false,
+            new_job_modal: ModalMotion::default(),
             name_input,
             schedule_input,
             prompt_input,
@@ -60,9 +61,8 @@ impl Render for CronView {
         let jobs = s.cron_jobs.clone();
 
         div()
-            .flex_1()
+            .size_full()
             .min_w_0()
-            .h_full()
             .bg(theme.bg_pane)
             .text_color(theme.text_primary)
             .font_family(FONT_SANS)
@@ -91,7 +91,7 @@ impl Render for CronView {
                             .child(cursor_icon("plus", 13.0, theme.text_on_primary))
                             .child("New Schedule")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.modal_open = true;
+                                this.new_job_modal.set_open(true);
                                 cx.notify();
                             })),
                     ),
@@ -131,7 +131,7 @@ impl Render for CronView {
                                         gb_btn("cron-empty-add", &theme, BtnVariant::Primary, false, false)
                                             .child("Create Cron Job")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.modal_open = true;
+                                                this.new_job_modal.set_open(true);
                                                 cx.notify();
                                             })),
                                     )
@@ -272,22 +272,22 @@ impl Render for CronView {
                     .vertical_scrollbar(&self.scroll_handle)
                     .child(smooth_scroll_layer(&self.smooth_scroller)),
             )
-            .when(self.modal_open, |d| {
+            .when(self.new_job_modal.is_open(), |d| {
                 d.child(deferred(
                     div()
                         .id("cron-modal-backdrop")
                         .absolute()
                         .inset_0()
-                        .bg(theme.bg_scrim)
+                        .child(self.new_job_modal.backdrop("cron-scrim-enter", theme.bg_scrim))
                         .flex()
                         .items_center()
                         .justify_center()
                         .p(px(20.0))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                            this.modal_open = false;
+                            this.new_job_modal.set_open(false);
                             cx.notify();
                         }))
-                        .child(
+                        .child(self.new_job_modal.card("cron-card-enter",
                             div()
                                 .id("cron-modal")
                                 .w(px(480.0))
@@ -313,7 +313,7 @@ impl Render for CronView {
                                             gb_btn("cron-cancel", &theme, BtnVariant::Ghost, false, false)
                                                 .child("Cancel")
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.modal_open = false;
+                                                    this.new_job_modal.set_open(false);
                                                     cx.notify();
                                                 })),
                                         )
@@ -331,7 +331,7 @@ impl Render for CronView {
                                                         let s = this.app.read(cx);
                                                         (s.client.clone(), s.tokio_rt.clone(), s.active_profile.clone())
                                                     };
-                                                    this.modal_open = false;
+                                                    this.new_job_modal.set_open(false);
                                                     this.name_input.update(cx, |st, cx| st.set_value("", window, cx));
                                                     this.prompt_input.update(cx, |st, cx| st.set_value("", window, cx));
                                                     if let Some(c) = c {
@@ -355,7 +355,7 @@ impl Render for CronView {
                                                 })),
                                         ),
                                 ),
-                        ),
+                        )),
                 ))
             })
     }

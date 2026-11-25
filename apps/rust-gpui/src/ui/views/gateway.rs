@@ -3,6 +3,7 @@ use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_dot, gb_row, gb_section_card, gb_section_card_head,
     BadgeTone, BtnVariant, FONT_MONO, FONT_SANS,
 };
+use crate::ui::motion::{gpu_spinner, ModalMotion};
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -12,7 +13,7 @@ use gpui_component::scroll::ScrollableElement;
 pub struct GatewayView {
     app: Entity<AppState>,
     busy_action: Option<&'static str>,
-    add_webhook_open: bool,
+    webhook_modal: ModalMotion,
     hook_name_input: Entity<InputState>,
     hook_url_input: Entity<InputState>,
     scroll_handle: ScrollHandle,
@@ -36,7 +37,7 @@ impl GatewayView {
         Self {
             app,
             busy_action: None,
-            add_webhook_open: false,
+            webhook_modal: ModalMotion::default(),
             hook_name_input,
             hook_url_input,
             scroll_handle,
@@ -120,7 +121,7 @@ impl GatewayView {
         let Some(client) = client else {
             return;
         };
-        self.add_webhook_open = false;
+        self.webhook_modal.set_open(false);
         self.hook_name_input
             .update(cx, |st, cx| st.set_value("", window, cx));
         self.hook_url_input
@@ -174,6 +175,9 @@ impl GatewayView {
 
 impl Render for GatewayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let starting = self.busy_action == Some("start");
+        let restarting = self.busy_action == Some("restart");
+        let stopping = self.busy_action == Some("stop");
         let (theme, status, platforms, webhooks, has_client) = {
             let s = self.app.read(cx);
             (
@@ -269,8 +273,9 @@ impl Render for GatewayView {
                                                     false,
                                                     !has_client || self.busy_action.is_some() || gw_running,
                                                 )
-                                                .child(cursor_icon("play", 13.0, theme.text_on_primary))
-                                                .child(if self.busy_action == Some("start") {
+                                                .when(starting, |d| d.child(gpu_spinner(13.0, theme.text_on_primary)))
+                                                .when(!starting, |d| d.child(cursor_icon("play", 13.0, theme.text_on_primary)))
+                                                .child(if starting {
                                                     "Starting…"
                                                 } else {
                                                     "Start"
@@ -287,8 +292,9 @@ impl Render for GatewayView {
                                                     false,
                                                     !has_client || self.busy_action.is_some(),
                                                 )
-                                                .child(cursor_icon("refresh", 13.0, theme.text_primary))
-                                                .child("Restart")
+                                                .when(restarting, |d| d.child(gpu_spinner(13.0, theme.text_primary)))
+                                                .when(!restarting, |d| d.child(cursor_icon("refresh", 13.0, theme.text_primary)))
+                                                .child(if restarting { "Restarting…" } else { "Restart" })
                                                 .on_click(cx.listener(|v, _, _, cx| {
                                                     v.run_gateway_action("restart", cx);
                                                 })),
@@ -301,8 +307,9 @@ impl Render for GatewayView {
                                                     false,
                                                     !has_client || self.busy_action.is_some() || !gw_running,
                                                 )
-                                                .child(cursor_icon("stop", 13.0, theme.danger_text))
-                                                .child("Stop")
+                                                .when(stopping, |d| d.child(gpu_spinner(13.0, theme.danger_text)))
+                                                .when(!stopping, |d| d.child(cursor_icon("stop", 13.0, theme.danger_text)))
+                                                .child(if stopping { "Stopping…" } else { "Stop" })
                                                 .on_click(cx.listener(|v, _, _, cx| {
                                                     v.run_gateway_action("stop", cx);
                                                 })),
@@ -467,7 +474,7 @@ impl Render for GatewayView {
                                                     .child(cursor_icon("plus", 12.5, theme.text_on_primary))
                                                     .child("Add Webhook")
                                                     .on_click(cx.listener(|v, _, _, cx| {
-                                                        v.add_webhook_open = true;
+                                                        v.webhook_modal.set_open(true);
                                                         cx.notify();
                                                     })),
                                             ),
@@ -526,21 +533,21 @@ impl Render for GatewayView {
                     .child(smooth_scroll_layer(&self.smooth_scroller)),
             )
             // Add Webhook Modal
-            .when(self.add_webhook_open, |d| {
+            .when(self.webhook_modal.is_open(), |d| {
                 d.child(
                     div()
                         .id("hook-modal-backdrop")
                         .absolute()
                         .inset_0()
-                        .bg(theme.bg_scrim)
+                        .child(self.webhook_modal.backdrop("webhook-scrim-enter", theme.bg_scrim))
                         .flex()
                         .items_center()
                         .justify_center()
                         .on_click(cx.listener(|v, _, _, cx| {
-                            v.add_webhook_open = false;
+                            v.webhook_modal.set_open(false);
                             cx.notify();
                         }))
-                        .child(
+                        .child(self.webhook_modal.card("webhook-card-enter",
                             div()
                                 .id("hook-modal-card")
                                 .w(px(460.0))
@@ -598,7 +605,7 @@ impl Render for GatewayView {
                                             gb_btn("hook-cancel", &theme, BtnVariant::Ghost, false, false)
                                                 .child("Cancel")
                                                 .on_click(cx.listener(|v, _, _, cx| {
-                                                    v.add_webhook_open = false;
+                                                    v.webhook_modal.set_open(false);
                                                     cx.notify();
                                                 })),
                                         )
@@ -610,7 +617,7 @@ impl Render for GatewayView {
                                                 })),
                                         ),
                                 ),
-                        ),
+                        )),
                 )
             })
     }

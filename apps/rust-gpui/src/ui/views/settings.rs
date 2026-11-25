@@ -1,13 +1,14 @@
 use crate::backend::ssh::SshTarget;
 use crate::backend::updater::UpdateSettingsPatch;
 use crate::state::app_state::{AppState, AppViewId, AvatarEditorTarget};
-use crate::theme::bot_face::{bot_face, BotFaceState};
+use crate::theme::bot_face::{bot_face_with_options, BotFaceOptions, BotFaceState};
 use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_dot, gb_row, gb_section_card, gb_section_card_head,
     gb_segmented_item, gb_segmented_shell, gb_toggle_switch, BadgeTone, BtnVariant, FONT_MONO,
     FONT_SANS,
 };
 use crate::theme::tokens::ThemeMode;
+use crate::ui::motion::gpu_spinner;
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -784,7 +785,8 @@ impl Render for SettingsView {
                                                         )
                                                         .child(
                                                             gb_btn("restart-be-set", &theme, BtnVariant::Secondary, true, restarting)
-                                                                .child(cursor_icon("refresh", 12.5, theme.text_primary))
+                                                                .when(restarting, |d| d.child(gpu_spinner(12.5, theme.text_primary)))
+                                                                .when(!restarting, |d| d.child(cursor_icon("refresh", 12.5, theme.text_primary)))
                                                                 .child(if restarting { "Restarting…" } else { "Restart Backend" })
                                                                 .on_click(cx.listener(|v, _, _, cx| {
                                                                     v.app.update(cx, |s, cx| s.restart_backend(cx));
@@ -1089,14 +1091,14 @@ impl Render for SettingsView {
                                                                 .flex()
                                                                 .items_center()
                                                                 .gap(px(12.0))
-                                                                .child(bot_face(
+                                                                .child(bot_face_with_options(
                                                                     &theme,
                                                                     &seed,
                                                                     ov.and_then(|o| o.shape_id.as_deref()),
                                                                     ov.and_then(|o| o.color_id.as_deref()),
                                                                     32.0,
                                                                     BotFaceState::Idle,
-                                                                    0,
+                                                                    BotFaceOptions { slot_key: "settings-profile", is_static: true, ..Default::default() },
                                                                 ))
                                                                 .child(
                                                                     div()
@@ -1304,6 +1306,7 @@ impl Render for SettingsView {
                                                                         true,
                                                                         self.updater_busy || updating,
                                                                     )
+                                                                    .when(self.updater_busy, |d| d.child(gpu_spinner(12.0, theme.text_primary)))
                                                                     .child(if self.updater_busy {
                                                                         "Checking…"
                                                                     } else {
@@ -1321,7 +1324,8 @@ impl Render for SettingsView {
                                                                         true,
                                                                         updating || !upd_status.repo_valid,
                                                                     )
-                                                                    .child("Update Now")
+                                                                    .when(updating, |d| d.child(gpu_spinner(12.0, theme.text_on_primary)))
+                                                                    .child(if updating { "Updating…" } else { "Update Now" })
                                                                     .on_click(cx.listener(|v, _, _, cx| {
                                                                         v.apply_update("git", cx);
                                                                     })),

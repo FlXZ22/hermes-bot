@@ -1,5 +1,6 @@
 use crate::theme::icon_map::cursor_icon_char;
 use crate::theme::tokens::SandTheme;
+use crate::ui::motion::toggle_thumb;
 use gpui::{div, prelude::*, px, rgb, Div, FontWeight, Hsla, IntoElement, SharedString, Stateful};
 
 pub const FONT_SANS: &str = "X VF";
@@ -115,14 +116,21 @@ pub fn gb_btn(
     if disabled {
         d = d.opacity(0.45);
     } else {
-        d = d.cursor_pointer().hover(move |s| {
-            let s = s.bg(hover_bg);
-            if variant == BtnVariant::Ghost {
-                s.text_color(fg)
-            } else {
-                s
-            }
-        });
+        let pressed_bg = match variant {
+            BtnVariant::Primary | BtnVariant::Danger => hover_bg,
+            BtnVariant::Secondary | BtnVariant::Ghost => theme.bg_active,
+        };
+        d = d
+            .cursor_pointer()
+            .hover(move |s| {
+                let s = s.bg(hover_bg);
+                if variant == BtnVariant::Ghost {
+                    s.text_color(fg)
+                } else {
+                    s
+                }
+            })
+            .active(move |s| s.bg(pressed_bg).text_color(fg).opacity(0.86));
     }
     d
 }
@@ -168,6 +176,7 @@ pub fn gb_chip_btn(
     let hover_bg = theme.bg_elevated_hover;
     let hover_fg = theme.text_primary;
     let hover_border = theme.border_primary;
+    let pressed_bg = if active { bg } else { theme.bg_active };
     div()
         .id(id)
         .flex()
@@ -189,6 +198,12 @@ pub fn gb_chip_btn(
                 .text_color(hover_fg)
                 .border_color(hover_border)
         })
+        .active(move |s| {
+            s.bg(pressed_bg)
+                .border_color(hover_border)
+                .text_color(fg)
+                .opacity(0.85)
+        })
 }
 
 pub fn gb_circle_btn(
@@ -201,7 +216,12 @@ pub fn gb_circle_btn(
     } else {
         (theme.bg_elevated, theme.sidebar_text_primary)
     };
-    let hover_bg = theme.bg_elevated_hover;
+    let hover_bg = if active {
+        theme.bg_primary_hover
+    } else {
+        theme.bg_elevated_hover
+    };
+    let pressed_bg = if active { hover_bg } else { theme.bg_active };
     div()
         .id(id)
         .w(px(34.0))
@@ -217,6 +237,7 @@ pub fn gb_circle_btn(
         .flex_shrink_0()
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg))
+        .active(move |s| s.bg(pressed_bg).opacity(0.85))
 }
 
 pub fn gb_window_action(
@@ -235,6 +256,7 @@ pub fn gb_window_action(
     };
     let hover_bg = theme.bg_hover;
     let hover_fg = theme.text_primary;
+    let pressed_bg = if active { bg } else { theme.bg_active };
     div()
         .id(id)
         .w(px(30.0))
@@ -250,6 +272,7 @@ pub fn gb_window_action(
         .flex_shrink_0()
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
+        .active(move |s| s.bg(pressed_bg).text_color(fg).opacity(0.85))
 }
 
 pub fn gb_mini_icon_btn(
@@ -279,6 +302,7 @@ pub fn gb_mini_icon_btn(
         .flex_shrink_0()
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
+        .active(move |s| s.bg(hover_bg).text_color(hover_fg).opacity(0.78))
 }
 
 pub fn gb_toggle_switch(
@@ -291,6 +315,11 @@ pub fn gb_toggle_switch(
     } else {
         theme.bg_active
     };
+    let hover_bg = if checked {
+        bg.opacity(0.88)
+    } else {
+        theme.bg_secondary_hover
+    };
     div()
         .id(id)
         .w(px(34.0))
@@ -302,15 +331,9 @@ pub fn gb_toggle_switch(
         .items_center()
         .flex_shrink_0()
         .cursor_pointer()
-        .when(checked, |d| d.justify_end())
-        .when(!checked, |d| d.justify_start())
-        .child(
-            div()
-                .w(px(16.0))
-                .h(px(16.0))
-                .rounded_full()
-                .bg(rgb(0xffffff)),
-        )
+        .hover(move |s| s.bg(hover_bg))
+        .active(move |s| s.bg(bg).opacity(0.8))
+        .child(toggle_thumb(checked))
 }
 
 pub fn gb_section_card(theme: &SandTheme) -> Div {
@@ -399,6 +422,11 @@ pub fn gb_board_pill(
 ) -> Stateful<Div> {
     let hover_bg = theme.sidebar_hover;
     let hover_fg = theme.sidebar_text_primary;
+    let pressed_bg = if active {
+        theme.bg_primary_hover
+    } else {
+        theme.sidebar_selected
+    };
     let mut d = div()
         .id(id)
         .h(px(26.0))
@@ -410,7 +438,8 @@ pub fn gb_board_pill(
         .items_center()
         .gap(px(6.0))
         .flex_shrink_0()
-        .cursor_pointer();
+        .cursor_pointer()
+        .active(move |s| s.bg(pressed_bg).opacity(0.86));
     if active {
         d = d.bg(theme.bg_primary).text_color(theme.text_on_primary);
     } else {

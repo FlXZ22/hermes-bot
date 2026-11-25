@@ -3,20 +3,27 @@ use crate::hermes::types::{
     HermesSessionUsage, HermesToolCall, MessageRole, ToolCallStatus,
 };
 use crate::state::app_state::{AppState, AttachmentFile, AvatarEditorTarget};
-use crate::theme::bot_face::{bot_face, describe_tool, BotFaceState};
+use crate::theme::bot_face::{bot_face_with_options, describe_tool, BotFaceOptions, BotFaceState};
 use crate::theme::components::{
     cursor_icon, format_tokens, gb_badge, gb_btn, gb_chip_btn, gb_dot, gb_mini_icon_btn,
     gb_section_card, gb_section_card_head, gb_window_action, short_model_name, BadgeTone,
     BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::theme::tokens::{resolve_bot_color, SandTheme};
-use crate::ui::markdown::{render_code_block, render_markdown};
+use crate::ui::markdown::{render_code_block, render_markdown, render_thinking_markdown};
+use crate::ui::motion::{
+    gpu_spinner, live_pulse_dot, pill_enter, popover_enter, typing_dots, view_enter, EntranceKey,
+    SpringValue,
+};
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Open model & provider picker"),
@@ -57,6 +64,69 @@ const STARTER_PROMPTS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+type ThoughtScrollHitboxes = Rc<RefCell<Vec<Hitbox>>>;
+
+fn row_fingerprint(value: impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn message_fingerprint(msg: &HermesMessage) -> u64 {
+    row_fingerprint((
+        &msg.id, &msg.role, &msg.content, &msg.thinking, &msg.tool_name, &msg.model,
+        &msg.tool_calls, &msg.approval, &msg.clarify, msg.streaming,
+    ))
+}
+
+fn message_has_body(msg: &HermesMessage) -> bool {
+    matches!(msg.role, MessageRole::User | MessageRole::Tool)
+        || thinking_is_live(msg)
+        || !msg.content.trim().is_empty()
+        || msg.thinking.as_ref().is_some_and(|s| !s.is_empty())
+        || !msg.tool_calls.is_empty()
+        || msg.approval.is_some()
+        || msg.clarify.is_some()
+}
+
+fn thinking_is_live(msg: &HermesMessage) -> bool {
+    msg.streaming
+        && msg.content.trim().is_empty()
+        && !msg.tool_calls.iter().any(|t| t.status == ToolCallStatus::Running)
+}
+
+#[derive(Default)]
+struct ThinkingDisclosure {
+    expanded: HashSet<String>,
+    collapsed_live: HashSet<String>,
+}
+
+impl ThinkingDisclosure {
+    fn is_expanded(&self, msg: &HermesMessage) -> bool {
+        if thinking_is_live(msg) {
+            !self.collapsed_live.contains(&msg.id)
+        } else {
+            self.expanded.contains(&msg.id)
+        }
+    }
+
+    fn toggle(&mut self, id: &str, live: bool) {
+        // Live auto-expansion never writes to the set of explicitly opened disclosures.
+        let toggles = if live { &mut self.collapsed_live } else { &mut self.expanded };
+        if !toggles.remove(id) {
+            toggles.insert(id.to_owned());
+        }
+    }
+}
+
+fn chat_row() -> Div {
+    div().w_full().min_w_0().overflow_hidden()
+}
+
+fn clipped_label(text: impl Into<SharedString>) -> Div {
+    div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(text.into())
+}
+
 pub struct ChatView {
     app: Entity<AppState>,
     composer: Entity<TextareaState>,
@@ -64,22 +134,33 @@ pub struct ChatView {
     editing_title: bool,
     attach_menu_open: bool,
     board_menu_open: bool,
-    expanded_thinking: HashSet<String>,
+    thinking_disclosure: ThinkingDisclosure,
     expanded_tools: HashSet<String>,
     collapsed_groups: HashSet<String>,
     // Virtualized Zed ListState + 120Hz smooth scroller for chat transcript
     list_state: ListState,
     smooth_scroller: SmoothScroller,
     synced_session_id: Option<String>,
-    synced_item_count: usize,
-    synced_last_fp: (usize, usize, bool),
+    synced_prefix_count: usize,
+    synced_prefix_kind: (bool, bool),
+    synced_first_msg_id: Option<String>,
+    synced_msg_count: usize,
+    synced_has_pending: bool,
+    synced_last_fp: Option<u64>,
+    synced_messages: Vec<(String, u64)>,
+    synced_aux_fp: (u64, u64),
+    measured_width: Rc<Cell<Option<Pixels>>>,
+    empty_hero_entrance: EntranceKey<bool>,
+    jump_pill_entrance: EntranceKey<bool>,
+    usage_fill: SpringValue,
+    usage_session: Option<String>,
 }
 
 impl ChatView {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             let mut st =
-                TextareaState::new(window, cx).placeholder("Message Hermes... (type / for commands)");
+                TextareaState::new(window, cx).placeholder("Message Hermes… (/ for commands)");
             st.set_auto_grow(1, 5, cx);
             st
         });
@@ -142,14 +223,25 @@ impl ChatView {
             editing_title: false,
             attach_menu_open: false,
             board_menu_open: false,
-            expanded_thinking: HashSet::new(),
+            thinking_disclosure: ThinkingDisclosure::default(),
             expanded_tools: HashSet::new(),
             collapsed_groups: HashSet::new(),
             list_state,
             smooth_scroller,
             synced_session_id: None,
-            synced_item_count: 0,
-            synced_last_fp: (0, 0, false),
+            synced_prefix_count: 0,
+            synced_prefix_kind: (false, false),
+            synced_first_msg_id: None,
+            synced_msg_count: 0,
+            synced_has_pending: false,
+            synced_last_fp: None,
+            synced_messages: Vec::new(),
+            synced_aux_fp: (0, 0),
+            measured_width: Rc::new(Cell::new(None)),
+            empty_hero_entrance: EntranceKey::new(),
+            jump_pill_entrance: EntranceKey::new(),
+            usage_fill: SpringValue::new(0.0).with_precision(0.05),
+            usage_session: None,
         }
     }
 
@@ -227,7 +319,8 @@ impl ChatView {
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::face::FaceLayer::begin_pane();
         let s = self.app.read(cx);
         let theme = s.sand_theme();
         let active_session = s.active_session().cloned();
@@ -250,7 +343,6 @@ impl Render for ChatView {
         let fast = s.fast_mode;
         let yolo = s.yolo_mode;
         let right_open = s.right_pane_open;
-        let tick = s.anim_tick;
         let boards = s.boards.clone();
         let attachments = s.attachments.clone();
 
@@ -276,6 +368,18 @@ impl Render for ChatView {
         let has_messages = !chat.messages.is_empty();
         let loading_history = chat.loading_history;
         let is_streaming = chat.is_streaming;
+        let empty_id = self.empty_hero_entrance.id("chat-empty-hero", !has_messages && !loading_history);
+        if self.usage_session != active_session_id {
+            self.usage_session.clone_from(&active_session_id);
+            self.usage_fill.snap(0.0);
+        }
+        let usage_bar = render_usage_bar(
+            &theme,
+            chat.session_usage.as_ref(),
+            active_session.as_ref().and_then(|x| x.context_limit),
+            &mut self.usage_fill,
+            window,
+        );
 
         let draft = self.composer.read(cx).value().to_string();
         let matching_slash: Vec<(&str, &str)> = if draft.starts_with('/') && !draft.contains(' ') {
@@ -297,14 +401,12 @@ impl Render for ChatView {
 
         let bot_seed_hdr = bot_seed.clone();
         let bot_name_hdr = bot_name.clone();
-        let bot_seed_hero = bot_seed.clone();
-        let bot_name_hero = bot_name.clone();
         let hdr_title_edit = header_title.clone();
 
         div()
-            .flex_1()
+            .size_full()
             .min_w_0()
-            .h_full()
+            .min_h_0()
             .bg(theme.bg_pane)
             .text_color(theme.text_primary)
             .font_family(FONT_SANS)
@@ -322,93 +424,121 @@ impl Render for ChatView {
                     .items_center()
                     .justify_between()
                     .flex_shrink_0()
-                    .child(if self.editing_title && active_session_id.is_some() {
+                    .min_w_0()
+                    .gap(px(8.0))
+                    .child(
                         div()
-                            .h(px(32.0))
-                            .px(px(10.0))
-                            .rounded_full()
-                            .bg(theme.bg_chrome)
-                            .border_1()
-                            .border_color(theme.border_default)
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
                             .flex()
                             .items_center()
-                            .gap(px(7.0))
-                            .child(bot_face(
-                                &theme,
-                                &bot_seed,
-                                bot_av.as_ref().and_then(|a| a.shape_id.as_deref()),
-                                bot_av.as_ref().and_then(|a| a.color_id.as_deref()),
-                                24.0,
-                                bot_state,
-                                tick,
-                            ))
-                            .child(div().w(px(220.0)).child(Input::new(&self.title_input).h(px(24.0))))
-                            .into_any_element()
-                    } else {
-                        let has_sid = active_session_id.is_some();
-                        div()
-                            .id("chat-title-pill")
-                            .h(px(32.0))
-                            .pl(px(8.0))
-                            .pr(px(12.0))
-                            .rounded_full()
-                            .bg(theme.bg_chrome)
-                            .border_1()
-                            .border_color(theme.border_default)
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .max_w(px(440.0))
-                            .cursor_pointer()
-                            .hover(|st| st.bg(theme.bg_elevated))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if has_sid {
-                                    let t = hdr_title_edit.clone();
-                                    this.title_input
-                                        .update(cx, |st, cx| st.set_value(t, window, cx));
-                                    this.editing_title = true;
-                                    cx.notify();
-                                } else {
-                                    this.app.update(cx, |s, cx| {
-                                        s.avatar_editor_target = Some(AvatarEditorTarget {
-                                            seed: bot_seed_hdr.clone(),
-                                            title: bot_name_hdr.clone(),
-                                        });
-                                        cx.notify();
-                                    });
-                                }
-                            }))
-                            .child(bot_face(
-                                &theme,
-                                &bot_seed,
-                                bot_av.as_ref().and_then(|a| a.shape_id.as_deref()),
-                                bot_av.as_ref().and_then(|a| a.color_id.as_deref()),
-                                24.0,
-                                bot_state,
-                                tick,
-                            ))
-                            .child(
+                            .child(if self.editing_title && active_session_id.is_some() {
                                 div()
-                                    .text_size(px(13.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.text_primary)
+                                    .h(px(32.0))
+                                    .max_w_full()
+                                    .min_w_0()
                                     .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .child(header_title),
-                            )
-                            .child(
+                                    .px(px(10.0))
+                                    .rounded_full()
+                                    .bg(theme.bg_chrome)
+                                    .border_1()
+                                    .border_color(theme.border_default)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .child(bot_face_with_options(
+                                        &theme,
+                                        &bot_seed,
+                                        bot_av.as_ref().and_then(|a| a.shape_id.as_deref()),
+                                        bot_av.as_ref().and_then(|a| a.color_id.as_deref()),
+                                        24.0,
+                                        bot_state,
+                                        BotFaceOptions { slot_key: "chat-title", ..Default::default() },
+                                    ))
+                                    .child(div().w(px(220.0)).max_w_full().min_w_0().child(Input::new(&self.title_input).h(px(24.0))))
+                                    .into_any_element()
+                            } else {
+                                let has_sid = active_session_id.is_some();
+                                let seed_face = bot_seed_hdr.clone();
+                                let name_face = bot_name_hdr.clone();
                                 div()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_tertiary)
-                                    .whitespace_nowrap()
-                                    .child(format!("· {}", short_model_name(&active_model))),
-                            )
-                            .into_any_element()
-                    })
+                                    .id("chat-title-pill")
+                                    .h(px(32.0))
+                                    .pl(px(8.0))
+                                    .pr(px(12.0))
+                                    .rounded_full()
+                                    .bg(theme.bg_chrome)
+                                    .border_1()
+                                    .border_color(theme.border_default)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .max_w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .cursor_pointer()
+                                    .hover(|st| st.bg(theme.bg_elevated))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if has_sid {
+                                            let t = hdr_title_edit.clone();
+                                            this.title_input
+                                                .update(cx, |st, cx| st.set_value(t, window, cx));
+                                            this.editing_title = true;
+                                            cx.notify();
+                                        } else {
+                                            this.app.update(cx, |s, cx| {
+                                                s.avatar_editor_target = Some(AvatarEditorTarget {
+                                                    seed: bot_seed_hdr.clone(),
+                                                    title: bot_name_hdr.clone(),
+                                                });
+                                                cx.notify();
+                                            });
+                                        }
+                                    }))
+                                    .child(
+                                        div()
+                                            .id("chat-title-avatar")
+                                            .flex_shrink_0()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.app.update(cx, |s, cx| {
+                                                    s.avatar_editor_target = Some(AvatarEditorTarget {
+                                                        seed: seed_face.clone(),
+                                                        title: name_face.clone(),
+                                                    });
+                                                    cx.notify();
+                                                });
+                                            }))
+                                            .child(bot_face_with_options(
+                                                &theme,
+                                                &bot_seed,
+                                                bot_av.as_ref().and_then(|a| a.shape_id.as_deref()),
+                                                bot_av.as_ref().and_then(|a| a.color_id.as_deref()),
+                                                24.0,
+                                                bot_state,
+                                                BotFaceOptions { slot_key: "chat-title", ..Default::default() },
+                                            )),
+                                    )
+                                    .child(
+                                        clipped_label(header_title)
+                                            .text_size(px(13.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.text_primary),
+                                    )
+                                    .child(
+                                        clipped_label(format!("· {}", short_model_name(&active_model)))
+                                            .max_w(px(128.0))
+                                            .text_size(px(12.0))
+                                            .text_color(theme.text_tertiary),
+                                    )
+                                    .into_any_element()
+                            }),
+                    )
                     .child(
                         div()
                             .flex()
+                            .flex_shrink_0()
                             .items_center()
                             .gap(px(6.0))
                             .when(active_session_id.is_some(), |d| {
@@ -478,12 +608,12 @@ impl Render for ChatView {
                     .justify_center()
                     .gap(px(10.0))
                     .text_color(theme.text_tertiary)
-                    .child(cursor_icon("spinner", 18.0, theme.text_tertiary))
+                    .child(gpu_spinner(18.0, theme.text_tertiary))
                     .child("Loading conversation…")
                     .into_any_element()
             } else if !has_messages {
                 // Exact Grok Bot Empty Chat Hero (matches verification-chat.jpg!)
-                div()
+                view_enter(empty_id, div()
                     .flex_1()
                     .w_full()
                     .px(px(24.0))
@@ -499,23 +629,19 @@ impl Render for ChatView {
                             .p(px(6.0))
                             .rounded(px(28.0))
                             .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.app.update(cx, |s, cx| {
-                                    s.avatar_editor_target = Some(AvatarEditorTarget {
-                                        seed: bot_seed_hero.clone(),
-                                        title: bot_name_hero.clone(),
-                                    });
-                                    cx.notify();
-                                });
-                            }))
-                            .child(bot_face(
+                            .child(bot_face_with_options(
                                 &theme,
                                 &bot_seed,
                                 bot_av.as_ref().and_then(|a| a.shape_id.as_deref()),
                                 bot_av.as_ref().and_then(|a| a.color_id.as_deref()),
                                 72.0,
                                 bot_state,
-                                tick,
+                                BotFaceOptions {
+                                    slot_key: "chat-hero",
+                                    follow_pointer: true,
+                                    clickable_spin: true,
+                                    ..Default::default()
+                                },
                             )),
                     )
                     .child(
@@ -604,18 +730,17 @@ impl Render for ChatView {
                                             )
                                     }))
                             })),
-                    )
+                    ))
                     .into_any_element()
             } else {
                 // Transcript scroller
                 self.render_transcript(
                     &theme,
-                    &chat,
+                    chat,
                     &bot_seed,
                     bot_av.as_ref().and_then(|a| a.shape_id.as_deref()),
                     bot_av.as_ref().and_then(|a| a.color_id.as_deref()),
                     bot_state,
-                    tick,
                     cx,
                 )
                 .into_any_element()
@@ -624,6 +749,7 @@ impl Render for ChatView {
             .child(
                 div()
                     .w_full()
+                    .min_w_0()
                     .px(px(20.0))
                     .pt(px(8.0))
                     .pb(px(16.0))
@@ -633,14 +759,15 @@ impl Render for ChatView {
                     .justify_center()
                     .child(
                         div()
-                            .w(px(740.0))
-                            .max_w_full()
+                            .w_full()
+                            .max_w(px(740.0))
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .relative()
                             // Slash command autocomplete popover
                             .when(!matching_slash.is_empty(), |d| {
-                                d.child(
+                                d.child(popover_enter("slash-completions-enter",
                                     div()
                                         .mb(px(8.0))
                                         .w(px(360.0))
@@ -689,16 +816,18 @@ impl Render for ChatView {
                                                         .child(desc),
                                                 )
                                         })),
-                                )
+                                ))
                             })
                             // Board assignment popover
                             .when(self.board_menu_open, |d| {
                                 let sid_assign = active_session_id.clone();
-                                d.child(
+                                d.child(popover_enter("board-assignment-enter",
                                     div()
                                         .mb(px(8.0))
                                         .self_end()
                                         .w(px(240.0))
+                                        .max_w_full()
+                                        .min_w_0()
                                         .p(px(5.0))
                                         .rounded(px(14.0))
                                         .bg(theme.bg_elevated)
@@ -764,11 +893,12 @@ impl Render for ChatView {
                                                     d.child(cursor_icon("check", 13.0, theme.text_primary))
                                                 })
                                         })),
-                                )
+                                ))
                             })
                             // Controls strip (model, effort, fast, ask/yolo, board)
                             .child(
                                 div()
+                                    .min_w_0()
                                     .px(px(10.0))
                                     .pb(px(6.0))
                                     .flex()
@@ -778,14 +908,18 @@ impl Render for ChatView {
                                     .gap(px(8.0))
                                     .child(
                                         div()
+                                            .min_w_0()
+                                            .max_w_full()
                                             .flex()
                                             .items_center()
                                             .flex_wrap()
                                             .gap(px(6.0))
                                             .child(
                                                 gb_chip_btn("chip-model", &theme, false)
+                                                    .min_w_0()
+                                                    .max_w_full()
                                                     .child(cursor_icon("sparkles", 12.0, theme.text_secondary))
-                                                    .child(short_model_name(&active_model))
+                                                    .child(clipped_label(short_model_name(&active_model)))
                                                     .child(cursor_icon(
                                                         "chevron-down-small",
                                                         11.0,
@@ -864,8 +998,10 @@ impl Render for ChatView {
                                         let preset = resolve_bot_color(&b.slug, b.color.as_deref());
                                         d.child(
                                             gb_chip_btn("chip-board", &theme, false)
+                                                .min_w_0()
+                                                .max_w_full()
                                                 .child(gb_dot(preset.hex, 7.0))
-                                                .child(b.name)
+                                                .child(clipped_label(b.name))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.board_menu_open = !this.board_menu_open;
                                                     cx.notify();
@@ -874,11 +1010,7 @@ impl Render for ChatView {
                                     }),
                             )
                             // Context UsageBar
-                            .child(render_usage_bar(
-                                &theme,
-                                chat.session_usage.as_ref(),
-                                active_session.as_ref().and_then(|x| x.context_limit),
-                            ))
+                            .child(usage_bar)
                             // Attachments row
                             .when(!attachments.is_empty(), |d| {
                                 d.child(
@@ -890,6 +1022,8 @@ impl Render for ChatView {
                                         .gap(px(6.0))
                                         .children(attachments.iter().enumerate().map(|(i, att)| {
                                             div()
+                                                .min_w_0()
+                                                .max_w_full()
                                                 .px(px(9.0))
                                                 .py(px(5.0))
                                                 .rounded(px(10.0))
@@ -901,7 +1035,7 @@ impl Render for ChatView {
                                                 .items_center()
                                                 .gap(px(6.0))
                                                 .child(cursor_icon("file", 13.0, theme.text_secondary))
-                                                .child(att.name.clone())
+                                                .child(clipped_label(att.name.clone()))
                                                 .child(
                                                     gb_mini_icon_btn(
                                                         SharedString::from(format!("rm-att-{i}")),
@@ -923,7 +1057,7 @@ impl Render for ChatView {
                             })
                             // Attach menu
                             .when(self.attach_menu_open, |d| {
-                                d.child(
+                                d.child(popover_enter("attach-menu-enter",
                                     div()
                                         .mx(px(12.0))
                                         .mb(px(8.0))
@@ -934,6 +1068,7 @@ impl Render for ChatView {
                                         .border_color(theme.border_default)
                                         .flex()
                                         .items_center()
+                                        .flex_wrap()
                                         .gap(px(8.0))
                                         .child(
                                             gb_btn("menu-attach-files", &theme, BtnVariant::Ghost, true, false)
@@ -959,12 +1094,13 @@ impl Render for ChatView {
                                                     cx.notify();
                                                 })),
                                         ),
-                                )
+                                ))
                             })
                             // Floating Grok Bot Pill Composer (rounded 26px)
                             .child(
                                 div()
                                     .w_full()
+                                    .min_w_0()
                                     .px(px(8.0))
                                     .py(px(7.0))
                                     .rounded(px(26.0))
@@ -1049,99 +1185,122 @@ impl ChatView {
     fn render_transcript(
         &mut self,
         theme: &SandTheme,
-        chat: &crate::state::app_state::SessionChatState,
+        chat: crate::state::app_state::SessionChatState,
         bot_seed: &str,
         shape_id: Option<&str>,
         color_id: Option<&str>,
         bot_state: BotFaceState,
-        tick: u64,
         cx: &mut Context<Self>,
     ) -> Div {
-        let has_inline_activity = chat.messages.last().is_some_and(|m| {
-            m.streaming
-                && ((m.thinking.is_some() && m.content.is_empty())
-                    || m.tool_calls
-                        .iter()
-                        .any(|t| t.status == ToolCallStatus::Running))
-        });
+        let has_inline_activity = chat.messages.iter().rev().any(|m| m.streaming && message_has_body(m));
 
         let has_older = chat.older_offset.is_some();
         let has_todos = !chat.todos.is_empty();
-        let has_pending = chat.is_streaming && !has_inline_activity;
+        let has_pending = chat.is_streaming && !chat.has_streamed_text && !has_inline_activity;
         let msg_start = usize::from(has_older) + usize::from(has_todos);
         let msg_count = chat.messages.len();
-        let total_items = msg_start + msg_count + usize::from(has_pending) + 1;
+        let total_items = msg_start + msg_count + usize::from(has_pending);
 
         let active_sid = self.app.read(cx).active_session_id.clone();
-        let last_fp = chat
-            .messages
-            .last()
-            .map(|m| {
-                (
-                    m.content.len() + m.thinking.as_ref().map_or(0, String::len),
-                    m.tool_calls.len(),
-                    m.streaming,
-                )
-            })
-            .unwrap_or((0, 0, false));
-
-        if self.synced_session_id != active_sid {
-            self.synced_session_id = active_sid;
-            self.synced_item_count = total_items;
-            self.synced_last_fp = last_fp;
+        let messages: Vec<_> = chat.messages.iter().map(|m| (m.id.clone(), message_fingerprint(m))).collect();
+        let first_msg_id = chat.messages.first().map(|m| m.id.clone());
+        let last_fp = messages.last().map(|(_, fp)| *fp);
+        let aux_fp = (row_fingerprint(&chat.todos), row_fingerprint(&chat.live_status_text));
+        let switched = self.synced_session_id != active_sid;
+        let prefix_changed = self.synced_prefix_count != msg_start || self.synced_prefix_kind != (has_older, has_todos);
+        if switched || prefix_changed || self.synced_first_msg_id != first_msg_id || msg_count < self.synced_msg_count {
+            // A prefix change shifts the cached heights, even if the total row count is unchanged.
+            let was_following = switched || self.list_state.is_following_tail();
+            let anchor = self.list_state.logical_scroll_top();
+            let anchor_id = anchor.item_ix.checked_sub(self.synced_prefix_count)
+                .and_then(|index| self.synced_messages.get(index))
+                .map(|(id, _)| id);
             self.smooth_scroller.cancel();
             self.list_state.reset(total_items);
-            self.list_state.set_follow_mode(FollowMode::Tail);
-            self.list_state.scroll_to_end();
-        } else if total_items != self.synced_item_count {
-            let old = self.synced_item_count;
-            self.synced_item_count = total_items;
-            self.synced_last_fp = last_fp;
-            if total_items > old && old >= 2 {
-                // Incremental tail splice preserves scroll anchor & cached item heights!
-                let insert_at = old - 1;
-                let added = total_items - old;
-                self.list_state.splice(insert_at..insert_at, added);
-                if insert_at > 0 {
-                    self.list_state.remeasure_items((insert_at - 1)..insert_at);
+            self.measured_width.set(None);
+            if was_following {
+                self.list_state.set_follow_mode(FollowMode::Tail);
+                self.list_state.scroll_to_end();
+            } else if let Some(id) = anchor_id {
+                if let Some(index) = messages.iter().position(|(candidate, _)| candidate == id) {
+                    self.list_state.scroll_to(ListOffset { item_ix: msg_start + index, ..anchor });
                 }
-            } else {
-                self.list_state.reset(total_items);
             }
-        } else if last_fp != self.synced_last_fp {
-            self.synced_last_fp = last_fp;
-            if msg_count > 0 {
-                let last_msg_ix = msg_start + msg_count - 1;
-                self.list_state
-                    .remeasure_items(last_msg_ix..(last_msg_ix + 1));
+        } else {
+            if msg_count != self.synced_msg_count || has_pending != self.synced_has_pending {
+                let tail_start = msg_start + self.synced_msg_count;
+                self.list_state.splice(
+                    tail_start..tail_start + usize::from(self.synced_has_pending),
+                    msg_count - self.synced_msg_count + usize::from(has_pending),
+                );
+            }
+            for (index, (old, current)) in self.synced_messages.iter().zip(&messages).enumerate() {
+                // Tool/approval events can update a row behind the streaming tail.
+                if old != current && index + 1 != msg_count {
+                    self.list_state.remeasure_items(msg_start + index..msg_start + index + 1);
+                }
+            }
+            if last_fp != self.synced_last_fp && msg_count > 0 {
+                self.list_state.remeasure_items(msg_start + msg_count - 1..msg_start + msg_count);
+            }
+            if has_todos && aux_fp.0 != self.synced_aux_fp.0 {
+                let index = usize::from(has_older);
+                self.list_state.remeasure_items(index..index + 1);
+            }
+            if has_pending && aux_fp.1 != self.synced_aux_fp.1 {
+                let index = msg_start + msg_count;
+                self.list_state.remeasure_items(index..index + 1);
             }
         }
+        self.synced_session_id = active_sid;
+        self.synced_prefix_count = msg_start;
+        self.synced_prefix_kind = (has_older, has_todos);
+        self.synced_first_msg_id = first_msg_id;
+        self.synced_msg_count = msg_count;
+        self.synced_has_pending = has_pending;
+        self.synced_last_fp = last_fp;
+        self.synced_messages = messages;
+        self.synced_aux_fp = aux_fp;
+        self.thinking_disclosure.collapsed_live.retain(|id| chat.messages.iter().any(|m| m.id == *id && m.streaming));
 
         let is_scrolled_up = self.list_state.max_offset_for_scrollbar().y > px(40.0)
             && !self.list_state.is_following_tail()
             && !self.list_state.is_scrolled_to_end().unwrap_or(true);
+        let jump_id = self.jump_pill_entrance.id("chat-jump-enter", is_scrolled_up);
 
         let theme_copy = *theme;
         let bot_seed_owned = bot_seed.to_string();
         let shape_owned = shape_id.map(str::to_string);
         let color_owned = color_id.map(str::to_string);
-        let messages = chat.messages.clone();
-        let todos = chat.todos.clone();
+        let messages = chat.messages;
+        let todos = chat.todos;
         let loading_history = chat.loading_history;
-        let live_status_text = chat.live_status_text.clone();
+        let live_status_text = chat.live_status_text;
+        let is_streaming = chat.is_streaming;
+        let _measured_width = &self.measured_width;
+        let thought_scroll = ThoughtScrollHitboxes::default();
+        let row_scroll = thought_scroll.clone();
+        let clear_scroll = thought_scroll.clone();
 
         div()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .w_full()
+            .flex()
+            .flex_col()
             .relative()
+            // Clear nested thought scroll hitboxes before list prepaint; GPUI List already
+            // invalidates cached row heights automatically whenever its layout width changes.
+            .child(canvas(move |_, _, _| {
+                clear_scroll.borrow_mut().clear();
+            }, |_, _, _, _| {}).absolute().w_full().h(px(0.0)))
             .child(
                 list(
                     self.list_state.clone(),
                     cx.processor(move |this, idx: usize, _window, cx| {
                         let inner: AnyElement = if has_older && idx == 0 {
-                            div()
-                                .w_full()
+                            chat_row()
                                 .pb(px(14.0))
                                 .flex()
                                 .justify_center()
@@ -1153,6 +1312,7 @@ impl ChatView {
                                         true,
                                         loading_history,
                                     )
+                                    .when(loading_history, |d| d.child(gpu_spinner(12.0, theme_copy.text_primary)))
                                     .child(if loading_history {
                                         "Loading…"
                                     } else {
@@ -1166,8 +1326,7 @@ impl ChatView {
                         } else if has_todos && idx == usize::from(has_older) {
                             let done_count =
                                 todos.iter().filter(|t| t.status == "completed").count();
-                            div()
-                                .w_full()
+                            chat_row()
                                 .pb(px(14.0))
                                 .child(
                                     gb_section_card(&theme_copy)
@@ -1176,7 +1335,7 @@ impl ChatView {
                                                 .py(px(9.0))
                                                 .px(px(13.0))
                                                 .child(
-                                                    div()
+                                                    chat_row()
                                                         .flex()
                                                         .items_center()
                                                         .gap(px(6.0))
@@ -1201,14 +1360,11 @@ impl ChatView {
                                                 .flex_col()
                                                 .gap(px(5.0))
                                                 .children(todos.iter().map(|t| {
-                                                    let (icon, col) = match t.status.as_str() {
-                                                        "completed" => {
-                                                            ("check-circle", theme_copy.success_text)
-                                                        }
-                                                        "in_progress" => {
-                                                            ("spinner", theme_copy.accent_text)
-                                                        }
-                                                        _ => ("circle", theme_copy.text_tertiary),
+                                                    let indicator = match t.status.as_str() {
+                                                        "completed" => cursor_icon("check-circle", 13.0, theme_copy.success_text).into_any_element(),
+                                                        "in_progress" if is_streaming => gpu_spinner(13.0, theme_copy.accent_text).into_any_element(),
+                                                        "in_progress" => cursor_icon("circle", 13.0, theme_copy.accent_text).into_any_element(),
+                                                        _ => cursor_icon("circle", 13.0, theme_copy.text_tertiary).into_any_element(),
                                                     };
                                                     div()
                                                         .flex()
@@ -1220,74 +1376,82 @@ impl ChatView {
                                                         } else {
                                                             theme_copy.text_primary
                                                         })
-                                                        .child(cursor_icon(icon, 13.0, col))
-                                                        .child(t.content.clone())
+                                                        .child(indicator)
+                                                        .child(div().flex_1().min_w_0().child(StyledText::new(t.content.clone())))
                                                 })),
                                         ),
                                 )
                                 .into_any_element()
                         } else if idx >= msg_start && idx < msg_start + msg_count {
                             let msg = &messages[idx - msg_start];
-                            div()
-                                .w_full()
-                                .pb(px(14.0))
+                            chat_row()
+                                .when(message_has_body(msg), |d| d.pb(px(14.0)))
                                 .child(this.render_message(
                                     msg,
                                     &theme_copy,
                                     &bot_seed_owned,
                                     shape_owned.as_deref(),
-                                    color_owned.as_deref(),
-                                    tick,
+                                     color_owned.as_deref(),
+                                    is_streaming,
+                                     &row_scroll,
                                     cx,
                                 ))
                                 .into_any_element()
                         } else if has_pending && idx == msg_start + msg_count {
                             let status_lbl = if live_status_text.is_empty() {
-                                "Hermes is thinking".to_string()
+                                "Hermes is thinking…".to_string()
                             } else {
                                 live_status_text.clone()
                             };
-                            div()
-                                .w_full()
+                            chat_row()
                                 .pb(px(14.0))
                                 .flex()
                                 .items_center()
                                 .gap(px(10.0))
                                 .py(px(4.0))
-                                .child(bot_face(
+                                .child(bot_face_with_options(
                                     &theme_copy,
                                     &bot_seed_owned,
                                     shape_owned.as_deref(),
                                     color_owned.as_deref(),
                                     28.0,
                                     bot_state,
-                                    tick,
+                                    BotFaceOptions { slot_key: "chat-pending", ..Default::default() },
                                 ))
                                 .child(
                                     div()
+                                        .min_w_0()
+                                        .overflow_hidden()
                                         .text_size(px(13.0))
                                         .text_color(theme_copy.text_tertiary)
-                                        .child(format!("{status_lbl} …")),
-                                )
+                                         .child(StyledText::new(status_lbl)),
+                                 )
+                                .child(typing_dots(theme_copy.text_tertiary))
                                 .into_any_element()
                         } else {
-                            div().h(px(24.0)).into_any_element()
+                            div().into_any_element()
                         };
 
                         div()
                             .w_full()
+                            .min_w_0()
+                            .px(px(24.0))
                             .flex()
                             .justify_center()
-                            .child(div().w(px(740.0)).max_w_full().child(inner))
+                            .child(chat_row().max_w(px(740.0)).flex().flex_col().child(inner))
                             .into_any_element()
                     }),
                 )
-                .size_full()
-                .px(px(24.0))
+                .flex_1()
+                .min_h_0()
+                .w_full()
                 .py(px(14.0)),
             )
             .vertical_scrollbar(&self.list_state)
-            .child(smooth_scroll_layer(&self.smooth_scroller))
+            .child(smooth_scroll_layer(&self.smooth_scroller).filter_events(move |event, window| {
+                // Let GPUI's nested scroll panes handle their own wheel events first.
+                !event.modifiers.shift && !thought_scroll.borrow().iter().any(|hitbox| hitbox.should_handle_scroll(window))
+            }))
             // Floating Jump-to-Latest pill when scrolled up away from bottom
             .when(is_scrolled_up, |d| {
                 d.child(
@@ -1298,7 +1462,7 @@ impl ChatView {
                         .right_0()
                         .flex()
                         .justify_center()
-                        .child(
+                        .child(pill_enter(jump_id,
                             gb_btn("chat-jump-bottom", theme, BtnVariant::Secondary, true, false)
                                 .shadow_md()
                                 .child(cursor_icon("arrow-down", 12.0, theme.text_primary))
@@ -1309,7 +1473,7 @@ impl ChatView {
                                     this.list_state.scroll_to_end();
                                     cx.notify();
                                 })),
-                        ),
+                        )),
                 )
             })
     }
@@ -1322,7 +1486,8 @@ impl ChatView {
         bot_seed: &str,
         shape_id: Option<&str>,
         color_id: Option<&str>,
-        tick: u64,
+        session_streaming: bool,
+        thought_scroll: &ThoughtScrollHitboxes,
         cx: &mut Context<Self>,
     ) -> Div {
         if msg.role == MessageRole::Tool {
@@ -1335,23 +1500,23 @@ impl ChatView {
                 duration_ms: None,
                 preview: None,
             };
-            return div()
-                .w_full()
+            return chat_row()
                 .flex()
                 .flex_col()
                 .items_start()
-                .child(self.render_tool_card(&synth, theme, cx));
+                .child(self.render_tool_card(&synth, theme, session_streaming && msg.streaming, cx));
         }
 
         if msg.role == MessageRole::User {
-            return div()
-                .w_full()
+            return chat_row()
                 .flex()
                 .flex_col()
                 .items_end()
                 .child(
                     div()
                         .max_w(px(560.0))
+                        .min_w_0()
+                        .overflow_hidden()
                         .px(px(14.0))
                         .py(px(9.0))
                         .rounded(px(19.0))
@@ -1359,39 +1524,44 @@ impl ChatView {
                         .text_color(theme.bubble_user_ink)
                         .text_size(px(14.5))
                         .line_height(px(21.0))
-                        .child(msg.content.clone()),
+                        .child(StyledText::new(msg.content.clone())),
                 );
         }
 
         let msg_id = msg.id.clone();
         let copy_content = msg.content.clone();
-        let think_open = self.expanded_thinking.contains(&msg.id);
-        let think_streaming = msg.streaming
-            && msg.content.is_empty()
-            && !msg
-                .tool_calls
-                .iter()
-                .any(|t| t.status == ToolCallStatus::Running);
+        let think_streaming = thinking_is_live(msg);
+        let think_open = self.thinking_disclosure.is_expanded(msg);
+        let thinking = msg.thinking.as_deref().filter(|t| !t.is_empty());
+        let has_answer = !msg.content.trim().is_empty();
 
-        div()
-            .w_full()
+        chat_row()
             .flex()
             .flex_col()
             .items_start()
             .gap(px(8.0))
             // Collapsible Thought Process
-            .when_some(msg.thinking.as_ref().filter(|t| !t.is_empty()), |d, thinking| {
+            .when(think_streaming || thinking.is_some(), |d| {
                 let tid = msg_id.clone();
                 d.child(
-                    div()
-                        .w_full()
+                    chat_row()
                         .flex()
                         .flex_col()
+                        .items_start()
+                        .gap(px(5.0))
                         .child(
                             div()
                                 .id(SharedString::from(format!("think-head-{msg_id}")))
+                                .max_w_full()
+                                .min_w_0()
+                                .overflow_hidden()
                                 .min_h(px(28.0))
-                                .py(px(3.0))
+                                .px(px(9.0))
+                                .py(px(4.0))
+                                .rounded(px(10.0))
+                                .border_1()
+                                .border_color(theme.border_subtle)
+                                .bg(theme.bg_card)
                                 .flex()
                                 .items_center()
                                 .gap(px(7.0))
@@ -1399,32 +1569,33 @@ impl ChatView {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text_tertiary)
                                 .cursor_pointer()
-                                .hover(|st| st.text_color(theme.text_secondary))
+                                .hover(|st| st.bg(theme.bg_hover).border_color(theme.border_default).text_color(theme.text_secondary))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if !this.expanded_thinking.remove(&tid) {
-                                        this.expanded_thinking.insert(tid.clone());
-                                    }
+                                    this.thinking_disclosure.toggle(&tid, think_streaming);
                                     this.list_state.remeasure();
                                     cx.notify();
                                 }))
                                 .child(if think_streaming {
-                                    bot_face(
+                                    bot_face_with_options(
                                         theme,
                                         bot_seed,
                                         shape_id,
                                         color_id,
                                         22.0,
                                         BotFaceState::Thinking,
-                                        tick,
+                                        BotFaceOptions { slot_key: "chat-thinking", ..Default::default() },
                                     )
                                     .into_any_element()
                                 } else {
-                                    cursor_icon("brain", 16.0, theme.text_tertiary).into_any_element()
+                                    cursor_icon("brain", 14.0, theme.text_tertiary).into_any_element()
                                 })
-                                .child(if think_streaming {
+                                .child(clipped_label(if think_streaming {
                                     "Thinking…"
                                 } else {
                                     "Thought process"
+                                }))
+                                .when(!think_streaming, |d| {
+                                    d.child(clipped_label("· View").text_size(px(11.0)))
                                 })
                                 .child(cursor_icon(
                                     if think_open {
@@ -1436,20 +1607,31 @@ impl ChatView {
                                     theme.text_tertiary,
                                 )),
                         )
-                        .when(think_open, |d| {
-                            d.child(
-                                div()
-                                    .ml(px(8.0))
-                                    .my(px(4.0))
-                                    .pl(px(14.0))
-                                    .py(px(4.0))
-                                    .border_l_1()
+                        .when_some(thinking.filter(|_| think_open), |d, thinking| {
+                            let thought_scroll = thought_scroll.clone();
+                            d.child(popover_enter(SharedString::from(format!("think-body-anim-{msg_id}")),
+                                chat_row()
+                                    .relative()
+                                    .rounded(px(8.0))
+                                    .border_l_2()
                                     .border_color(theme.border_default)
-                                    .text_size(px(12.5))
-                                    .line_height(px(19.0))
-                                    .text_color(theme.text_secondary)
-                                    .child(thinking.clone()),
-                            )
+                                    .bg(theme.bg_card)
+                                    .child(canvas(move |bounds, window, _| {
+                                        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+                                        thought_scroll.borrow_mut().push(hitbox);
+                                    }, |_, _, _, _| {}).absolute().size_full())
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("think-scroll-{msg_id}")))
+                                            .w_full()
+                                            .min_w_0()
+                                            .max_h(px(if think_streaming { 220.0 } else { 320.0 }))
+                                            .overflow_y_scroll()
+                                            .px(px(12.0))
+                                            .py(px(7.0))
+                                            .child(render_thinking_markdown(&format!("thought-{msg_id}"), thinking, theme)),
+                                    ),
+                            ))
                         }),
                 )
             })
@@ -1474,13 +1656,15 @@ impl ChatView {
                 };
                 let gid_click = grp_id.clone();
                 d.child(
-                    div()
-                        .w_full()
+                    chat_row()
                         .flex()
                         .flex_col()
                         .child(
                             div()
                                 .id(SharedString::from(grp_id))
+                                .w_full()
+                                .min_w_0()
+                                .overflow_hidden()
                                 .min_h(px(28.0))
                                 .py(px(3.0))
                                 .flex()
@@ -1504,7 +1688,8 @@ impl ChatView {
                                         t.preview.as_deref(),
                                         true,
                                     );
-                                    bot_face(theme, bot_seed, shape_id, color_id, 22.0, st, tick)
+                                    bot_face_with_options(theme, bot_seed, shape_id, color_id, 22.0, st,
+                                        BotFaceOptions { slot_key: "chat-tool", ..Default::default() })
                                         .into_any_element()
                                 } else {
                                     cursor_icon("layers", 16.0, theme.text_tertiary)
@@ -1530,18 +1715,17 @@ impl ChatView {
                                 )),
                         )
                         .when(grp_open, |d| {
-                            d.child(
-                                div()
-                                    .w_full()
+                            d.child(popover_enter(SharedString::from(format!("tool-group-body-{}", msg.id)),
+                                chat_row()
                                     .flex()
                                     .flex_col()
                                     .gap(px(2.0))
                                     .children(
                                         msg.tool_calls
                                             .iter()
-                                            .map(|tc| self.render_tool_card(tc, theme, cx)),
+                                            .map(|tc| self.render_tool_card(tc, theme, session_streaming && msg.streaming, cx)),
                                     ),
-                            )
+                            ))
                         }),
                 )
             })
@@ -1554,28 +1738,33 @@ impl ChatView {
                 d.child(self.render_clarify_card(cl, theme, cx))
             })
             // Main assistant markdown bubble
-            .when(!msg.content.is_empty(), |d| {
+            .when(has_answer, |d| {
                 d.child(
-                    div()
-                        .w_full()
+                    chat_row()
                         .px(px(16.0))
                         .py(px(12.0))
                         .rounded(px(18.0))
                         .bg(theme.bubble_agent)
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
                         .child(render_markdown(&msg.id, &msg.content, theme)),
                 )
             })
             // Footer meta (model + copy)
-            .when(!msg.content.is_empty() && !msg.streaming, |d| {
+            .when(has_answer && !msg.streaming, |d| {
                 d.child(
                     div()
+                        .min_w_0()
+                        .max_w_full()
+                        .overflow_hidden()
                         .px(px(6.0))
                         .flex()
                         .items_center()
                         .gap(px(6.0))
                         .text_size(px(11.0))
                         .text_color(theme.text_tertiary)
-                        .when_some(msg.model.as_ref(), |d, m| d.child(short_model_name(m)))
+                        .when_some(msg.model.as_ref(), |d, m| d.child(clipped_label(short_model_name(m))))
                         .child(
                             gb_mini_icon_btn(
                                 SharedString::from(format!("copy-msg-{}", msg.id)),
@@ -1595,6 +1784,7 @@ impl ChatView {
         &self,
         tool: &HermesToolCall,
         theme: &SandTheme,
+        streaming: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let open = self.expanded_tools.contains(&tool.id);
@@ -1603,14 +1793,12 @@ impl ChatView {
         let (icon, label, detail, _) =
             describe_tool(&tool.name, tool.arguments.as_ref(), tool.preview.as_deref(), running);
 
-        div()
-            .w_full()
+        chat_row()
             .flex()
             .flex_col()
             .child(
-                div()
+                chat_row()
                     .id(SharedString::from(format!("tool-head-{}", tool.id)))
-                    .w_full()
                     .min_h(px(28.0))
                     .py(px(3.0))
                     .flex()
@@ -1628,7 +1816,7 @@ impl ChatView {
                         cx.notify();
                     }))
                     .child(cursor_icon(icon, 16.0, theme.text_tertiary))
-                    .child(div().flex_shrink_0().child(label))
+                    .child(clipped_label(label).flex_shrink_0())
                     .child(
                         div()
                             .flex_1()
@@ -1639,17 +1827,18 @@ impl ChatView {
                             .child(detail),
                     )
                     .when(tool.status == ToolCallStatus::Error, |d| {
-                        d.child(div().text_size(px(11.0)).text_color(theme.danger_text).child("Failed"))
+                        d.child(clipped_label("Failed").flex_shrink_0().text_size(px(11.0)).text_color(theme.danger_text))
                     })
                     .when(running, |d| {
-                        d.child(div().text_size(px(11.0)).text_color(theme.text_tertiary).child("Running"))
+                        d.child(live_pulse_dot(theme.accent_text, 5.0, streaming))
+                            .child(clipped_label("Running").flex_shrink_0().text_size(px(11.0)).text_color(theme.text_tertiary))
                     })
                     .when_some(tool.duration_ms, |d, ms| {
                         d.child(
-                            div()
+                            clipped_label(format!("{:.1}s", (ms as f64) / 1000.0))
+                                .flex_shrink_0()
                                 .text_size(px(11.0))
-                                .text_color(theme.text_tertiary)
-                                .child(format!("{:.1}s", (ms as f64) / 1000.0)),
+                                .text_color(theme.text_tertiary),
                         )
                     })
                     .child(cursor_icon(
@@ -1659,11 +1848,10 @@ impl ChatView {
                     )),
             )
             .when(open, |d| {
-                d.child(
-                    div()
-                        .ml(px(8.0))
+                d.child(popover_enter(SharedString::from(format!("tool-body-{}", tool.id)),
+                    chat_row()
                         .my(px(4.0))
-                        .pl(px(14.0))
+                        .pl(px(12.0))
                         .py(px(4.0))
                         .border_l_1()
                         .border_color(theme.border_default)
@@ -1674,7 +1862,7 @@ impl ChatView {
                             let pretty = serde_json::to_string_pretty(args)
                                 .unwrap_or_else(|_| args.to_string());
                             d.child(
-                                div()
+                                chat_row()
                                     .font_family(FONT_MONO)
                                     .text_size(px(11.0))
                                     .text_color(theme.text_tertiary)
@@ -1689,7 +1877,7 @@ impl ChatView {
                         })
                         .when_some(tool.output.as_ref(), |d, out| {
                             d.child(
-                                div()
+                                chat_row()
                                     .font_family(FONT_MONO)
                                     .text_size(px(11.0))
                                     .text_color(theme.text_tertiary)
@@ -1704,13 +1892,13 @@ impl ChatView {
                         })
                         .when(tool.arguments.is_none() && tool.output.is_none(), |d| {
                             d.child(
-                                div()
+                                chat_row()
                                     .text_size(px(12.0))
                                     .text_color(theme.text_tertiary)
                                     .child("No payload available yet."),
                             )
                         }),
-                )
+                ))
             })
     }
 
@@ -1723,8 +1911,7 @@ impl ChatView {
         let id1 = ap.id.clone();
         let id2 = ap.id.clone();
         let id3 = ap.id.clone();
-        div()
-            .w_full()
+        chat_row()
             .max_w(px(520.0))
             .p(px(15.0))
             .rounded(px(18.0))
@@ -1735,27 +1922,27 @@ impl ChatView {
             .flex_col()
             .gap(px(6.0))
             .child(
-                div()
+                chat_row()
                     .text_size(px(12.0))
                     .text_color(theme.text_tertiary)
                     .child("Needs your OK"),
             )
             .child(
-                div()
+                chat_row()
                     .text_size(px(14.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(ap.title.clone()),
+                    .child(StyledText::new(ap.title.clone())),
             )
-            .when_some(ap.detail.as_ref().filter(|s| !s.is_empty()), |d, detail| {
+            .when_some(ap.detail.as_ref().filter(|s| !s.is_empty()).or(ap.command.as_ref()), |d, detail| {
                 d.child(
-                    div()
+                    chat_row()
                         .p(px(10.0))
                         .rounded(px(10.0))
                         .bg(theme.bg_card)
                         .font_family(FONT_MONO)
                         .text_size(px(12.0))
                         .text_color(theme.text_secondary)
-                        .child(detail.clone()),
+                        .child(StyledText::new(detail.clone())),
                 )
             })
             .child(if let Some(dec) = &ap.settled {
@@ -1764,11 +1951,12 @@ impl ChatView {
                     ApprovalDecision::Always => (BadgeTone::Success, "Always allowed"),
                     ApprovalDecision::Allowed => (BadgeTone::Success, "Allowed once"),
                 };
-                div().mt(px(4.0)).child(gb_badge(theme, tone, txt))
+                chat_row().mt(px(4.0)).child(gb_badge(theme, tone, txt))
             } else {
-                div()
+                chat_row()
                     .mt(px(6.0))
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.0))
                     .child(
@@ -1822,34 +2010,33 @@ impl ChatView {
         theme: &SandTheme,
         cx: &mut Context<Self>,
     ) -> Div {
-        div()
-            .w_full()
+        chat_row()
             .max_w(px(560.0))
             .rounded(px(22.0))
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_default)
-            .overflow_hidden()
             .flex()
             .flex_col()
             .child(
-                div()
+                chat_row()
                     .px(px(16.0))
                     .pt(px(14.0))
                     .pb(px(8.0))
                     .text_size(px(15.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(cl.question.clone()),
+                    .child(StyledText::new(cl.question.clone())),
             )
             .child(if let Some(ans) = &cl.answered {
-                div()
+                chat_row()
                     .px(px(16.0))
                     .pb(px(14.0))
-                    .child(gb_badge(theme, BadgeTone::Success, format!("Answered: {ans}")))
+                    .child(gb_badge(theme, BadgeTone::Success, "Answered"))
+                    .child(chat_row().mt(px(4.0)).text_size(px(13.0)).child(StyledText::new(ans.clone())))
             } else {
                 let choices = cl.choices.clone().unwrap_or_default();
                 let cid = cl.id.clone();
-                div()
+                chat_row()
                     .px(px(12.0))
                     .pb(px(14.0))
                     .flex()
@@ -1858,9 +2045,8 @@ impl ChatView {
                     .children(choices.into_iter().enumerate().map(|(i, choice)| {
                         let cid2 = cid.clone();
                         let ans = choice.clone();
-                        div()
+                        chat_row()
                             .id(SharedString::from(format!("clarify-{cid}-{i}")))
-                            .w_full()
                             .px(px(10.0))
                             .py(px(8.0))
                             .rounded(px(12.0))
@@ -1878,6 +2064,7 @@ impl ChatView {
                                 div()
                                     .w(px(24.0))
                                     .h(px(24.0))
+                                    .flex_shrink_0()
                                     .rounded(px(7.0))
                                     .bg(theme.bg_secondary)
                                     .border_1()
@@ -1889,7 +2076,7 @@ impl ChatView {
                                     .justify_center()
                                     .child((i + 1).to_string()),
                             )
-                            .child(div().text_size(px(13.5)).child(choice))
+                            .child(div().flex_1().min_w_0().overflow_hidden().text_size(px(13.5)).child(StyledText::new(choice)))
                     }))
             })
     }
@@ -1899,6 +2086,8 @@ fn render_usage_bar(
     theme: &SandTheme,
     usage: Option<&HermesSessionUsage>,
     context_limit: Option<u64>,
+    fill: &mut SpringValue,
+    window: &mut Window,
 ) -> Div {
     let used = usage.and_then(|u| u.context_tokens);
     let limit = usage.and_then(|u| u.context_limit).or(context_limit);
@@ -1931,10 +2120,16 @@ fn render_usage_bar(
     } else {
         theme.accent_text
     };
-    let fill_w = (pct.unwrap_or(0.0) / 100.0) * 64.0;
+    if let Some(pct) = pct {
+        fill.set_target(pct * 0.64);
+    } else {
+        fill.snap(0.0);
+    }
+    let fill_w = fill.advance(window);
 
     div()
         .w_full()
+        .min_w_0()
         .px(px(12.0))
         .pb(px(7.0))
         .flex()
@@ -1952,7 +2147,7 @@ fn render_usage_bar(
                 .flex_shrink_0()
                 .child(div().h_full().w(px(fill_w)).bg(fill_color)),
         )
-        .child(label)
+        .child(clipped_label(label))
         .when(known, |d| {
             d.child(
                 div()
@@ -1960,4 +2155,57 @@ fn render_usage_bar(
                     .child(format!("{}%", pct.unwrap_or(0.0).round() as u32)),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{message_fingerprint, HermesMessage, HermesToolCall, ThinkingDisclosure, ToolCallStatus};
+
+    #[test]
+    fn live_thinking_collapses_when_the_answer_starts_and_can_be_reopened() {
+        let mut msg = HermesMessage::new_assistant("test".into());
+        let mut disclosure = ThinkingDisclosure::default();
+        assert!(disclosure.is_expanded(&msg));
+        disclosure.toggle(&msg.id, true);
+        assert!(!disclosure.is_expanded(&msg));
+        disclosure.toggle(&msg.id, true);
+        assert!(disclosure.is_expanded(&msg));
+
+        msg.content = "Answer starts".into();
+        assert!(!disclosure.is_expanded(&msg));
+        disclosure.toggle(&msg.id, false);
+        msg.streaming = false;
+        assert!(disclosure.is_expanded(&msg));
+        disclosure.toggle(&msg.id, false);
+        assert!(!disclosure.is_expanded(&msg));
+    }
+
+    #[test]
+    fn finishing_a_thinking_only_message_hides_its_body() {
+        let mut msg = HermesMessage::new_assistant("test".into());
+        let disclosure = ThinkingDisclosure::default();
+        msg.thinking = Some("Reasoning with no answer yet".into());
+        assert!(disclosure.is_expanded(&msg));
+        msg.streaming = false;
+        assert!(!disclosure.is_expanded(&msg));
+    }
+
+    #[test]
+    fn same_length_tool_updates_and_stream_completion_invalidate_row_measurements() {
+        let mut msg = HermesMessage::new_assistant("test".into());
+        msg.tool_calls.push(HermesToolCall {
+            status: ToolCallStatus::Running,
+            output: Some("one".into()),
+            ..Default::default()
+        });
+        let before = message_fingerprint(&msg);
+        msg.tool_calls[0].output = Some("two".into());
+        let changed_output = message_fingerprint(&msg);
+        assert_ne!(before, changed_output);
+        msg.tool_calls[0].status = ToolCallStatus::Done;
+        let changed_status = message_fingerprint(&msg);
+        assert_ne!(changed_output, changed_status);
+        msg.streaming = false;
+        assert_ne!(changed_status, message_fingerprint(&msg));
+    }
 }

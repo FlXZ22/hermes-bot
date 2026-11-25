@@ -5,6 +5,7 @@ use crate::theme::components::{
     gb_segmented_shell, gb_toggle_switch, BadgeTone, BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::theme::tokens::SandTheme;
+use crate::ui::motion::{gpu_spinner, ModalMotion};
 use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -29,9 +30,10 @@ pub struct SkillsView {
     hub_loading: bool,
     // Skill editor modal
     editing_skill: Option<String>,
+    skill_modal: ModalMotion,
     skill_editor: Entity<TextareaState>,
     // Add MCP modal
-    mcp_modal_open: bool,
+    mcp_modal: ModalMotion,
     mcp_name: Entity<InputState>,
     mcp_transport: String,
     mcp_command: Entity<InputState>,
@@ -89,8 +91,9 @@ impl SkillsView {
             hub_results: Vec::new(),
             hub_loading: false,
             editing_skill: None,
+            skill_modal: ModalMotion::default(),
             skill_editor,
-            mcp_modal_open: false,
+            mcp_modal: ModalMotion::default(),
             mcp_name,
             mcp_transport: "stdio".into(),
             mcp_command,
@@ -134,6 +137,7 @@ impl SkillsView {
 
     fn open_skill_editor(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_skill = Some(name.clone());
+        self.skill_modal.set_open(true);
         self.skill_editor
             .update(cx, |st, cx| st.set_value("Loading…", window, cx));
         let (client, rt) = {
@@ -154,6 +158,11 @@ impl SkillsView {
             });
         })
         .detach();
+    }
+
+    fn close_skill_editor(&mut self) {
+        self.editing_skill = None;
+        self.skill_modal.set_open(false);
     }
 }
 
@@ -182,9 +191,8 @@ impl Render for SkillsView {
             .collect();
 
         div()
-            .flex_1()
+            .size_full()
             .min_w_0()
-            .h_full()
             .bg(theme.bg_pane)
             .text_color(theme.text_primary)
             .font_family(FONT_SANS)
@@ -263,7 +271,7 @@ impl Render for SkillsView {
                                         .child(cursor_icon("plus", 13.0, theme.text_on_primary))
                                         .child("Add MCP")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.mcp_modal_open = true;
+                                            this.mcp_modal.set_open(true);
                                             cx.notify();
                                         })),
                                 )
@@ -399,6 +407,7 @@ impl Render for SkillsView {
                                         .child(div().flex_1().child(Input::new(&self.hub_input).h(px(36.0))))
                                         .child(
                                             gb_btn("hub-search-btn", &theme, BtnVariant::Primary, false, self.hub_loading)
+                                                .when(self.hub_loading, |d| d.child(gpu_spinner(13.0, theme.text_on_primary)))
                                                 .child(if self.hub_loading { "Searching..." } else { "Search Hub" })
                                                 .on_click(cx.listener(|this, _, _, cx| this.search_hub(cx))),
                                         ),
@@ -564,7 +573,7 @@ impl Render for SkillsView {
                                                 gb_btn("mcp-empty-add", &theme, BtnVariant::Primary, false, false)
                                                     .child("Add MCP Server")
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.mcp_modal_open = true;
+                                                        this.mcp_modal.set_open(true);
                                                         cx.notify();
                                                     })),
                                             )
@@ -719,16 +728,16 @@ impl Render for SkillsView {
                         .id("sk-edit-backdrop")
                         .absolute()
                         .inset_0()
-                        .bg(theme.bg_scrim)
+                        .child(self.skill_modal.backdrop("skill-scrim-enter", theme.bg_scrim))
                         .flex()
                         .items_center()
                         .justify_center()
                         .p(px(20.0))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                            this.editing_skill = None;
+                            this.close_skill_editor();
                             cx.notify();
                         }))
-                        .child(
+                        .child(self.skill_modal.card("skill-card-enter",
                             div()
                                 .id("sk-edit-modal")
                                 .w(px(600.0))
@@ -751,7 +760,7 @@ impl Render for SkillsView {
                                             gb_mini_icon_btn("close-sk-ed", &theme, false)
                                                 .child(cursor_icon("close", 14.0, theme.text_secondary))
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.editing_skill = None;
+                                                    this.close_skill_editor();
                                                     cx.notify();
                                                 })),
                                         ),
@@ -766,7 +775,7 @@ impl Render for SkillsView {
                                             gb_btn("sk-ed-cancel", &theme, BtnVariant::Ghost, false, false)
                                                 .child("Cancel")
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.editing_skill = None;
+                                                    this.close_skill_editor();
                                                     cx.notify();
                                                 })),
                                         )
@@ -780,7 +789,7 @@ impl Render for SkillsView {
                                                         (s.client.clone(), s.tokio_rt.clone())
                                                     };
                                                     let nm = sk_save.clone();
-                                                    this.editing_skill = None;
+                                                    this.close_skill_editor();
                                                     cx.notify();
                                                     if let Some(c) = client {
                                                         cx.spawn(async move |this, cx| {
@@ -795,11 +804,11 @@ impl Render for SkillsView {
                                                 })),
                                         ),
                                 ),
-                        ),
+                        )),
                 ))
             })
             // Add MCP Modal
-            .when(self.mcp_modal_open, |d| {
+            .when(self.mcp_modal.is_open(), |d| {
                 d.child(self.render_mcp_modal(&theme, cx))
             })
     }
@@ -813,16 +822,16 @@ impl SkillsView {
                 .id("mcp-modal-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(theme.bg_scrim)
+                .child(self.mcp_modal.backdrop("mcp-scrim-enter", theme.bg_scrim))
                 .flex()
                 .items_center()
                 .justify_center()
                 .p(px(20.0))
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.mcp_modal_open = false;
+                    this.mcp_modal.set_open(false);
                     cx.notify();
                 }))
-                .child(
+                .child(self.mcp_modal.card("mcp-card-enter",
                     div()
                         .id("mcp-modal")
                         .w(px(480.0))
@@ -875,7 +884,7 @@ impl SkillsView {
                                     gb_btn("mcp-cancel", theme, BtnVariant::Ghost, false, false)
                                         .child("Cancel")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.mcp_modal_open = false;
+                                            this.mcp_modal.set_open(false);
                                             cx.notify();
                                         })),
                                 )
@@ -904,7 +913,7 @@ impl SkillsView {
                                                 enabled: Some(true),
                                                 status: None,
                                             };
-                                            this.mcp_modal_open = false;
+                                            this.mcp_modal.set_open(false);
                                             this.mcp_name.update(cx, |st, cx| st.set_value("", window, cx));
                                             this.mcp_command.update(cx, |st, cx| st.set_value("", window, cx));
                                             this.mcp_args.update(cx, |st, cx| st.set_value("", window, cx));
@@ -932,7 +941,7 @@ impl SkillsView {
                                         })),
                                 ),
                         ),
-                ),
+                )),
         )
     }
 }
