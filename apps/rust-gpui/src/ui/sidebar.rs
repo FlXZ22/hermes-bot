@@ -6,9 +6,11 @@ use crate::theme::components::{
     gb_mini_icon_btn, gb_traffic_lights, BtnVariant, FONT_SANS,
 };
 use crate::theme::tokens::{resolve_bot_color, SandTheme, ThemeMode};
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::scroll::ScrollableElement;
 
 // Exact Grok Bot navigation dock WITHOUT Work (as requested by user)
 const NAV_ITEMS: &[(AppViewId, &str, &str)] = &[
@@ -32,6 +34,10 @@ pub struct SidebarView {
     hovered_session_id: Option<String>,
     renaming_id: Option<String>,
     rename_input: Entity<InputState>,
+    // Virtualized 120fps session list scroll handle + smooth wheel glide
+    session_scroll: UniformListScrollHandle,
+    session_smooth: SmoothScroller,
+    visible_sessions: Vec<HermesSession>,
     // Add Bot modal state
     new_bot_open: bool,
     bot_name_input: Entity<InputState>,
@@ -82,6 +88,9 @@ impl SidebarView {
         })
         .detach();
 
+        let session_scroll = UniformListScrollHandle::new();
+        let session_smooth = SmoothScroller::for_uniform_list(session_scroll.clone());
+
         Self {
             app,
             search_input,
@@ -89,6 +98,9 @@ impl SidebarView {
             hovered_session_id: None,
             renaming_id: None,
             rename_input,
+            session_scroll,
+            session_smooth,
+            visible_sessions: Vec::new(),
             new_bot_open: false,
             bot_name_input,
             bot_desc_input,
@@ -255,10 +267,11 @@ impl SidebarView {
         div()
             .id(SharedString::from(format!("sess-row-{}", sess.id)))
             .w_full()
+            .h(px(if collapsed { 46.0 } else { 54.0 }))
             .flex()
             .items_center()
-            .when(collapsed, |d| d.justify_center().px(px(4.0)).py(px(7.0)))
-            .when(!collapsed, |d| d.gap(px(10.0)).p(px(8.0)))
+            .when(collapsed, |d| d.justify_center().px(px(4.0)))
+            .when(!collapsed, |d| d.gap(px(10.0)).px(px(8.0)))
             .rounded(px(11.0))
             .bg(if is_active {
                 theme.sidebar_selected
@@ -480,8 +493,11 @@ impl Render for SidebarView {
             .cloned()
             .collect();
 
-        let pinned: Vec<HermesSession> = filtered.iter().filter(|x| x.pinned).cloned().collect();
-        let recent: Vec<HermesSession> = filtered.iter().filter(|x| !x.pinned).cloned().collect();
+        let mut ordered_sessions: Vec<HermesSession> = Vec::with_capacity(filtered.len());
+        ordered_sessions.extend(filtered.iter().filter(|x| x.pinned).cloned());
+        ordered_sessions.extend(filtered.iter().filter(|x| !x.pinned).cloned());
+        let total_sessions_count = ordered_sessions.len();
+        self.visible_sessions = ordered_sessions;
         let profiles = s.profiles.clone();
         let boards = s.boards.clone();
         let bot_avatars = s.bot_avatars.clone();
@@ -668,25 +684,21 @@ impl Render for SidebarView {
                         ),
                 )
             })
-            // Main scrollable area: Hermes Bots grid + Pinned + Sessions
-            .child(
-                div()
-                    .id("sidebar-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(if collapsed { 8.0 } else { 12.0 }))
-                    .pb(px(12.0))
-                    .flex()
-                    .flex_col()
-                    // 3-column Hermes Bots grid
-                    .when(!collapsed, |d| {
-                        let active_prof_for_btn = active_profile.clone();
-                        let active_title_for_btn = bot_avatars
-                            .get(&active_profile)
-                            .and_then(|a| a.display_name.clone())
-                            .unwrap_or_else(|| active_profile.clone());
-                        d.child(
+            // Hermes Bots 3-column grid + Sessions header (pinned cleanly above virtualized list)
+            .when(!collapsed, |d| {
+                let active_prof_for_btn = active_profile.clone();
+                let active_title_for_btn = bot_avatars
+                    .get(&active_profile)
+                    .and_then(|a| a.display_name.clone())
+                    .unwrap_or_else(|| active_profile.clone());
+                d.child(
+                    div()
+                        .w_full()
+                        .px(px(12.0))
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .child(
                             div()
                                 .px(px(6.0))
                                 .py(px(5.0))
@@ -818,54 +830,10 @@ impl Render for SidebarView {
                             div()
                                 .h(px(1.0))
                                 .w_full()
-                                .my(px(6.0))
+                                .my(px(4.0))
                                 .bg(theme.sidebar_separator),
                         )
-                    })
-                    // Pinned sessions
-                    .when(!pinned.is_empty(), |d| {
-                        d.when(!collapsed, |d| {
-                            d.child(
-                                div()
-                                    .px(px(6.0))
-                                    .py(px(5.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.sidebar_text_tertiary)
-                                    .child("Pinned")
-                                    .child(pinned.len().to_string()),
-                            )
-                        })
-                        .children(pinned.iter().map(|sess| {
-                            self.render_session_row(
-                                sess,
-                                &theme,
-                                collapsed,
-                                active_view,
-                                active_session_id.as_deref(),
-                                active_streaming,
-                                active_bot_state,
-                                &active_board_slug,
-                                tick,
-                                cx,
-                            )
-                        }))
-                        .when(!collapsed, |d| {
-                            d.child(
-                                div()
-                                    .h(px(1.0))
-                                    .w_full()
-                                    .my(px(6.0))
-                                    .bg(theme.sidebar_separator),
-                            )
-                        })
-                    })
-                    // Recent / Archived sessions header
-                    .when(!collapsed, |d| {
-                        d.child(
+                        .child(
                             div()
                                 .px(px(6.0))
                                 .py(px(5.0))
@@ -881,7 +849,7 @@ impl Render for SidebarView {
                                         .flex()
                                         .items_center()
                                         .gap(px(6.0))
-                                        .child(recent.len().to_string())
+                                        .child(total_sessions_count.to_string())
                                         .child(
                                             gb_mini_icon_btn("sb-toggle-archived", &theme, false)
                                                 .child(cursor_icon(
@@ -899,32 +867,60 @@ impl Render for SidebarView {
                                                 })),
                                         ),
                                 ),
+                        ),
+                )
+            })
+            // Virtualized 120 FPS Sessions List (Zed uniform_list + SmoothScroller + GPU scrollbar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .px(px(if collapsed { 8.0 } else { 12.0 }))
+                    .pb(px(8.0))
+                    .relative()
+                    .child(if total_sessions_count == 0 && !collapsed {
+                        div()
+                            .px(px(10.0))
+                            .py(px(14.0))
+                            .text_size(px(12.5))
+                            .text_color(theme.sidebar_text_tertiary)
+                            .child("No sessions here yet. Click + to start a new chat.")
+                            .into_any_element()
+                    } else {
+                        let theme_u = theme;
+                        let active_sid_u = active_session_id.clone();
+                        let active_board_u = active_board_slug.clone();
+                        uniform_list(
+                            "sidebar-sessions-uniform",
+                            total_sessions_count,
+                            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                                let mut out = Vec::with_capacity(range.len());
+                                for idx in range {
+                                    if let Some(sess) = this.visible_sessions.get(idx).cloned() {
+                                        out.push(this.render_session_row(
+                                            &sess,
+                                            &theme_u,
+                                            collapsed,
+                                            active_view,
+                                            active_sid_u.as_deref(),
+                                            active_streaming,
+                                            active_bot_state,
+                                            &active_board_u,
+                                            tick,
+                                            cx,
+                                        ));
+                                    }
+                                }
+                                out
+                            }),
                         )
+                        .size_full()
+                        .track_scroll(&self.session_scroll)
+                        .into_any_element()
                     })
-                    .children(recent.iter().map(|sess| {
-                        self.render_session_row(
-                            sess,
-                            &theme,
-                            collapsed,
-                            active_view,
-                            active_session_id.as_deref(),
-                            active_streaming,
-                            active_bot_state,
-                            &active_board_slug,
-                            tick,
-                            cx,
-                        )
-                    }))
-                    .when(recent.is_empty() && !collapsed, |d| {
-                        d.child(
-                            div()
-                                .px(px(10.0))
-                                .py(px(14.0))
-                                .text_size(px(12.5))
-                                .text_color(theme.sidebar_text_tertiary)
-                                .child("No sessions here yet. Click + to start a new chat."),
-                        )
-                    }),
+                    .vertical_scrollbar(&self.session_scroll)
+                    .child(smooth_scroll_layer(&self.session_smooth)),
             )
             // Navigation Dock (exact Grok Bot pills, without Work)
             .child(

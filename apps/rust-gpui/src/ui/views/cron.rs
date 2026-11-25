@@ -1,11 +1,13 @@
-use crate::state::app_state::AppState;
+use crate::state::app_state::{AppState, AppViewId};
 use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_row, gb_section_card, BadgeTone, BtnVariant, FONT_MONO,
     FONT_SANS,
 };
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_component::scroll::ScrollableElement;
 
 pub struct CronView {
     app: Entity<AppState>,
@@ -13,6 +15,8 @@ pub struct CronView {
     name_input: Entity<InputState>,
     schedule_input: Entity<InputState>,
     prompt_input: Entity<TextareaState>,
+    scroll_handle: ScrollHandle,
+    smooth_scroller: SmoothScroller,
 }
 
 impl CronView {
@@ -29,13 +33,22 @@ impl CronView {
                 .placeholder("What should Hermes do when triggered?")
                 .rows(4)
         });
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).active_view == AppViewId::Cron {
+                cx.notify();
+            }
+        })
+        .detach();
+        let scroll_handle = ScrollHandle::new();
+        let smooth_scroller = SmoothScroller::for_handle(scroll_handle.clone());
         Self {
             app,
             modal_open: false,
             name_input,
             schedule_input,
             prompt_input,
+            scroll_handle,
+            smooth_scroller,
         }
     }
 }
@@ -85,11 +98,17 @@ impl Render for CronView {
             )
             .child(
                 div()
-                    .id("cron-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(24.0))
+                    .w_full()
+                    .relative()
+                    .child(
+                        div()
+                            .id("cron-scroll")
+                            .track_scroll(&self.scroll_handle)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .px(px(24.0))
                     .py(px(20.0))
                     .flex()
                     .justify_center()
@@ -249,6 +268,9 @@ impl Render for CronView {
                                     .collect()
                             })),
                     ),
+                    )
+                    .vertical_scrollbar(&self.scroll_handle)
+                    .child(smooth_scroll_layer(&self.smooth_scroller)),
             )
             .when(self.modal_open, |d| {
                 d.child(deferred(

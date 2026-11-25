@@ -17,30 +17,35 @@ use crate::ui::views::skills::SkillsView;
 use crate::ui::welcome::WelcomeView;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct HermesShell {
     app: Entity<AppState>,
     focus_handle: FocusHandle,
     last_theme_mode: Option<ThemeMode>,
+    anim_frame_scheduled: bool,
+    last_anim_tick: Instant,
 
+    // Always-hot primary views
     welcome: Entity<WelcomeView>,
     sidebar: Entity<SidebarView>,
     chat: Entity<ChatView>,
-    boards: Entity<BoardsView>,
-    skills: Entity<SkillsView>,
-    cron: Entity<CronView>,
-    memory: Entity<MemoryView>,
-    gateway: Entity<GatewayView>,
-    analytics: Entity<AnalyticsView>,
-    settings: Entity<SettingsView>,
-    right_pane: Entity<RightSidePaneView>,
 
-    model_picker: Entity<ModelPickerModal>,
-    avatar_editor: Entity<AvatarEditorModal>,
-    command_palette: Entity<CommandPaletteModal>,
+    // Lazily constructed on first visit so hidden views & PTYs cost 0 CPU & 0 RAM at startup
+    boards: Option<Entity<BoardsView>>,
+    skills: Option<Entity<SkillsView>>,
+    cron: Option<Entity<CronView>>,
+    memory: Option<Entity<MemoryView>>,
+    gateway: Option<Entity<GatewayView>>,
+    analytics: Option<Entity<AnalyticsView>>,
+    settings: Option<Entity<SettingsView>>,
+    right_pane: Option<Entity<RightSidePaneView>>,
 
-    _anim_task: Task<()>,
+    model_picker: Option<Entity<ModelPickerModal>>,
+    avatar_editor: Option<Entity<AvatarEditorModal>>,
+    command_palette: Option<Entity<CommandPaletteModal>>,
+
+    _toast_task: Option<Task<()>>,
 }
 
 impl HermesShell {
@@ -49,25 +54,34 @@ impl HermesShell {
         let welcome = cx.new(|cx| WelcomeView::new(app.clone(), window, cx));
         let sidebar = cx.new(|cx| SidebarView::new(app.clone(), window, cx));
         let chat = cx.new(|cx| ChatView::new(app.clone(), window, cx));
-        let boards = cx.new(|cx| BoardsView::new(app.clone(), window, cx));
-        let skills = cx.new(|cx| SkillsView::new(app.clone(), window, cx));
-        let cron = cx.new(|cx| CronView::new(app.clone(), window, cx));
-        let memory = cx.new(|cx| MemoryView::new(app.clone(), window, cx));
-        let gateway = cx.new(|cx| GatewayView::new(app.clone(), window, cx));
-        let analytics = cx.new(|cx| AnalyticsView::new(app.clone(), window, cx));
-        let settings = cx.new(|cx| SettingsView::new(app.clone(), window, cx));
-        let right_pane = cx.new(|cx| RightSidePaneView::new(app.clone(), window, cx));
 
-        let model_picker = cx.new(|cx| ModelPickerModal::new(app.clone(), window, cx));
-        let avatar_editor = cx.new(|cx| AvatarEditorModal::new(app.clone(), window, cx));
-        let command_palette = cx.new(|cx| CommandPaletteModal::new(app.clone(), window, cx));
-
-        // Observe AppState changes and sync gpui-component ThemeMode cleanly
+        // Observe AppState changes, sync gpui-component ThemeMode, and manage toast auto-dismiss
         cx.observe(&app, |this, app_entity, cx| {
-            let mode = app_entity.read(cx).theme_mode();
+            let (mode, has_toast) = {
+                let s = app_entity.read(cx);
+                (s.theme_mode(), s.toast.is_some())
+            };
             if this.last_theme_mode != Some(mode) {
                 this.last_theme_mode = Some(mode);
                 sync_gpui_component_theme(mode, cx);
+            }
+            if has_toast && this._toast_task.is_none() {
+                let app_toast = app_entity.clone();
+                this._toast_task = Some(cx.spawn(async move |shell, cx| {
+                    cx.background_executor().timer(Duration::from_secs(4)).await;
+                    let _ = shell.update(cx, |v, cx| {
+                        v._toast_task = None;
+                        app_toast.update(cx, |s, cx| {
+                            if s.toast
+                                .as_ref()
+                                .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(3))
+                            {
+                                s.toast = None;
+                                cx.notify();
+                            }
+                        });
+                    });
+                }));
             }
             cx.notify();
         })
@@ -75,37 +89,6 @@ impl HermesShell {
 
         let initial_mode = app.read(cx).theme_mode();
         sync_gpui_component_theme(initial_mode, cx);
-
-        // Background animation ticker for morphing bot faces & toast auto-dismissal
-        let app_anim = app.clone();
-        let anim_task = cx.spawn(async move |_, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(450))
-                    .await;
-                app_anim.update(cx, |s, cx| {
-                    let any_streaming = s.chats.values().any(|c| c.is_streaming);
-                    let toast_expired = s
-                        .toast
-                        .as_ref()
-                        .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(4));
-                    let need_anim =
-                        any_streaming || s.avatar_editor_target.is_some() || s.initializing;
-                    let mut changed = false;
-                    if toast_expired {
-                        s.toast = None;
-                        changed = true;
-                    }
-                    if need_anim {
-                        s.anim_tick = s.anim_tick.wrapping_add(1);
-                        changed = true;
-                    }
-                    if changed {
-                        cx.notify();
-                    }
-                });
-            }
-        });
 
         // Kick off saved connection bootstrap
         app.update(cx, |s, cx| {
@@ -116,22 +99,56 @@ impl HermesShell {
             app,
             focus_handle,
             last_theme_mode: Some(initial_mode),
+            anim_frame_scheduled: false,
+            last_anim_tick: Instant::now(),
             welcome,
             sidebar,
             chat,
-            boards,
-            skills,
-            cron,
-            memory,
-            gateway,
-            analytics,
-            settings,
-            right_pane,
-            model_picker,
-            avatar_editor,
-            command_palette,
-            _anim_task: anim_task,
+            boards: None,
+            skills: None,
+            cron: None,
+            memory: None,
+            gateway: None,
+            analytics: None,
+            settings: None,
+            right_pane: None,
+            model_picker: None,
+            avatar_editor: None,
+            command_palette: None,
+            _toast_task: None,
         }
+    }
+
+    fn schedule_anim_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.anim_frame_scheduled {
+            return;
+        }
+        self.anim_frame_scheduled = true;
+        let weak_self = cx.weak_entity();
+        window.on_next_frame(move |window, cx| {
+            let _ = weak_self.update(cx, |this, cx| {
+                this.anim_frame_scheduled = false;
+                let need_anim = {
+                    let s = this.app.read(cx);
+                    s.chats.values().any(|c| c.is_streaming)
+                        || s.avatar_editor_target.is_some()
+                        || s.initializing
+                };
+                if !need_anim {
+                    return;
+                }
+                // Advance morph frame smoothly at compositor VSync cadence (~12Hz SVG frame swap,
+                // keeping full VSync smoothness without excessive state churn)
+                if this.last_anim_tick.elapsed() >= Duration::from_millis(220) {
+                    this.last_anim_tick = Instant::now();
+                    this.app.update(cx, |s, cx| {
+                        s.anim_tick = s.anim_tick.wrapping_add(1);
+                        cx.notify();
+                    });
+                }
+                this.schedule_anim_frame(window, cx);
+            });
+        });
     }
 
     fn handle_global_key(
@@ -214,7 +231,7 @@ fn sync_gpui_component_theme(mode: ThemeMode, cx: &mut App) {
 }
 
 impl Render for HermesShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (
             theme,
             setup_open,
@@ -225,8 +242,12 @@ impl Render for HermesShell {
             avatar_editor_open,
             command_palette_open,
             toast_msg,
+            need_anim,
         ) = {
             let s = self.app.read(cx);
+            let need_anim = s.chats.values().any(|c| c.is_streaming)
+                || s.avatar_editor_target.is_some()
+                || s.initializing;
             (
                 s.sand_theme(),
                 s.setup_open,
@@ -237,18 +258,100 @@ impl Render for HermesShell {
                 s.avatar_editor_target.is_some(),
                 s.command_palette_open,
                 s.toast.as_ref().map(|(m, _)| m.clone()),
+                need_anim,
             )
         };
 
+        if need_anim {
+            self.schedule_anim_frame(window, cx);
+        }
+
+        let app = self.app.clone();
         let center_content: AnyElement = match active_view {
             AppViewId::Chat => self.chat.clone().into_any_element(),
-            AppViewId::Boards => self.boards.clone().into_any_element(),
-            AppViewId::Skills => self.skills.clone().into_any_element(),
-            AppViewId::Cron => self.cron.clone().into_any_element(),
-            AppViewId::Memory => self.memory.clone().into_any_element(),
-            AppViewId::Gateway => self.gateway.clone().into_any_element(),
-            AppViewId::Analytics => self.analytics.clone().into_any_element(),
-            AppViewId::Settings => self.settings.clone().into_any_element(),
+            AppViewId::Boards => self
+                .boards
+                .get_or_insert_with(|| cx.new(|cx| BoardsView::new(app.clone(), window, cx)))
+                .clone()
+                .into_any_element(),
+            AppViewId::Skills => self
+                .skills
+                .get_or_insert_with(|| cx.new(|cx| SkillsView::new(app.clone(), window, cx)))
+                .clone()
+                .into_any_element(),
+            AppViewId::Cron => self
+                .cron
+                .get_or_insert_with(|| cx.new(|cx| CronView::new(app.clone(), window, cx)))
+                .clone()
+                .into_any_element(),
+            AppViewId::Memory => self
+                .memory
+                .get_or_insert_with(|| cx.new(|cx| MemoryView::new(app.clone(), window, cx)))
+                .clone()
+                .into_any_element(),
+            AppViewId::Gateway => self
+                .gateway
+                .get_or_insert_with(|| cx.new(|cx| GatewayView::new(app.clone(), window, cx)))
+                .clone()
+                .into_any_element(),
+            AppViewId::Analytics => self
+                .analytics
+                .get_or_insert_with(|| cx.new(|cx| AnalyticsView::new(app.clone(), window, cx)))
+                .clone()
+                .into_any_element(),
+            AppViewId::Settings => self
+                .settings
+                .get_or_insert_with(|| cx.new(|cx| SettingsView::new(app.clone(), window, cx)))
+                .clone()
+                .into_any_element(),
+        };
+
+        let right_pane_el = if right_pane_open {
+            Some(
+                self.right_pane
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| RightSidePaneView::new(app.clone(), window, cx))
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
+        let model_picker_el = if model_picker_open {
+            Some(
+                self.model_picker
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| ModelPickerModal::new(app.clone(), window, cx))
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
+        let avatar_editor_el = if avatar_editor_open {
+            Some(
+                self.avatar_editor
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| AvatarEditorModal::new(app.clone(), window, cx))
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
+        let command_palette_el = if command_palette_open {
+            Some(
+                self.command_palette
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| CommandPaletteModal::new(app.clone(), window, cx))
+                    })
+                    .clone(),
+            )
+        } else {
+            None
         };
 
         div()
@@ -281,15 +384,13 @@ impl Render for HermesShell {
                             .overflow_hidden()
                             .child(center_content),
                     )
-                    .when(right_pane_open, |d| d.child(self.right_pane.clone()))
+                    .when_some(right_pane_el, |d, rp| d.child(rp))
                     .into_any_element()
             })
-            // Global Modals
-            .when(model_picker_open, |d| d.child(self.model_picker.clone()))
-            .when(avatar_editor_open, |d| d.child(self.avatar_editor.clone()))
-            .when(command_palette_open, |d| {
-                d.child(self.command_palette.clone())
-            })
+            // Global Modals (lazily initialized on first open)
+            .when_some(model_picker_el, |d, m| d.child(m))
+            .when_some(avatar_editor_el, |d, m| d.child(m))
+            .when_some(command_palette_el, |d, m| d.child(m))
             // Floating bottom-right Toast notification
             .when_some(toast_msg, |d, msg| {
                 d.child(

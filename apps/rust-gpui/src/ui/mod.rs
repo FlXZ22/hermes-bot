@@ -4,5 +4,6 @@ pub mod markdown;
 pub mod modals;
 pub mod shell;
 pub mod sidebar;
+pub mod smooth_scroll;
 pub mod views;
 pub mod welcome;

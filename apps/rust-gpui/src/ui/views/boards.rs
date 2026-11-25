@@ -1,14 +1,16 @@
 use crate::hermes::types::{HermesKanbanStatus, HermesKanbanTask};
-use crate::state::app_state::AppState;
+use crate::state::app_state::{AppState, AppViewId};
 use crate::theme::bot_face::{bot_face, BotFaceState};
 use crate::theme::components::{
     cursor_icon, format_relative_time, gb_badge, gb_board_pill, gb_btn, gb_dot, gb_mini_icon_btn,
     gb_segmented_item, gb_segmented_shell, short_model_name, BadgeTone, BtnVariant, FONT_SANS,
 };
 use crate::theme::tokens::{resolve_bot_color, SandTheme};
+use crate::ui::smooth_scroll::{smooth_scroll_layer, smooth_scroll_layer_xy, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_component::scroll::ScrollableElement;
 use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +43,10 @@ pub struct BoardsView {
     new_board_desc: Entity<InputState>,
     new_board_path: Entity<InputState>,
     new_board_color: String,
+    kanban_scroll: ScrollHandle,
+    kanban_smooth: SmoothScroller,
+    sessions_scroll: ScrollHandle,
+    sessions_smooth: SmoothScroller,
 }
 
 impl BoardsView {
@@ -66,7 +72,17 @@ impl BoardsView {
         let new_board_path =
             cx.new(|cx| InputState::new(window, cx).placeholder("/home/metis/Projects/..."));
 
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).active_view == AppViewId::Boards {
+                cx.notify();
+            }
+        })
+        .detach();
+
+        let kanban_scroll = ScrollHandle::new();
+        let kanban_smooth = SmoothScroller::for_handle(kanban_scroll.clone());
+        let sessions_scroll = ScrollHandle::new();
+        let sessions_smooth = SmoothScroller::for_handle(sessions_scroll.clone());
 
         Self {
             app,
@@ -86,6 +102,10 @@ impl BoardsView {
             new_board_desc,
             new_board_path,
             new_board_color: "violet".into(),
+            kanban_scroll,
+            kanban_smooth,
+            sessions_scroll,
+            sessions_smooth,
         }
     }
 
@@ -417,12 +437,17 @@ impl Render for BoardsView {
             // Body: Kanban columns OR Sessions grid
             .child(if self.mode == BoardsMode::Kanban {
                 div()
-                    .id("kanban-cols-scroll")
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .overflow_x_scroll()
-                    .px(px(20.0))
+                    .relative()
+                    .child(
+                        div()
+                            .id("kanban-cols-scroll")
+                            .track_scroll(&self.kanban_scroll)
+                            .size_full()
+                            .overflow_x_scroll()
+                            .px(px(20.0))
                     .py(px(16.0))
                     .flex()
                     .gap(px(12.0))
@@ -647,14 +672,23 @@ impl Render for BoardsView {
                                     }),
                             )
                     }))
+                    )
+                    .horizontal_scrollbar(&self.kanban_scroll)
+                    .child(smooth_scroll_layer_xy(&self.kanban_smooth))
                     .into_any_element()
             } else {
                 div()
-                    .id("board-sessions-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .p(px(24.0))
+                    .w_full()
+                    .relative()
+                    .child(
+                        div()
+                            .id("board-sessions-scroll")
+                            .track_scroll(&self.sessions_scroll)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .p(px(24.0))
                     .flex()
                     .justify_center()
                     .child(
@@ -743,6 +777,9 @@ impl Render for BoardsView {
                                     )
                             })),
                     )
+                    )
+                    .vertical_scrollbar(&self.sessions_scroll)
+                    .child(smooth_scroll_layer(&self.sessions_smooth))
                     .into_any_element()
             })
             // Task Editor Modal

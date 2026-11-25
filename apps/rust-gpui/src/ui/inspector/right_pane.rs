@@ -5,9 +5,11 @@ use crate::theme::components::{
     gb_segmented_item, gb_segmented_shell, BadgeTone, BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::ui::inspector::terminal_view::TerminalView;
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::scroll::ScrollableElement;
 use std::path::Path;
 
 pub struct RightSidePaneView {
@@ -18,6 +20,14 @@ pub struct RightSidePaneView {
     synced_cwd: String,
     synced_soul: String,
     width_px: f32,
+    files_scroll: ScrollHandle,
+    files_smooth: SmoothScroller,
+    preview_scroll: ScrollHandle,
+    preview_smooth: SmoothScroller,
+    git_scroll: ScrollHandle,
+    git_smooth: SmoothScroller,
+    bot_scroll: ScrollHandle,
+    bot_smooth: SmoothScroller,
 }
 
 impl RightSidePaneView {
@@ -55,7 +65,20 @@ impl RightSidePaneView {
         })
         .detach();
 
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).right_pane_open {
+                cx.notify();
+            }
+        })
+        .detach();
+        let files_scroll = ScrollHandle::new();
+        let files_smooth = SmoothScroller::for_handle(files_scroll.clone());
+        let preview_scroll = ScrollHandle::new();
+        let preview_smooth = SmoothScroller::for_handle(preview_scroll.clone());
+        let git_scroll = ScrollHandle::new();
+        let git_smooth = SmoothScroller::for_handle(git_scroll.clone());
+        let bot_scroll = ScrollHandle::new();
+        let bot_smooth = SmoothScroller::for_handle(bot_scroll.clone());
         Self {
             app,
             terminal,
@@ -64,6 +87,14 @@ impl RightSidePaneView {
             synced_cwd: cwd,
             synced_soul: soul,
             width_px: 380.0,
+            files_scroll,
+            files_smooth,
+            preview_scroll,
+            preview_smooth,
+            git_scroll,
+            git_smooth,
+            bot_scroll,
+            bot_smooth,
         }
     }
 
@@ -334,23 +365,40 @@ impl Render for RightSidePaneView {
                                 )
                                 .child(
                                     div()
-                                        .id("files-preview-scroll")
                                         .flex_1()
-                                        .overflow_y_scroll()
-                                        .p(px(12.0))
-                                        .bg(theme.bg_tertiary)
-                                        .font_family(FONT_MONO)
-                                        .text_size(px(11.5))
-                                        .text_color(theme.text_primary)
-                                        .child(preview_content),
+                                        .min_h_0()
+                                        .w_full()
+                                        .relative()
+                                        .child(
+                                            div()
+                                                .id("files-preview-scroll")
+                                                .track_scroll(&self.preview_scroll)
+                                                .size_full()
+                                                .overflow_y_scroll()
+                                                .p(px(12.0))
+                                                .bg(theme.bg_tertiary)
+                                                .font_family(FONT_MONO)
+                                                .text_size(px(11.5))
+                                                .text_color(theme.text_primary)
+                                                .child(preview_content),
+                                        )
+                                        .vertical_scrollbar(&self.preview_scroll)
+                                        .child(smooth_scroll_layer(&self.preview_smooth)),
                                 )
                                 .into_any_element()
                         } else {
                             div()
-                                .id("files-list-scroll")
                                 .flex_1()
-                                .overflow_y_scroll()
-                                .p(px(6.0))
+                                .min_h_0()
+                                .w_full()
+                                .relative()
+                                .child(
+                                    div()
+                                        .id("files-list-scroll")
+                                        .track_scroll(&self.files_scroll)
+                                        .size_full()
+                                        .overflow_y_scroll()
+                                        .p(px(6.0))
                                 .flex()
                                 .flex_col()
                                 .gap(px(1.0))
@@ -425,6 +473,9 @@ impl Render for RightSidePaneView {
                                             )
                                         })
                                 }))
+                                )
+                                .vertical_scrollbar(&self.files_scroll)
+                                .child(smooth_scroll_layer(&self.files_smooth))
                                 .into_any_element()
                         })
                         .into_any_element()
@@ -437,10 +488,17 @@ impl Render for RightSidePaneView {
                     .into_any_element(),
                 RightPaneTabId::Git => {
                     div()
-                        .id("git-scroll")
                         .flex_1()
-                        .overflow_y_scroll()
-                        .p(px(12.0))
+                        .min_h_0()
+                        .w_full()
+                        .relative()
+                        .child(
+                            div()
+                                .id("git-scroll")
+                                .track_scroll(&self.git_scroll)
+                                .size_full()
+                                .overflow_y_scroll()
+                                .p(px(12.0))
                         .flex()
                         .flex_col()
                         .gap(px(12.0))
@@ -604,6 +662,9 @@ impl Render for RightSidePaneView {
                                 )
                             })
                         })
+                        )
+                        .vertical_scrollbar(&self.git_scroll)
+                        .child(smooth_scroll_layer(&self.git_smooth))
                         .into_any_element()
                 }
                 RightPaneTabId::Bot => {
@@ -614,10 +675,17 @@ impl Render for RightSidePaneView {
                         .unwrap_or_else(|| active_profile.clone());
                     let title_edit = display_name.clone();
                     div()
-                        .id("bot-inspector-scroll")
                         .flex_1()
-                        .overflow_y_scroll()
-                        .p(px(14.0))
+                        .min_h_0()
+                        .w_full()
+                        .relative()
+                        .child(
+                            div()
+                                .id("bot-inspector-scroll")
+                                .track_scroll(&self.bot_scroll)
+                                .size_full()
+                                .overflow_y_scroll()
+                                .p(px(14.0))
                         .flex()
                         .flex_col()
                         .gap(px(14.0))
@@ -766,6 +834,9 @@ impl Render for RightSidePaneView {
                                         }),
                                 ),
                         )
+                        )
+                        .vertical_scrollbar(&self.bot_scroll)
+                        .child(smooth_scroll_layer(&self.bot_smooth))
                         .into_any_element()
                 }
             })

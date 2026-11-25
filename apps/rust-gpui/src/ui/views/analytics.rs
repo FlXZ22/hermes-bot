@@ -1,19 +1,34 @@
-use crate::state::app_state::AppState;
+use crate::state::app_state::{AppState, AppViewId};
 use crate::theme::components::{
     cursor_icon, format_tokens, gb_btn, gb_section_card, gb_section_card_head, short_model_name,
     BtnVariant, FONT_MONO, FONT_SANS,
 };
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::*;
+use gpui_component::scroll::ScrollableElement;
 use std::collections::HashMap;
 
 pub struct AnalyticsView {
     app: Entity<AppState>,
+    scroll_handle: ScrollHandle,
+    smooth_scroller: SmoothScroller,
 }
 
 impl AnalyticsView {
     pub fn new(app: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
-        Self { app }
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).active_view == AppViewId::Analytics {
+                cx.notify();
+            }
+        })
+        .detach();
+        let scroll_handle = ScrollHandle::new();
+        let smooth_scroller = SmoothScroller::for_handle(scroll_handle.clone());
+        Self {
+            app,
+            scroll_handle,
+            smooth_scroller,
+        }
     }
 }
 
@@ -88,10 +103,17 @@ impl Render for AnalyticsView {
             .font_family(FONT_SANS)
             .child(
                 div()
-                    .id("analytics-scroll")
                     .flex_1()
-                    .overflow_y_scroll()
-                    .p(px(28.0))
+                    .min_h_0()
+                    .w_full()
+                    .relative()
+                    .child(
+                        div()
+                            .id("analytics-scroll")
+                            .track_scroll(&self.scroll_handle)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .p(px(28.0))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -341,6 +363,9 @@ impl Render for AnalyticsView {
                                     }),
                             ),
                     ),
+                    )
+                    .vertical_scrollbar(&self.scroll_handle)
+                    .child(smooth_scroll_layer(&self.smooth_scroller)),
             )
     }
 }

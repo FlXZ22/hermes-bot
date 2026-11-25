@@ -1,13 +1,15 @@
 use crate::hermes::types::HermesMcpServer;
-use crate::state::app_state::AppState;
+use crate::state::app_state::{AppState, AppViewId};
 use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_mini_icon_btn, gb_row, gb_section_card, gb_segmented_item,
     gb_segmented_shell, gb_toggle_switch, BadgeTone, BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::theme::tokens::SandTheme;
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::scroll::ScrollableElement;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,8 @@ pub struct SkillsView {
     mcp_command: Entity<InputState>,
     mcp_args: Entity<InputState>,
     mcp_url: Entity<InputState>,
+    scroll_handle: ScrollHandle,
+    smooth_scroller: SmoothScroller,
 }
 
 impl SkillsView {
@@ -55,7 +59,12 @@ impl SkillsView {
         });
         let mcp_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://..."));
 
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).active_view == AppViewId::Skills {
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe(&search_input, |_, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 cx.notify();
@@ -68,6 +77,9 @@ impl SkillsView {
             }
         })
         .detach();
+
+        let scroll_handle = ScrollHandle::new();
+        let smooth_scroller = SmoothScroller::for_handle(scroll_handle.clone());
 
         Self {
             app,
@@ -84,6 +96,8 @@ impl SkillsView {
             mcp_command,
             mcp_args,
             mcp_url,
+            scroll_handle,
+            smooth_scroller,
         }
     }
 
@@ -259,11 +273,17 @@ impl Render for SkillsView {
             // Body
             .child(
                 div()
-                    .id("skills-body-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(24.0))
+                    .w_full()
+                    .relative()
+                    .child(
+                        div()
+                            .id("skills-body-scroll")
+                            .track_scroll(&self.scroll_handle)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .px(px(24.0))
                     .py(px(20.0))
                     .flex()
                     .justify_center()
@@ -687,6 +707,9 @@ impl Render for SkillsView {
                                 ))
                             }),
                     ),
+                    )
+                    .vertical_scrollbar(&self.scroll_handle)
+                    .child(smooth_scroll_layer(&self.smooth_scroller)),
             )
             // Skill editor modal
             .when_some(self.editing_skill.clone(), |d, sk_name| {

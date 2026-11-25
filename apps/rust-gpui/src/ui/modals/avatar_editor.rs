@@ -30,7 +30,12 @@ pub struct AvatarEditorModal {
 impl AvatarEditorModal {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Bot name"));
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).avatar_editor_target.is_some() {
+                cx.notify();
+            }
+        })
+        .detach();
         Self {
             app,
             synced_seed: None,

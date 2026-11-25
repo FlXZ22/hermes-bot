@@ -11,9 +11,11 @@ use crate::theme::components::{
 };
 use crate::theme::tokens::{resolve_bot_color, SandTheme};
 use crate::ui::markdown::{render_code_block, render_markdown};
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::scroll::ScrollableElement;
 use std::collections::HashSet;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -65,7 +67,12 @@ pub struct ChatView {
     expanded_thinking: HashSet<String>,
     expanded_tools: HashSet<String>,
     collapsed_groups: HashSet<String>,
-    scroll_handle: ScrollHandle,
+    // Virtualized Zed ListState + 120Hz smooth scroller for chat transcript
+    list_state: ListState,
+    smooth_scroller: SmoothScroller,
+    synced_session_id: Option<String>,
+    synced_item_count: usize,
+    synced_last_fp: (usize, usize, bool),
 }
 
 impl ChatView {
@@ -78,7 +85,12 @@ impl ChatView {
         });
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Session title"));
 
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).active_view == crate::state::app_state::AppViewId::Chat {
+                cx.notify();
+            }
+        })
+        .detach();
 
         cx.subscribe_in(&composer, window, |this, state, ev: &InputEvent, window, cx| {
             match ev {
@@ -112,6 +124,17 @@ impl ChatView {
         })
         .detach();
 
+        let list_state = ListState::new(0, ListAlignment::Top, px(400.0));
+        list_state.set_follow_mode(FollowMode::Tail);
+        let weak_self = cx.weak_entity();
+        list_state.set_scroll_handler(move |_, _, cx| {
+            let weak_self = weak_self.clone();
+            cx.defer(move |cx| {
+                let _ = weak_self.update(cx, |_, cx| cx.notify());
+            });
+        });
+        let smooth_scroller = SmoothScroller::for_list(list_state.clone());
+
         Self {
             app,
             composer,
@@ -122,7 +145,11 @@ impl ChatView {
             expanded_thinking: HashSet::new(),
             expanded_tools: HashSet::new(),
             collapsed_groups: HashSet::new(),
-            scroll_handle: ScrollHandle::new(),
+            list_state,
+            smooth_scroller,
+            synced_session_id: None,
+            synced_item_count: 0,
+            synced_last_fp: (0, 0, false),
         }
     }
 
@@ -134,7 +161,9 @@ impl ChatView {
         self.composer
             .update(cx, |st, cx| st.set_value("", window, cx));
         self.app.update(cx, |s, cx| s.send_message(text, cx));
-        self.scroll_handle.scroll_to_bottom();
+        self.smooth_scroller.cancel();
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        self.list_state.scroll_to_end();
         cx.notify();
     }
 
@@ -532,6 +561,7 @@ impl Render for ChatView {
                                             .bg(theme.bg_elevated)
                                             .border_1()
                                             .border_color(theme.border_default)
+                                            .overflow_hidden()
                                             .flex()
                                             .flex_col()
                                             .gap(px(3.0))
@@ -546,6 +576,8 @@ impl Render for ChatView {
                                             }))
                                             .child(
                                                 div()
+                                                    .w_full()
+                                                    .min_w_0()
                                                     .flex()
                                                     .items_center()
                                                     .gap(px(6.0))
@@ -553,7 +585,15 @@ impl Render for ChatView {
                                                     .font_weight(FontWeight::MEDIUM)
                                                     .text_color(theme.text_primary)
                                                     .child(cursor_icon(icon, 14.0, theme.text_primary))
-                                                    .child(title),
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .overflow_hidden()
+                                                            .text_ellipsis()
+                                                            .whitespace_nowrap()
+                                                            .child(title),
+                                                    ),
                                             )
                                             .child(
                                                 div()
@@ -1007,7 +1047,7 @@ impl Render for ChatView {
 impl ChatView {
     #[allow(clippy::too_many_arguments)]
     fn render_transcript(
-        &self,
+        &mut self,
         theme: &SandTheme,
         chat: &crate::state::app_state::SessionChatState,
         bot_seed: &str,
@@ -1016,7 +1056,7 @@ impl ChatView {
         bot_state: BotFaceState,
         tick: u64,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let has_inline_activity = chat.messages.last().is_some_and(|m| {
             m.streaming
                 && ((m.thinking.is_some() && m.content.is_empty())
@@ -1025,41 +1065,95 @@ impl ChatView {
                         .any(|t| t.status == ToolCallStatus::Running))
         });
 
+        let has_older = chat.older_offset.is_some();
+        let has_todos = !chat.todos.is_empty();
+        let has_pending = chat.is_streaming && !has_inline_activity;
+        let msg_start = usize::from(has_older) + usize::from(has_todos);
+        let msg_count = chat.messages.len();
+        let total_items = msg_start + msg_count + usize::from(has_pending) + 1;
+
+        let active_sid = self.app.read(cx).active_session_id.clone();
+        let last_fp = chat
+            .messages
+            .last()
+            .map(|m| {
+                (
+                    m.content.len() + m.thinking.as_ref().map_or(0, String::len),
+                    m.tool_calls.len(),
+                    m.streaming,
+                )
+            })
+            .unwrap_or((0, 0, false));
+
+        if self.synced_session_id != active_sid {
+            self.synced_session_id = active_sid;
+            self.synced_item_count = total_items;
+            self.synced_last_fp = last_fp;
+            self.smooth_scroller.cancel();
+            self.list_state.reset(total_items);
+            self.list_state.set_follow_mode(FollowMode::Tail);
+            self.list_state.scroll_to_end();
+        } else if total_items != self.synced_item_count {
+            let old = self.synced_item_count;
+            self.synced_item_count = total_items;
+            self.synced_last_fp = last_fp;
+            if total_items > old && old >= 2 {
+                // Incremental tail splice preserves scroll anchor & cached item heights!
+                let insert_at = old - 1;
+                let added = total_items - old;
+                self.list_state.splice(insert_at..insert_at, added);
+                if insert_at > 0 {
+                    self.list_state.remeasure_items((insert_at - 1)..insert_at);
+                }
+            } else {
+                self.list_state.reset(total_items);
+            }
+        } else if last_fp != self.synced_last_fp {
+            self.synced_last_fp = last_fp;
+            if msg_count > 0 {
+                let last_msg_ix = msg_start + msg_count - 1;
+                self.list_state
+                    .remeasure_items(last_msg_ix..(last_msg_ix + 1));
+            }
+        }
+
+        let is_scrolled_up = self.list_state.max_offset_for_scrollbar().y > px(40.0)
+            && !self.list_state.is_following_tail()
+            && !self.list_state.is_scrolled_to_end().unwrap_or(true);
+
+        let theme_copy = *theme;
+        let bot_seed_owned = bot_seed.to_string();
+        let shape_owned = shape_id.map(str::to_string);
+        let color_owned = color_id.map(str::to_string);
+        let messages = chat.messages.clone();
+        let todos = chat.todos.clone();
+        let loading_history = chat.loading_history;
+        let live_status_text = chat.live_status_text.clone();
+
         div()
-            .id("chat-transcript-scroll")
-            .track_scroll(&self.scroll_handle)
             .flex_1()
             .min_h_0()
             .w_full()
-            .overflow_y_scroll()
-            .px(px(24.0))
-            .py(px(14.0))
-            .flex()
-            .flex_col()
-            .items_center()
+            .relative()
             .child(
-                div()
-                    .w(px(740.0))
-                    .max_w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(14.0))
-                    // Load older messages button
-                    .when(chat.older_offset.is_some(), |d| {
-                        d.child(
+                list(
+                    self.list_state.clone(),
+                    cx.processor(move |this, idx: usize, _window, cx| {
+                        let inner: AnyElement = if has_older && idx == 0 {
                             div()
                                 .w_full()
+                                .pb(px(14.0))
                                 .flex()
                                 .justify_center()
                                 .child(
                                     gb_btn(
                                         "load-older-msgs",
-                                        theme,
+                                        &theme_copy,
                                         BtnVariant::Secondary,
                                         true,
-                                        chat.loading_history,
+                                        loading_history,
                                     )
-                                    .child(if chat.loading_history {
+                                    .child(if loading_history {
                                         "Loading…"
                                     } else {
                                         "Load older messages"
@@ -1067,84 +1161,104 @@ impl ChatView {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.app.update(cx, |s, cx| s.load_older_messages(cx));
                                     })),
-                                ),
-                        )
-                    })
-                    // Live Agent Plan Todo Checklist
-                    .when(!chat.todos.is_empty(), |d| {
-                        let done_count = chat
-                            .todos
-                            .iter()
-                            .filter(|t| t.status == "completed")
-                            .count();
-                        d.child(
-                            gb_section_card(theme)
-                                .child(
-                                    gb_section_card_head(theme).py(px(9.0)).px(px(13.0)).child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .text_size(px(12.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(cursor_icon("list-todo", 13.0, theme.text_primary))
-                                            .child(format!(
-                                                "Agent Plan ({done_count}/{})",
-                                                chat.todos.len()
-                                            )),
-                                    ),
                                 )
-                                .child(
-                                    div()
-                                        .px(px(13.0))
-                                        .py(px(8.0))
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(5.0))
-                                        .children(chat.todos.iter().map(|t| {
-                                            let (icon, col) = match t.status.as_str() {
-                                                "completed" => ("check-circle", theme.success_text),
-                                                "in_progress" => ("spinner", theme.accent_text),
-                                                _ => ("circle", theme.text_tertiary),
-                                            };
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(7.0))
-                                                .text_size(px(12.5))
-                                                .text_color(if t.status == "completed" {
-                                                    theme.text_tertiary
-                                                } else {
-                                                    theme.text_primary
-                                                })
-                                                .child(cursor_icon(icon, 13.0, col))
-                                                .child(t.content.clone())
-                                        })),
-                                ),
-                        )
-                    })
-                    // Messages
-                    .children(chat.messages.iter().map(|msg| {
-                        self.render_message(msg, theme, bot_seed, shape_id, color_id, tick, cx)
-                    }))
-                    // Pending indicator
-                    .when(chat.is_streaming && !has_inline_activity, |d| {
-                        let status_lbl = if chat.live_status_text.is_empty() {
-                            "Hermes is thinking".to_string()
-                        } else {
-                            chat.live_status_text.clone()
-                        };
-                        d.child(
+                                .into_any_element()
+                        } else if has_todos && idx == usize::from(has_older) {
+                            let done_count =
+                                todos.iter().filter(|t| t.status == "completed").count();
                             div()
+                                .w_full()
+                                .pb(px(14.0))
+                                .child(
+                                    gb_section_card(&theme_copy)
+                                        .child(
+                                            gb_section_card_head(&theme_copy)
+                                                .py(px(9.0))
+                                                .px(px(13.0))
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(6.0))
+                                                        .text_size(px(12.5))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child(cursor_icon(
+                                                            "list-todo",
+                                                            13.0,
+                                                            theme_copy.text_primary,
+                                                        ))
+                                                        .child(format!(
+                                                            "Agent Plan ({done_count}/{})",
+                                                            todos.len()
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(13.0))
+                                                .py(px(8.0))
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(5.0))
+                                                .children(todos.iter().map(|t| {
+                                                    let (icon, col) = match t.status.as_str() {
+                                                        "completed" => {
+                                                            ("check-circle", theme_copy.success_text)
+                                                        }
+                                                        "in_progress" => {
+                                                            ("spinner", theme_copy.accent_text)
+                                                        }
+                                                        _ => ("circle", theme_copy.text_tertiary),
+                                                    };
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(7.0))
+                                                        .text_size(px(12.5))
+                                                        .text_color(if t.status == "completed" {
+                                                            theme_copy.text_tertiary
+                                                        } else {
+                                                            theme_copy.text_primary
+                                                        })
+                                                        .child(cursor_icon(icon, 13.0, col))
+                                                        .child(t.content.clone())
+                                                })),
+                                        ),
+                                )
+                                .into_any_element()
+                        } else if idx >= msg_start && idx < msg_start + msg_count {
+                            let msg = &messages[idx - msg_start];
+                            div()
+                                .w_full()
+                                .pb(px(14.0))
+                                .child(this.render_message(
+                                    msg,
+                                    &theme_copy,
+                                    &bot_seed_owned,
+                                    shape_owned.as_deref(),
+                                    color_owned.as_deref(),
+                                    tick,
+                                    cx,
+                                ))
+                                .into_any_element()
+                        } else if has_pending && idx == msg_start + msg_count {
+                            let status_lbl = if live_status_text.is_empty() {
+                                "Hermes is thinking".to_string()
+                            } else {
+                                live_status_text.clone()
+                            };
+                            div()
+                                .w_full()
+                                .pb(px(14.0))
                                 .flex()
                                 .items_center()
                                 .gap(px(10.0))
                                 .py(px(4.0))
                                 .child(bot_face(
-                                    theme,
-                                    bot_seed,
-                                    shape_id,
-                                    color_id,
+                                    &theme_copy,
+                                    &bot_seed_owned,
+                                    shape_owned.as_deref(),
+                                    color_owned.as_deref(),
                                     28.0,
                                     bot_state,
                                     tick,
@@ -1152,13 +1266,52 @@ impl ChatView {
                                 .child(
                                     div()
                                         .text_size(px(13.0))
-                                        .text_color(theme.text_tertiary)
+                                        .text_color(theme_copy.text_tertiary)
                                         .child(format!("{status_lbl} …")),
-                                ),
-                        )
-                    })
-                    .child(div().h(px(24.0))),
+                                )
+                                .into_any_element()
+                        } else {
+                            div().h(px(24.0)).into_any_element()
+                        };
+
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .child(div().w(px(740.0)).max_w_full().child(inner))
+                            .into_any_element()
+                    }),
+                )
+                .size_full()
+                .px(px(24.0))
+                .py(px(14.0)),
             )
+            .vertical_scrollbar(&self.list_state)
+            .child(smooth_scroll_layer(&self.smooth_scroller))
+            // Floating Jump-to-Latest pill when scrolled up away from bottom
+            .when(is_scrolled_up, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .bottom(px(14.0))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            gb_btn("chat-jump-bottom", theme, BtnVariant::Secondary, true, false)
+                                .shadow_md()
+                                .child(cursor_icon("arrow-down", 12.0, theme.text_primary))
+                                .child("Latest")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.smooth_scroller.cancel();
+                                    this.list_state.set_follow_mode(FollowMode::Tail);
+                                    this.list_state.scroll_to_end();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1251,6 +1404,7 @@ impl ChatView {
                                     if !this.expanded_thinking.remove(&tid) {
                                         this.expanded_thinking.insert(tid.clone());
                                     }
+                                    this.list_state.remeasure();
                                     cx.notify();
                                 }))
                                 .child(if think_streaming {
@@ -1340,6 +1494,7 @@ impl ChatView {
                                     if !this.collapsed_groups.remove(&gid_click) {
                                         this.collapsed_groups.insert(gid_click.clone());
                                     }
+                                    this.list_state.remeasure();
                                     cx.notify();
                                 }))
                                 .child(if let Some(t) = active_tool {
@@ -1469,6 +1624,7 @@ impl ChatView {
                         if !this.expanded_tools.remove(&tid) {
                             this.expanded_tools.insert(tid.clone());
                         }
+                        this.list_state.remeasure();
                         cx.notify();
                     }))
                     .child(cursor_icon(icon, 16.0, theme.text_tertiary))

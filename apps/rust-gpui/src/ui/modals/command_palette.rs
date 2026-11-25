@@ -1,8 +1,10 @@
 use crate::state::app_state::{AppState, AppViewId};
 use crate::theme::components::{cursor_icon, FONT_SANS};
 use crate::theme::tokens::{SandTheme, ThemeMode};
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::scroll::ScrollableElement;
 
 #[derive(Clone)]
 enum PaletteAction {
@@ -28,6 +30,8 @@ pub struct CommandPaletteModal {
     app: Entity<AppState>,
     query_input: Entity<InputState>,
     selected_idx: usize,
+    scroll_handle: ScrollHandle,
+    smooth_scroller: SmoothScroller,
 }
 
 impl CommandPaletteModal {
@@ -36,7 +40,12 @@ impl CommandPaletteModal {
             InputState::new(window, cx)
                 .placeholder("Jump to a session, board, model, or command...")
         });
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).command_palette_open {
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe(&query_input, |this, _, ev: &InputEvent, cx| match ev {
             InputEvent::Change => {
                 this.selected_idx = 0;
@@ -52,10 +61,15 @@ impl CommandPaletteModal {
         })
         .detach();
 
+        let scroll_handle = ScrollHandle::new();
+        let smooth_scroller = SmoothScroller::for_handle(scroll_handle.clone());
+
         Self {
             app,
             query_input,
             selected_idx: 0,
+            scroll_handle,
+            smooth_scroller,
         }
     }
 
@@ -280,54 +294,63 @@ impl Render for CommandPaletteModal {
                         )
                         .child(
                             div()
-                                .id("cmd-palette-list")
-                                .p(px(8.0))
+                                .w_full()
                                 .max_h(px(360.0))
-                                .overflow_y_scroll()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .children(items.into_iter().enumerate().map(|(idx, item)| {
-                                    let active = idx == self.selected_idx;
-                                    let act = item.action.clone();
+                                .relative()
+                                .child(
                                     div()
-                                        .id(SharedString::from(format!("cmd-item-{}", item.id)))
-                                        .w_full()
-                                        .px(px(9.0))
-                                        .py(px(7.0))
-                                        .rounded(px(9.0))
-                                        .bg(if active {
-                                            theme.bg_active
-                                        } else {
-                                            SandTheme::transparent()
-                                        })
+                                        .id("cmd-palette-list")
+                                        .track_scroll(&self.scroll_handle)
+                                        .p(px(8.0))
+                                        .max_h(px(360.0))
+                                        .overflow_y_scroll()
                                         .flex()
-                                        .items_center()
-                                        .gap(px(9.0))
-                                        .cursor_pointer()
-                                        .hover(|st| st.bg(theme.bg_active))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.run_action(act.clone(), cx);
-                                        }))
-                                        .child(cursor_icon(item.icon, 15.0, theme.text_secondary))
-                                        .child(
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .children(items.into_iter().enumerate().map(|(idx, item)| {
+                                            let active = idx == self.selected_idx;
+                                            let act = item.action.clone();
                                             div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_size(px(13.0))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child(item.label),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(12.0))
-                                                .text_color(theme.text_tertiary)
-                                                .child(item.detail),
-                                        )
-                                })),
+                                                .id(SharedString::from(format!("cmd-item-{}", item.id)))
+                                                .w_full()
+                                                .px(px(9.0))
+                                                .py(px(7.0))
+                                                .rounded(px(9.0))
+                                                .bg(if active {
+                                                    theme.bg_active
+                                                } else {
+                                                    SandTheme::transparent()
+                                                })
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(9.0))
+                                                .cursor_pointer()
+                                                .hover(|st| st.bg(theme.bg_active))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.run_action(act.clone(), cx);
+                                                }))
+                                                .child(cursor_icon(item.icon, 15.0, theme.text_secondary))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
+                                                        .whitespace_nowrap()
+                                                        .text_size(px(13.0))
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .child(item.label),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.0))
+                                                        .text_color(theme.text_tertiary)
+                                                        .child(item.detail),
+                                                )
+                                        })),
+                                )
+                                .vertical_scrollbar(&self.scroll_handle)
+                                .child(smooth_scroll_layer(&self.smooth_scroller)),
                         ),
                 ),
         )

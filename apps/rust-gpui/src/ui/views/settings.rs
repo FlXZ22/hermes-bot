@@ -1,6 +1,6 @@
 use crate::backend::ssh::SshTarget;
 use crate::backend::updater::UpdateSettingsPatch;
-use crate::state::app_state::{AppState, AvatarEditorTarget};
+use crate::state::app_state::{AppState, AppViewId, AvatarEditorTarget};
 use crate::theme::bot_face::{bot_face, BotFaceState};
 use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_dot, gb_row, gb_section_card, gb_section_card_head,
@@ -8,9 +8,11 @@ use crate::theme::components::{
     FONT_SANS,
 };
 use crate::theme::tokens::ThemeMode;
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_component::scroll::ScrollableElement;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
@@ -53,6 +55,8 @@ pub struct SettingsView {
     synced_updater_key: String,
     updater_busy: bool,
     diag_busy: bool,
+    scroll_handle: ScrollHandle,
+    smooth_scroller: SmoothScroller,
 }
 
 impl SettingsView {
@@ -130,7 +134,14 @@ impl SettingsView {
         let synced_ssh_conn = format!("{}:{:?}", conn.url, conn.ssh);
         let synced_updater_key = format!("{:?}:{}", upd.repo_path, upd.target_branch);
 
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).active_view == AppViewId::Settings {
+                cx.notify();
+            }
+        })
+        .detach();
+        let scroll_handle = ScrollHandle::new();
+        let smooth_scroller = SmoothScroller::for_handle(scroll_handle.clone());
         Self {
             app,
             tab: SettingsTab::Appearance,
@@ -151,6 +162,8 @@ impl SettingsView {
             synced_updater_key,
             updater_busy: false,
             diag_busy: false,
+            scroll_handle,
+            smooth_scroller,
         }
     }
 
@@ -560,10 +573,17 @@ impl Render for SettingsView {
             .font_family(FONT_SANS)
             .child(
                 div()
-                    .id("settings-scroll")
                     .flex_1()
-                    .overflow_y_scroll()
-                    .p(px(28.0))
+                    .min_h_0()
+                    .w_full()
+                    .relative()
+                    .child(
+                        div()
+                            .id("settings-scroll")
+                            .track_scroll(&self.scroll_handle)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .p(px(28.0))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -1562,6 +1582,9 @@ impl Render for SettingsView {
                                 }
                             }),
                     ),
+                    )
+                    .vertical_scrollbar(&self.scroll_handle)
+                    .child(smooth_scroll_layer(&self.smooth_scroller)),
             )
     }
 }

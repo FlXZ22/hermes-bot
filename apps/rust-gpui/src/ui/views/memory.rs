@@ -1,11 +1,13 @@
-use crate::state::app_state::AppState;
+use crate::state::app_state::{AppState, AppViewId};
 use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_row, gb_section_card, gb_section_card_head,
     gb_segmented_item, gb_segmented_shell, BadgeTone, BtnVariant, FONT_SANS,
 };
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Textarea, TextareaState};
+use gpui_component::scroll::ScrollableElement;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemoryTab {
@@ -24,6 +26,8 @@ pub struct MemoryView {
     synced_mem: String,
     synced_user: String,
     synced_soul: String,
+    scroll_handle: ScrollHandle,
+    smooth_scroller: SmoothScroller,
 }
 
 impl MemoryView {
@@ -53,7 +57,14 @@ impl MemoryView {
             st.set_value(so.clone(), window, cx);
             st
         });
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).active_view == AppViewId::Memory {
+                cx.notify();
+            }
+        })
+        .detach();
+        let scroll_handle = ScrollHandle::new();
+        let smooth_scroller = SmoothScroller::for_handle(scroll_handle.clone());
         Self {
             app,
             tab: MemoryTab::Memory,
@@ -63,6 +74,8 @@ impl MemoryView {
             synced_mem: m,
             synced_user: u,
             synced_soul: so,
+            scroll_handle,
+            smooth_scroller,
         }
     }
 
@@ -212,11 +225,17 @@ impl Render for MemoryView {
             )
             .child(
                 div()
-                    .id("memory-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(24.0))
+                    .w_full()
+                    .relative()
+                    .child(
+                        div()
+                            .id("memory-scroll")
+                            .track_scroll(&self.scroll_handle)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .px(px(24.0))
                     .py(px(20.0))
                     .flex()
                     .justify_center()
@@ -341,6 +360,9 @@ impl Render for MemoryView {
                                 )
                             }),
                     ),
+                    )
+                    .vertical_scrollbar(&self.scroll_handle)
+                    .child(smooth_scroll_layer(&self.smooth_scroller)),
             )
     }
 }

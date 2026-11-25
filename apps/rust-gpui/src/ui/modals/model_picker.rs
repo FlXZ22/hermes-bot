@@ -1,3 +1,4 @@
+use crate::hermes::types::HermesModelOption;
 use crate::state::app_state::{AppState, ReasoningEffort};
 use crate::theme::components::{
     cursor_icon, format_tokens, gb_badge, gb_board_pill, gb_btn, gb_mini_icon_btn, gb_row,
@@ -5,9 +6,11 @@ use crate::theme::components::{
     BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::theme::tokens::SandTheme;
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::scroll::ScrollableElement;
 use std::collections::BTreeMap;
 
 pub struct ModelPickerModal {
@@ -16,6 +19,9 @@ pub struct ModelPickerModal {
     custom_input: Entity<InputState>,
     provider_filter: String,
     save_default: bool,
+    list_scroll: UniformListScrollHandle,
+    list_smooth: SmoothScroller,
+    visible_models: Vec<HermesModelOption>,
 }
 
 impl ModelPickerModal {
@@ -28,7 +34,12 @@ impl ModelPickerModal {
             InputState::new(window, cx)
                 .placeholder("Custom model ID (e.g. openrouter/anthropic/claude-opus-4.6)")
         });
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe(&app, |_, app_e, cx| {
+            if app_e.read(cx).model_picker_open {
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe(&search_input, |_, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 cx.notify();
@@ -52,12 +63,18 @@ impl ModelPickerModal {
         })
         .detach();
 
+        let list_scroll = UniformListScrollHandle::new();
+        let list_smooth = SmoothScroller::for_uniform_list(list_scroll.clone());
+
         Self {
             app,
             search_input,
             custom_input,
             provider_filter: "all".into(),
             save_default: false,
+            list_scroll,
+            list_smooth,
+            visible_models: Vec::new(),
         }
     }
 }
@@ -118,6 +135,8 @@ impl Render for ModelPickerModal {
             .cloned()
             .collect();
         filtered.sort_by(|a, b| b.configured.cmp(&a.configured));
+        let model_count = filtered.len();
+        self.visible_models = filtered;
 
         let save_def = self.save_default;
 
@@ -252,105 +271,125 @@ impl Render for ModelPickerModal {
                                             }))
                                         })),
                                 )
-                                // Model list
+                                // Virtualized 120 FPS Model list (uniform_list + SmoothScroller + scrollbar)
                                 .child(
                                     div()
-                                        .id("mp-list")
-                                        .max_h(px(260.0))
-                                        .overflow_y_scroll()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(3.0))
-                                        .children(filtered.iter().enumerate().map(|(idx, m)| {
-                                            let selected = m.id == active_model
-                                                && (active_provider.is_empty()
-                                                    || active_provider == "auto"
-                                                    || m.provider == active_provider);
-                                            let mid = m.id.clone();
-                                            let mprov = m.provider.clone();
-                                            let sub = if let Some(ctx) = m.context_length {
-                                                format!("{} · {} ctx", m.id, format_tokens(ctx))
-                                            } else {
-                                                m.id.clone()
-                                            };
+                                        .w_full()
+                                        .h(px(260.0))
+                                        .relative()
+                                        .child(if model_count == 0 {
                                             div()
-                                                .id(SharedString::from(format!("mp-row-{idx}")))
-                                                .w_full()
-                                                .px(px(11.0))
-                                                .py(px(8.0))
-                                                .rounded(px(11.0))
-                                                .bg(if selected {
-                                                    theme.accent_soft
-                                                } else {
-                                                    SandTheme::transparent()
-                                                })
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .gap(px(10.0))
-                                                .cursor_pointer()
-                                                .hover(|st| st.bg(theme.bg_hover))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.app.update(cx, |s, cx| {
-                                                        s.select_model(
-                                                            mid.clone(),
-                                                            Some(mprov.clone()),
-                                                            save_def,
-                                                            cx,
-                                                        );
-                                                        s.model_picker_open = false;
-                                                        cx.notify();
-                                                    });
-                                                }))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .flex()
-                                                        .flex_col()
-                                                        .gap(px(2.0))
-                                                        .child(
+                                                .py(px(18.0))
+                                                .text_center()
+                                                .text_size(px(13.0))
+                                                .text_color(theme.text_tertiary)
+                                                .child("No matching models. Enter a custom model ID below.")
+                                                .into_any_element()
+                                        } else {
+                                            let theme_u = theme;
+                                            let active_m = active_model.clone();
+                                            let active_p = active_provider.clone();
+                                            uniform_list(
+                                                "mp-list-uniform",
+                                                model_count,
+                                                cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                                                    let mut out = Vec::with_capacity(range.len());
+                                                    for idx in range {
+                                                        let Some(m) = this.visible_models.get(idx) else {
+                                                            continue;
+                                                        };
+                                                        let selected = m.id == active_m
+                                                            && (active_p.is_empty()
+                                                                || active_p == "auto"
+                                                                || m.provider == active_p);
+                                                        let mid = m.id.clone();
+                                                        let mprov = m.provider.clone();
+                                                        let sub = if let Some(ctx) = m.context_length {
+                                                            format!("{} · {} ctx", m.id, format_tokens(ctx))
+                                                        } else {
+                                                            m.id.clone()
+                                                        };
+                                                        out.push(
                                                             div()
+                                                                .id(SharedString::from(format!("mp-row-{idx}")))
+                                                                .w_full()
+                                                                .h(px(54.0))
+                                                                .px(px(11.0))
+                                                                .rounded(px(11.0))
+                                                                .bg(if selected {
+                                                                    theme_u.accent_soft
+                                                                } else {
+                                                                    SandTheme::transparent()
+                                                                })
                                                                 .flex()
                                                                 .items_center()
-                                                                .gap(px(7.0))
+                                                                .justify_between()
+                                                                .gap(px(10.0))
+                                                                .cursor_pointer()
+                                                                .hover(move |st| st.bg(theme_u.bg_hover))
+                                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                                    this.app.update(cx, |s, cx| {
+                                                                        s.select_model(
+                                                                            mid.clone(),
+                                                                            Some(mprov.clone()),
+                                                                            save_def,
+                                                                            cx,
+                                                                        );
+                                                                        s.model_picker_open = false;
+                                                                        cx.notify();
+                                                                    });
+                                                                }))
                                                                 .child(
                                                                     div()
-                                                                        .text_size(px(13.5))
-                                                                        .font_weight(FontWeight::MEDIUM)
+                                                                        .flex_1()
+                                                                        .min_w_0()
+                                                                        .flex()
+                                                                        .flex_col()
+                                                                        .gap(px(2.0))
                                                                         .child(
-                                                                            m.name
-                                                                                .clone()
-                                                                                .unwrap_or_else(|| m.id.clone()),
+                                                                            div()
+                                                                                .flex()
+                                                                                .items_center()
+                                                                                .gap(px(7.0))
+                                                                                .child(
+                                                                                    div()
+                                                                                        .text_size(px(13.5))
+                                                                                        .font_weight(FontWeight::MEDIUM)
+                                                                                        .truncate()
+                                                                                        .child(
+                                                                                            m.name
+                                                                                                .clone()
+                                                                                                .unwrap_or_else(|| m.id.clone()),
+                                                                                        ),
+                                                                                )
+                                                                                .child(gb_badge(&theme_u, BadgeTone::Muted, m.provider.clone()))
+                                                                                .when(m.configured, |d| {
+                                                                                    d.child(gb_badge(&theme_u, BadgeTone::Success, "Ready"))
+                                                                                }),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .font_family(FONT_MONO)
+                                                                                .text_size(px(11.5))
+                                                                                .text_color(theme_u.text_tertiary)
+                                                                                .truncate()
+                                                                                .child(sub),
                                                                         ),
                                                                 )
-                                                                .child(gb_badge(&theme, BadgeTone::Muted, m.provider.clone()))
-                                                                .when(m.configured, |d| {
-                                                                    d.child(gb_badge(&theme, BadgeTone::Success, "Ready"))
+                                                                .when(selected, |d| {
+                                                                    d.child(cursor_icon("check-circle", 16.0, theme_u.accent_text))
                                                                 }),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .font_family(FONT_MONO)
-                                                                .text_size(px(11.5))
-                                                                .text_color(theme.text_tertiary)
-                                                                .child(sub),
-                                                        ),
-                                                )
-                                                .when(selected, |d| {
-                                                    d.child(cursor_icon("check-circle", 16.0, theme.accent_text))
-                                                })
-                                        }))
-                                        .when(filtered.is_empty(), |d| {
-                                            d.child(
-                                                div()
-                                                    .py(px(18.0))
-                                                    .text_center()
-                                                    .text_size(px(13.0))
-                                                    .text_color(theme.text_tertiary)
-                                                    .child("No matching models. Enter a custom model ID below."),
+                                                        );
+                                                    }
+                                                    out
+                                                }),
                                             )
-                                        }),
+                                            .size_full()
+                                            .track_scroll(&self.list_scroll)
+                                            .into_any_element()
+                                        })
+                                        .vertical_scrollbar(&self.list_scroll)
+                                        .child(smooth_scroll_layer(&self.list_smooth)),
                                 )
                                 // Custom model entry
                                 .child(

@@ -678,12 +678,23 @@ impl AppState {
                         }
                     });
                     cx.spawn(async move |this, cx| {
-                        while let Some(ev) = ev_rx.recv().await {
+                        while let Some(first_ev) = ev_rx.recv().await {
+                            // Drain any bursty tokens already queued so GPUI paints once per frame batch
+                            let mut batch = Vec::with_capacity(8);
+                            batch.push(first_ev);
+                            while batch.len() < 64 {
+                                match ev_rx.try_recv() {
+                                    Ok(next_ev) => batch.push(next_ev),
+                                    Err(_) => break,
+                                }
+                            }
                             let keep = this.update(cx, |s, cx| {
                                 if s.ws_generation != gen {
                                     return false;
                                 }
-                                s.handle_stream_event(ev, cx);
+                                for ev in batch {
+                                    s.handle_stream_event(ev, cx);
+                                }
                                 true
                             });
                             if !matches!(keep, Ok(true)) {

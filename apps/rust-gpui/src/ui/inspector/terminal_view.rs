@@ -14,7 +14,9 @@ use alacritty_terminal::Term;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 #[derive(Clone, Copy)]
 struct TermDims {
@@ -62,7 +64,8 @@ pub struct TerminalView {
     tabs: Vec<TermTab>,
     active_tab_id: Option<String>,
     tab_counter: usize,
-    _poll_task: Task<()>,
+    wake_notify: Arc<Notify>,
+    _wake_task: Task<()>,
 }
 
 impl TerminalView {
@@ -70,11 +73,16 @@ impl TerminalView {
         let focus_handle = cx.focus_handle();
         cx.observe(&app, |_, _, cx| cx.notify()).detach();
 
-        // Lightweight dirty-flag poller so PTY output from background threads repaints smoothly at ~30fps when active
-        let poll_task = cx.spawn(async move |this, cx| {
+        // Event-driven 120fps wake task: sleeps at 0% CPU when idle, wakes immediately on PTY
+        // output and coalesces rapid bursts at ~8ms (120Hz) frame pacing just like Zed's terminal!
+        let wake_notify = Arc::new(Notify::new());
+        let wake_rx = wake_notify.clone();
+        let wake_task = cx.spawn(async move |this, cx| {
             loop {
+                wake_rx.notified().await;
+                // Coalesce bursty PTY reads over one 120Hz frame window (8ms)
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(33))
+                    .timer(std::time::Duration::from_millis(8))
                     .await;
                 let keep_going = this
                     .update(cx, |v, cx| {
@@ -104,7 +112,8 @@ impl TerminalView {
             tabs: Vec::new(),
             active_tab_id: None,
             tab_counter: 0,
-            _poll_task: poll_task,
+            wake_notify,
+            _wake_task: wake_task,
         };
         view.open_new_tab(cx);
         view
@@ -143,6 +152,7 @@ impl TerminalView {
         let rt_sink = runtime.clone();
         let terminals_ack = terminals.clone();
         let id_ack = id.clone();
+        let wake = self.wake_notify.clone();
         let sink = EventSink::new(move |event| {
             let Ok(mut rt) = rt_sink.lock() else {
                 return Err(());
@@ -153,6 +163,7 @@ impl TerminalView {
                     rt.exit_code = None;
                     rt.error = None;
                     rt.dirty = true;
+                    wake.notify_one();
                 }
                 TerminalEvent::Output { data } => {
                     if let Ok(bytes) = STANDARD.decode(&data) {
@@ -166,6 +177,7 @@ impl TerminalView {
                         parser.advance(term, &bytes);
                         rt.dirty = true;
                         drop(rt);
+                        wake.notify_one();
                         if !gen_copy.is_empty() {
                             terminals_ack.acknowledge(&id_ack, &gen_copy, len);
                         }
@@ -175,10 +187,12 @@ impl TerminalView {
                 TerminalEvent::Exit { code } => {
                     rt.exit_code = Some(code);
                     rt.dirty = true;
+                    wake.notify_one();
                 }
                 TerminalEvent::Error { message } => {
                     rt.error = Some(message);
                     rt.dirty = true;
+                    wake.notify_one();
                 }
             }
             Ok(())
@@ -388,7 +402,7 @@ impl Render for TerminalView {
 
         let (rendered_rows, meta_shell, meta_cwd, meta_remote, exit_code, error_msg) =
             if let Some(tab) = active_tab {
-                let mut rows_out: Vec<Vec<(String, Hsla, Option<Hsla>, bool)>> = Vec::new();
+                let mut rows_out: Vec<StyledText> = Vec::with_capacity(tab.rows as usize);
                 let mut exit_c = None;
                 let mut err_m = None;
                 if let Ok(rt) = tab.runtime.lock() {
@@ -400,14 +414,18 @@ impl Render for TerminalView {
                     let cols = tab.cols as usize;
 
                     for r in 0..rows {
-                        let mut spans: Vec<(String, Hsla, Option<Hsla>, bool)> = Vec::new();
+                        let mut line_str = String::with_capacity(cols);
+                        let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+                        let mut cur_run: Option<(usize, Hsla, Option<Hsla>, bool)> = None;
+
                         for c in 0..cols {
                             let cell = &grid[Line(r as i32)][Column(c)];
                             if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
                                 continue;
                             }
-                            let is_cursor =
-                                r as i32 == cursor_pt.line.0 && c == cursor_pt.column.0 && exit_c.is_none();
+                            let is_cursor = r as i32 == cursor_pt.line.0
+                                && c == cursor_pt.column.0
+                                && exit_c.is_none();
                             let inverse = cell.flags.contains(CellFlags::INVERSE);
                             let bold = cell.flags.contains(CellFlags::BOLD);
                             let mut fg = resolve_ansi_color(cell.fg, default_fg, term_bg, mode);
@@ -422,17 +440,55 @@ impl Render for TerminalView {
                                 fg = rgb(0xffffff).into();
                             }
                             let ch = if cell.c == '\0' { ' ' } else { cell.c };
-                            if let Some(last) = spans.last_mut() {
-                                if last.1 == fg && last.2 == bg && last.3 == bold {
-                                    last.0.push(ch);
-                                    continue;
+                            let start = line_str.len();
+                            line_str.push(ch);
+
+                            let same = matches!(
+                                cur_run,
+                                Some((_, r_fg, r_bg, r_bold))
+                                    if r_fg == fg && r_bg == bg && r_bold == bold
+                            );
+                            if !same {
+                                if let Some((r_start, r_fg, r_bg, r_bold)) = cur_run.take() {
+                                    if r_start < start
+                                        && (r_fg != default_fg || r_bg.is_some() || r_bold)
+                                    {
+                                        highlights.push((
+                                            r_start..start,
+                                            HighlightStyle {
+                                                color: Some(r_fg),
+                                                background_color: r_bg,
+                                                font_weight: r_bold.then_some(FontWeight::BOLD),
+                                                ..Default::default()
+                                            },
+                                        ));
+                                    }
                                 }
+                                cur_run = Some((start, fg, bg, bold));
                             }
-                            let mut s = String::new();
-                            s.push(ch);
-                            spans.push((s, fg, bg, bold));
                         }
-                        rows_out.push(spans);
+
+                        if let Some((r_start, r_fg, r_bg, r_bold)) = cur_run.take() {
+                            let end = line_str.len();
+                            if r_start < end && (r_fg != default_fg || r_bg.is_some() || r_bold) {
+                                highlights.push((
+                                    r_start..end,
+                                    HighlightStyle {
+                                        color: Some(r_fg),
+                                        background_color: r_bg,
+                                        font_weight: r_bold.then_some(FontWeight::BOLD),
+                                        ..Default::default()
+                                    },
+                                ));
+                            }
+                        }
+
+                        let st = if highlights.is_empty() {
+                            StyledText::new(line_str)
+                        } else {
+                            StyledText::new(line_str).with_highlights(highlights)
+                        };
+                        rows_out.push(st);
                     }
                 }
                 (
@@ -679,19 +735,9 @@ impl Render for TerminalView {
                             .w_full()
                             .flex()
                             .flex_col()
-                            .children(rendered_rows.into_iter().map(|spans| {
-                                div().w_full().flex().flex_row().whitespace_nowrap().children(
-                                    spans.into_iter().map(|(text, fg, bg, bold)| {
-                                        let mut cell_run = div().text_color(fg).child(text);
-                                        if let Some(b) = bg {
-                                            cell_run = cell_run.bg(b);
-                                        }
-                                        if bold {
-                                            cell_run = cell_run.font_weight(FontWeight::BOLD);
-                                        }
-                                        cell_run
-                                    }),
-                                )
+                            .text_color(default_fg)
+                            .children(rendered_rows.into_iter().map(|styled_line| {
+                                div().w_full().whitespace_nowrap().child(styled_line)
                             }))
                     }),
             )
