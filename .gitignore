@@ -4,6 +4,7 @@ dist/
 .vite/
 *.tsbuildinfo
 /apps/desktop/src-tauri/target/
+/apps/rust-gpui/target/
 
 # Local configuration and logs
 .env

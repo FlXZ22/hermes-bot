@@ -1,0 +1,53 @@
+[package]
+name = "hermes-grok-bot-gpui"
+version = "1.0.0"
+edition = "2021"
+description = "Native Rust GPU-accelerated Grok Bot UI for Hermes Agent (GPUI)"
+
+[[bin]]
+name = "hermes-grok-bot-rust"
+path = "src/main.rs"
+
+[dependencies]
+# Zed's GPU-accelerated UI framework + GPUI Component library
+gpui = { package = "gpui-pre", version = "=0.3.14" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.14", features = ["wayland", "x11"] }
+gpui-component = { version = "0.11.0", default-features = false }
+gpui-kit-assets = "0.11.0"
+rust-embed = "8"
+anyhow = "1"
+smallvec = "1"
+
+# Async runtime, HTTP & WebSocket
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+url = "2"
+
+# Serialization & data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Markdown & Terminal emulation (Zed's alacritty_terminal + portable-pty)
+pulldown-cmark = "0.13"
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+
+# Utilities & System
+rand = "0.8"
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+sha2 = "0.10"
+base64 = "0.22"
+libc = "0.2"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

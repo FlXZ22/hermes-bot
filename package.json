@@ -37,7 +37,11 @@
     "desktop:chromium": "electron apps/chromium/main.cjs",
     "test:chromium:perf": "node scripts/chromium-perf.mjs",
     "test:chromium:smoke": "node scripts/chromium-smoke.mjs",
-    "desktop:chromium:install": "bash scripts/install-chromium.sh"
+    "desktop:chromium:install": "bash scripts/install-chromium.sh",
+    "desktop:rust:build": "cargo build --release --manifest-path apps/rust-gpui/Cargo.toml",
+    "desktop:rust:run": "cargo run --release --manifest-path apps/rust-gpui/Cargo.toml",
+    "desktop:rust:test": "cargo test --manifest-path apps/rust-gpui/Cargo.toml",
+    "desktop:rust:install": "bash scripts/install-rust-gpui.sh"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.6",
