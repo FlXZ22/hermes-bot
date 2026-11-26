@@ -381,7 +381,6 @@ pub struct AppState {
     pub cron_jobs: Vec<HermesCronJob>,
     pub messaging_platforms: Vec<HermesMessagingPlatform>,
     pub webhooks: Vec<HermesWebhook>,
-    pub usage_points: Vec<HermesUsagePoint>,
     pub env_entries: Vec<HermesEnvEntry>,
     pub raw_config: String,
     pub server_logs: Vec<String>,
@@ -475,7 +474,6 @@ impl AppState {
             cron_jobs: Vec::new(),
             messaging_platforms: Vec::new(),
             webhooks: Vec::new(),
-            usage_points: Vec::new(),
             env_entries: Vec::new(),
             raw_config: String::new(),
             server_logs: Vec::new(),
@@ -912,7 +910,6 @@ impl AppState {
                 cron_jobs,
                 platforms,
                 webhooks,
-                usage,
                 boards,
                 soul,
                 raw_cfg,
@@ -932,7 +929,6 @@ impl AppState {
                         client.list_cron_jobs(),
                         client.list_messaging_platforms(),
                         client.list_webhooks(),
-                        client.get_usage_analytics(14),
                         client.list_kanban_boards(),
                         client.get_profile_soul(&active_prof),
                         client.get_raw_config(),
@@ -1024,9 +1020,6 @@ impl AppState {
                 }
                 if let Ok(hooks) = webhooks {
                     s.webhooks = hooks;
-                }
-                if let Ok(pts) = usage {
-                    s.usage_points = pts;
                 }
                 if let Ok(b_list) = boards {
                     for b in b_list {

@@ -958,16 +958,20 @@ impl HermesClient {
             .collect())
     }
 
-    pub async fn get_usage_analytics(&self, days: usize) -> Result<Vec<HermesUsagePoint>, String> {
+    pub async fn get_usage_analytics(
+        &self,
+        days: usize,
+        profile: &str,
+    ) -> Result<HermesUsageReport, String> {
         let v = self
             .request_json(
                 Method::GET,
                 "/api/analytics/usage",
-                &[("days", days.to_string())],
+                &[("days", days.to_string()), ("profile", profile.to_owned())],
                 None,
             )
             .await?;
-        Ok(extract_vec(&v, &["daily", "points", "usage", "items"]))
+        parse_usage_report(v)
     }
 
     // Kanban Boards
@@ -1199,6 +1203,59 @@ impl HermesClient {
             .unwrap_or_default();
         self.request_json(Method::POST, "/api/plugins/kanban/dispatch", &q, None)
             .await
+    }
+}
+
+fn parse_usage_report(value: Value) -> Result<HermesUsageReport, String> {
+    if value.is_array() {
+        serde_json::from_value(value).map(|daily| HermesUsageReport {
+            daily,
+            ..Default::default()
+        })
+    } else {
+        serde_json::from_value(value)
+    }
+    .map_err(|err| format!("Invalid Hermes usage report: {err}"))
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_usage_keeps_daily_counts_and_model_rows() {
+        let report = parse_usage_report(json!({
+            "daily": [{
+                "day": "2026-11-25", "input_tokens": 120, "output_tokens": 45,
+                "estimated_cost": 0.025, "sessions": 1, "api_calls": 3
+            }],
+            "by_model": [{"model": "provider/model", "sessions": 1}],
+            "totals": {"total_input": 120, "total_output": 45, "total_sessions": 1},
+            "period_days": 14
+        })).unwrap();
+
+        let day = &report.daily[0];
+        assert_eq!(day.date.to_string(), "2026-11-25");
+        assert_eq!(day.total_tokens(), Some(165));
+        assert_eq!(day.cost_usd, Some(0.025));
+        assert_eq!(day.requests, Some(3));
+        assert_eq!(report.by_model.unwrap()[0].model, "provider/model");
+        assert_eq!(report.totals.unwrap().total_sessions, Some(1));
+        assert_eq!(report.period_days, Some(14));
+    }
+
+    #[test]
+    fn supports_older_daily_responses_but_rejects_unrelated_payloads() {
+        let report = parse_usage_report(json!([
+            {"date": "2026-11-24", "tokens": 12, "cost_usd": 0.0, "requests": 0}
+        ])).unwrap();
+        assert_eq!(report.daily[0].total_tokens(), Some(12));
+        assert_eq!(report.daily[0].cost_usd, Some(0.0));
+        assert_eq!(report.daily[0].requests, Some(0));
+        assert!(report.by_model.is_none());
+        assert!(parse_usage_report(json!({"daily": []})).unwrap().daily.is_empty());
+        assert!(parse_usage_report(json!({"error": "unavailable"})).is_err());
+        assert!(parse_usage_report(json!({"daily": [{"day": "not a date"}]})).is_err());
     }
 }
 

@@ -20,6 +20,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
+use gpui_component::Sizable;
 use std::cell::{Cell, RefCell};
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
@@ -63,6 +64,10 @@ const STARTER_PROMPTS: &[(&str, &str, &str, &str)] = &[
         "Check the local Linux environment, active tools, and verify everything is running smoothly.",
     ),
 ];
+
+// Six complete 21px lines fit inside Electron's 140px field with 4px padding on each edge.
+const COMPOSER_MAX_ROWS: usize = 6;
+const COMPOSER_MAX_HEIGHT: f32 = 140.0;
 
 type ThoughtScrollHitboxes = Rc<RefCell<Vec<Hitbox>>>;
 
@@ -130,6 +135,7 @@ fn clipped_label(text: impl Into<SharedString>) -> Div {
 pub struct ChatView {
     app: Entity<AppState>,
     composer: Entity<TextareaState>,
+    composer_overflowing: bool,
     title_input: Entity<InputState>,
     editing_title: bool,
     attach_menu_open: bool,
@@ -158,16 +164,20 @@ pub struct ChatView {
 
 impl ChatView {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let composer = cx.new(|cx| {
-            let mut st =
-                TextareaState::new(window, cx).placeholder("Message Hermes… (/ for commands)");
-            st.set_auto_grow(1, 5, cx);
-            st
-        });
+        let composer = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, COMPOSER_MAX_ROWS));
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Session title"));
 
         cx.observe(&app, |_, app_e, cx| {
             if app_e.read(cx).active_view == crate::state::app_state::AppViewId::Chat {
+                cx.notify();
+            }
+        })
+        .detach();
+
+        cx.observe(&composer, |this, composer, cx| {
+            let overflowing = composer.read(cx).display_map().wrap_row_count() > COMPOSER_MAX_ROWS;
+            if this.composer_overflowing != overflowing {
+                this.composer_overflowing = overflowing;
                 cx.notify();
             }
         })
@@ -219,6 +229,7 @@ impl ChatView {
         Self {
             app,
             composer,
+            composer_overflowing: false,
             title_input,
             editing_title: false,
             attach_menu_open: false,
@@ -382,6 +393,11 @@ impl Render for ChatView {
         );
 
         let draft = self.composer.read(cx).value().to_string();
+        let placeholder = format!("Message {bot_name}... (type / for commands)");
+        if self.composer.read(cx).presentation().placeholder().as_ref() != placeholder {
+            self.composer
+                .update(cx, |state, cx| state.set_placeholder(placeholder, window, cx));
+        }
         let matching_slash: Vec<(&str, &str)> = if draft.starts_with('/') && !draft.contains(' ') {
             let q = draft.to_lowercase();
             SLASH_COMMANDS
@@ -402,6 +418,8 @@ impl Render for ChatView {
         let bot_seed_hdr = bot_seed.clone();
         let bot_name_hdr = bot_name.clone();
         let hdr_title_edit = header_title.clone();
+        let scale = window.scale_factor();
+        let composer_border = px((0.5 * scale).floor().max(1.0) / scale);
 
         div()
             .size_full()
@@ -751,7 +769,7 @@ impl Render for ChatView {
                     .w_full()
                     .min_w_0()
                     .px(px(20.0))
-                    .pt(px(8.0))
+                    .pt(px(20.0))
                     .pb(px(16.0))
                     .bg(theme.bg_pane)
                     .flex_shrink_0()
@@ -913,7 +931,7 @@ impl Render for ChatView {
                                             .flex()
                                             .items_center()
                                             .flex_wrap()
-                                            .gap(px(6.0))
+                                            .gap(px(8.0))
                                             .child(
                                                 gb_chip_btn("chip-model", &theme, false)
                                                     .min_w_0()
@@ -1096,31 +1114,32 @@ impl Render for ChatView {
                                         ),
                                 ))
                             })
-                            // Floating Grok Bot Pill Composer (rounded 26px)
+                            // Match the Electron composer and keep the controls at the bottom of multiline drafts.
                             .child(
                                 div()
+                                    .id("chat-composer")
                                     .w_full()
                                     .min_w_0()
                                     .px(px(8.0))
                                     .py(px(7.0))
                                     .rounded(px(26.0))
                                     .bg(theme.bg_chrome)
-                                    .border_1()
+                                    .border(composer_border)
                                     .border_color(theme.border_default)
+                                    .shadow(vec![
+                                        BoxShadow::new(px(0.0), px(4.0), rgba(0x00000024).into())
+                                            // GPUI uses sigma, half the CSS blur radius.
+                                            .blur_radius(px(10.0))
+                                            .spread_radius(px(-6.0)),
+                                    ])
                                     .flex()
                                     .items_end()
-                                    .gap(px(8.0))
+                                    // GPUI's xsmall editor adds 4px horizontally. A 6px gap
+                                    // matches Electron's 8px gap plus 2px of textarea padding.
+                                    .gap(px(6.0))
                                     .child(
-                                        div()
-                                            .id("composer-plus")
-                                            .w(px(30.0))
-                                            .h(px(30.0))
-                                            .rounded_full()
+                                        composer_button("composer-plus", "Attachments and commands")
                                             .bg(theme.bg_secondary)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .flex_shrink_0()
                                             .cursor_pointer()
                                             .hover(|st| st.bg(theme.bg_active))
                                             .child(cursor_icon("plus", 15.0, theme.text_secondary))
@@ -1130,49 +1149,41 @@ impl Render for ChatView {
                                             })),
                                     )
                                     .child(
-                                        div()
+                                        Textarea::new(&self.composer)
+                                            .appearance(false)
+                                            .xsmall()
                                             .flex_1()
                                             .min_w_0()
-                                            .child(
-                                                Textarea::new(&self.composer)
-                                                    .appearance(false)
-                                                    .bordered(false),
-                                            ),
+                                            .min_h(px(24.0))
+                                            .when(self.composer_overflowing, |field| {
+                                                field.h(px(COMPOSER_MAX_HEIGHT))
+                                            })
+                                            .py(px(4.0))
+                                            .text_size(px(14.5))
+                                            .line_height(px(21.0))
+                                            .text_color(theme.text_primary),
                                     )
                                     .child(if is_streaming {
-                                        div()
-                                            .id("composer-stop")
-                                            .w(px(30.0))
-                                            .h(px(30.0))
-                                            .rounded_full()
+                                        composer_button("composer-stop", "Stop generating")
                                             .bg(theme.danger_primary)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .flex_shrink_0()
                                             .cursor_pointer()
+                                            .hover(|st| st.opacity(0.88))
                                             .child(cursor_icon("stop", 13.0, rgb(0xffffff).into()))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.app.update(cx, |s, cx| s.interrupt_stream(cx));
                                             }))
                                     } else {
                                         let can_send = !draft.trim().is_empty() || !attachments.is_empty();
-                                        div()
-                                            .id("composer-send")
-                                            .w(px(30.0))
-                                            .h(px(30.0))
-                                            .rounded_full()
+                                        composer_button("composer-send", "Send message (Enter)")
                                             .bg(theme.bg_primary)
-                                            .opacity(if can_send { 1.0 } else { 0.4 })
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .flex_shrink_0()
-                                            .when(can_send, |d| d.cursor_pointer())
-                                            .child(cursor_icon("arrow-up", 15.0, theme.text_on_primary))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit_composer(window, cx);
-                                            }))
+                                            .child(composer_send_icon(theme.bubble_user_ink))
+                                            .when(can_send, |d| {
+                                                d.cursor_pointer()
+                                                    .hover(|st| st.opacity(0.88))
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.submit_composer(window, cx);
+                                                    }))
+                                            })
                                     }),
                             ),
                     ),
@@ -2082,6 +2093,61 @@ impl ChatView {
     }
 }
 
+fn composer_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label)
+        .size(px(30.0))
+        .rounded_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+}
+
+fn composer_send_icon(ink: Hsla) -> impl IntoElement {
+    const SIZE: f32 = 15.0;
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            // Center the Cursor Icons arrow-up outline on its ink bounds. Painting
+            // the outline as a path avoids LCD color fringing at fractional scales.
+            let center = bounds.center();
+            let scale = SIZE / 300.0;
+            let glyph_point = |x: f32, y: f32| {
+                center + point(px((x - 105.0) * scale), px((150.0 - y) * scale))
+            };
+            let mut arrow = PathBuilder::fill();
+            arrow.move_to(glyph_point(99.0, 272.0));
+            arrow.curve_to(glyph_point(106.0, 274.5), glyph_point(102.0, 275.0));
+            arrow.curve_to(glyph_point(113.0, 271.0), glyph_point(110.0, 274.0));
+            arrow.line_to(glyph_point(207.0, 177.0));
+            arrow.curve_to(glyph_point(210.0, 169.0), glyph_point(210.0, 174.0));
+            arrow.curve_to(glyph_point(207.0, 160.5), glyph_point(210.0, 164.0));
+            arrow.curve_to(glyph_point(199.0, 157.0), glyph_point(204.0, 157.0));
+            arrow.curve_to(glyph_point(190.0, 160.0), glyph_point(194.0, 157.0));
+            arrow.line_to(glyph_point(117.0, 234.0));
+            arrow.line_to(glyph_point(117.0, 37.0));
+            arrow.curve_to(glyph_point(113.5, 29.5), glyph_point(117.0, 33.0));
+            arrow.curve_to(glyph_point(105.0, 26.0), glyph_point(110.0, 26.0));
+            arrow.curve_to(glyph_point(96.5, 29.5), glyph_point(100.0, 26.0));
+            arrow.curve_to(glyph_point(93.0, 37.0), glyph_point(93.0, 33.0));
+            arrow.line_to(glyph_point(93.0, 234.0));
+            arrow.line_to(glyph_point(20.0, 160.0));
+            arrow.curve_to(glyph_point(11.0, 157.0), glyph_point(16.0, 157.0));
+            arrow.curve_to(glyph_point(3.0, 160.5), glyph_point(6.0, 157.0));
+            arrow.curve_to(glyph_point(0.0, 169.0), glyph_point(0.0, 164.0));
+            arrow.curve_to(glyph_point(3.0, 177.0), glyph_point(0.0, 174.0));
+            arrow.close();
+            if let Ok(path) = arrow.build() {
+                window.paint_path(path, ink);
+            }
+        },
+    )
+    .size(px(SIZE))
+}
+
 fn render_usage_bar(
     theme: &SandTheme,
     usage: Option<&HermesSessionUsage>,
@@ -2136,6 +2202,7 @@ fn render_usage_bar(
         .items_center()
         .gap(px(8.0))
         .text_size(px(10.0))
+        .line_height(px(20.0))
         .text_color(theme.text_tertiary)
         .child(
             div()

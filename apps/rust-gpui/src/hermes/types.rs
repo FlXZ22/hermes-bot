@@ -498,14 +498,51 @@ pub struct HermesLogEntry {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HermesUsageReport {
+    #[serde(alias = "points", alias = "usage", alias = "items")]
+    pub daily: Vec<HermesUsagePoint>,
+    pub by_model: Option<Vec<HermesUsageModel>>,
+    pub totals: Option<HermesUsageTotals>,
+    pub period_days: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct HermesUsagePoint {
-    pub date: String,
+    #[serde(alias = "day")]
+    pub date: chrono::NaiveDate,
     pub tokens: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    #[serde(alias = "estimated_cost")]
     pub cost_usd: Option<f64>,
+    #[serde(alias = "api_calls")]
     pub requests: Option<u64>,
+    pub sessions: Option<u64>,
+}
+
+impl HermesUsagePoint {
+    pub fn total_tokens(&self) -> Option<u64> {
+        self.tokens.or_else(|| match (self.input_tokens, self.output_tokens) {
+            (None, None) => None,
+            (input, output) => Some(input.unwrap_or(0).saturating_add(output.unwrap_or(0))),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HermesUsageModel {
+    pub model: String,
+    pub sessions: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HermesUsageTotals {
+    pub total_input: Option<u64>,
+    pub total_output: Option<u64>,
+    pub total_estimated_cost: Option<f64>,
+    pub total_sessions: Option<u64>,
+    pub total_api_calls: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

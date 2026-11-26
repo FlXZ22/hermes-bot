@@ -33,3 +33,5 @@ dist/
 
 # Upstream repositories cloned for feature comparisons
 /.upstream/
+
+.opencode/
