@@ -4,7 +4,7 @@ use crate::theme::components::{
     gb_segmented_item, gb_segmented_shell, BadgeTone, BtnVariant, FONT_SANS,
 };
 use crate::ui::motion::{gpu_spinner, view_enter, EntranceKey};
-use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
+use crate::ui::smooth_scroll::{smooth_scroll_layer, NestedScrollRegions, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Textarea, TextareaState};
@@ -23,6 +23,9 @@ pub struct MemoryView {
     tab: MemoryTab,
     tab_entrance: EntranceKey<MemoryTab>,
     graph_loading: bool,
+    graph_source: Option<u64>,
+    graph_error: Option<String>,
+    curator_busy: bool,
     mem_input: Entity<TextareaState>,
     user_input: Entity<TextareaState>,
     soul_input: Entity<TextareaState>,
@@ -30,6 +33,7 @@ pub struct MemoryView {
     synced_user: String,
     synced_soul: String,
     scroll_handle: ScrollHandle,
+    editor_regions: NestedScrollRegions,
     smooth_scroller: SmoothScroller,
 }
 
@@ -61,7 +65,8 @@ impl MemoryView {
             st
         });
         cx.observe(&app, |_, app_e, cx| {
-            if app_e.read(cx).active_view == AppViewId::Memory {
+            let app = app_e.read(cx);
+            if !app.setup_open && !app.initializing && app.active_view == AppViewId::Memory {
                 cx.notify();
             }
         })
@@ -73,6 +78,9 @@ impl MemoryView {
             tab: MemoryTab::Memory,
             tab_entrance: EntranceKey::new(),
             graph_loading: false,
+            graph_source: None,
+            graph_error: None,
+            curator_busy: false,
             mem_input,
             user_input,
             soul_input,
@@ -80,35 +88,84 @@ impl MemoryView {
             synced_user: u,
             synced_soul: so,
             scroll_handle,
+            editor_regions: NestedScrollRegions::default(),
             smooth_scroller,
         }
     }
 
     fn load_graph(&mut self, cx: &mut Context<Self>) {
-        if self.graph_loading {
+        let app = self.app.read(cx);
+        let Some(client) = app.client.clone() else {
+            return;
+        };
+        let source = app.profile_generation;
+        if self.graph_loading && self.graph_source == Some(source) {
             return;
         }
-        let (client, rt) = {
-            let s = self.app.read(cx);
-            (s.client.clone(), s.tokio_rt.clone())
-        };
-        let Some(client) = client else {
-            return;
-        };
+        self.graph_source = Some(source);
+        self.graph_error = None;
         self.graph_loading = true;
+        let rt = app.tokio_rt.clone();
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = rt
                 .spawn(async move { client.get_learning_graph().await })
-                .await;
-            let _ = this.update(cx, |v, cx| {
-                v.graph_loading = false;
-                if let Ok(Ok(g)) = result {
-                    v.app.update(cx, |s, cx| {
-                        s.learning_graph = Some(g);
-                        cx.notify();
-                    });
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |view, cx| {
+                if view.graph_source != Some(source) {
+                    return;
+                }
+                view.graph_loading = false;
+                if view.app.read(cx).profile_generation == source {
+                    match result {
+                        Ok(graph) => view.app.update(cx, |app, cx| {
+                            app.learning_graph = Some(graph);
+                            cx.notify();
+                        }),
+                        Err(error) => view.graph_error = Some(error),
+                    }
                 }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn run_curator(&mut self, cx: &mut Context<Self>) {
+        if self.curator_busy {
+            return;
+        }
+        let app = self.app.read(cx);
+        let Some(client) = app.client.clone() else {
+            return;
+        };
+        let source = app.profile_generation;
+        let rt = app.tokio_rt.clone();
+        self.curator_busy = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = rt
+                .spawn(async move { client.run_curator().await })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |view, cx| {
+                view.curator_busy = false;
+                cx.notify();
+                if view.app.read(cx).profile_generation != source {
+                    return;
+                }
+                match result {
+                    Ok(_) => {
+                        view.app.update(cx, |app, cx| {
+                            app.show_toast("Triggered Hermes memory curator", cx)
+                        });
+                        if view.tab == MemoryTab::Graph {
+                            view.load_graph(cx);
+                        }
+                    }
+                    Err(error) => view.app.update(cx, |app, cx| app.show_toast(error, cx)),
+                }
             });
         })
         .detach();
@@ -117,7 +174,7 @@ impl MemoryView {
 
 impl Render for MemoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (theme, is_local, mem, usr, soul, graph, has_client) = {
+        let (theme, is_local, mem, usr, soul, source, has_client) = {
             let s = self.app.read(cx);
             (
                 s.sand_theme(),
@@ -125,24 +182,29 @@ impl Render for MemoryView {
                 s.memory_md.clone(),
                 s.user_md.clone(),
                 s.soul_md.clone(),
-                s.learning_graph.clone(),
+                s.profile_generation,
                 s.client.is_some(),
             )
         };
-        if self.synced_mem != mem {
+        if self.synced_mem != mem && self.mem_input.read(cx).value().as_ref() == self.synced_mem {
             self.synced_mem = mem.clone();
             self.mem_input
                 .update(cx, |st, cx| st.set_value(mem, window, cx));
         }
-        if self.synced_user != usr {
+        if self.synced_user != usr && self.user_input.read(cx).value().as_ref() == self.synced_user
+        {
             self.synced_user = usr.clone();
             self.user_input
                 .update(cx, |st, cx| st.set_value(usr, window, cx));
         }
-        if self.synced_soul != soul {
+        if self.synced_soul != soul && self.soul_input.read(cx).value().as_ref() == self.synced_soul
+        {
             self.synced_soul = soul.clone();
             self.soul_input
                 .update(cx, |st, cx| st.set_value(soul, window, cx));
+        }
+        if self.tab == MemoryTab::Graph && has_client && self.graph_source != Some(source) {
+            self.load_graph(cx);
         }
         let tab_id = self.tab_entrance.id("memory-tab", self.tab);
 
@@ -177,13 +239,16 @@ impl Render for MemoryView {
                         div()
                             .flex()
                             .items_center()
+                            .flex_wrap()
                             .gap(px(8.0))
                             .child(
-                                gb_segmented_shell(&theme)
+                                gb_segmented_shell(&theme).flex_wrap()
                                     .child(
                                         gb_segmented_item("mem-t-mem", &theme, self.tab == MemoryTab::Memory, "MEMORY.md")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.tab = MemoryTab::Memory;
+                                                this.smooth_scroller.cancel();
+                                                this.scroll_handle.set_offset(Point::default());
                                                 cx.notify();
                                             })),
                                     )
@@ -191,6 +256,8 @@ impl Render for MemoryView {
                                         gb_segmented_item("mem-t-user", &theme, self.tab == MemoryTab::User, "USER.md")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.tab = MemoryTab::User;
+                                                this.smooth_scroller.cancel();
+                                                this.scroll_handle.set_offset(Point::default());
                                                 cx.notify();
                                             })),
                                     )
@@ -198,6 +265,8 @@ impl Render for MemoryView {
                                         gb_segmented_item("mem-t-soul", &theme, self.tab == MemoryTab::Soul, "SOUL.md")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.tab = MemoryTab::Soul;
+                                                this.smooth_scroller.cancel();
+                                                this.scroll_handle.set_offset(Point::default());
                                                 cx.notify();
                                             })),
                                     )
@@ -205,6 +274,8 @@ impl Render for MemoryView {
                                         gb_segmented_item("mem-t-graph", &theme, self.tab == MemoryTab::Graph, "Learning Graph")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.tab = MemoryTab::Graph;
+                                                this.smooth_scroller.cancel();
+                                                this.scroll_handle.set_offset(Point::default());
                                                 this.load_graph(cx);
                                                 cx.notify();
                                             })),
@@ -212,24 +283,10 @@ impl Render for MemoryView {
                             )
                             .when(has_client, |d| {
                                 d.child(
-                                    gb_btn("mem-curator-btn", &theme, BtnVariant::Secondary, false, false)
+                                    gb_btn("mem-curator-btn", &theme, BtnVariant::Secondary, false, self.curator_busy)
                                         .child(cursor_icon("sparkles", 13.0, theme.text_primary))
                                         .child("Run Curator")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            let (c, rt) = {
-                                                let s = this.app.read(cx);
-                                                (s.client.clone(), s.tokio_rt.clone())
-                                            };
-                                            if let Some(c) = c {
-                                                cx.spawn(async move |this, cx| {
-                                                    let _ = rt.spawn(async move { c.run_curator().await }).await;
-                                                    let _ = this.update(cx, |v, cx| {
-                                                        v.app.update(cx, |s, cx| s.show_toast("Triggered Hermes memory curator", cx));
-                                                    });
-                                                })
-                                                .detach();
-                                            }
-                                        })),
+                                        .on_click(cx.listener(|this, _, _, cx| this.run_curator(cx))),
                                 )
                             }),
                     ),
@@ -240,6 +297,7 @@ impl Render for MemoryView {
                     .min_h_0()
                     .w_full()
                     .relative()
+                    .child(self.editor_regions.reset_marker())
                     .child(
                         div()
                             .id("memory-scroll")
@@ -249,11 +307,13 @@ impl Render for MemoryView {
                             .px(px(24.0))
                     .py(px(20.0))
                     .flex()
-                    .justify_center()
+                    .flex_col()
+                    .items_center()
                     .child(view_enter(tab_id,
                         div()
                             .w(px(920.0))
                             .max_w_full()
+                            .flex_shrink_0()
                             .when(self.tab == MemoryTab::Memory, |d| {
                                 d.child(
                                     gb_section_card(&theme)
@@ -272,6 +332,8 @@ impl Render for MemoryView {
                                         .child(
                                             div()
                                                 .p(px(16.0))
+                                                .relative()
+                                                .child(self.editor_regions.mark_nested())
                                                 .child(Textarea::new(&self.mem_input).h(px(380.0)).readonly(!is_local)),
                                         ),
                                 )
@@ -294,6 +356,8 @@ impl Render for MemoryView {
                                         .child(
                                             div()
                                                 .p(px(16.0))
+                                                .relative()
+                                                .child(self.editor_regions.mark_nested())
                                                 .child(Textarea::new(&self.user_input).h(px(380.0)).readonly(!is_local)),
                                         ),
                                 )
@@ -316,12 +380,21 @@ impl Render for MemoryView {
                                         .child(
                                             div()
                                                 .p(px(16.0))
+                                                .relative()
+                                                .child(self.editor_regions.mark_nested())
                                                 .child(Textarea::new(&self.soul_input).h(px(380.0))),
                                         ),
                                 )
                             })
                             .when(self.tab == MemoryTab::Graph, |d| {
-                                let nodes = graph.map(|g| g.nodes).unwrap_or_default();
+                                let loaded = has_client && self.graph_source == Some(source)
+                                    && !self.graph_loading && self.graph_error.is_none();
+                                let nodes = if loaded {
+                                    self.app.read(cx).learning_graph.as_ref()
+                                        .map_or(&[][..], |graph| graph.nodes.as_slice())
+                                } else {
+                                    &[]
+                                };
                                 d.child(
                                     gb_section_card(&theme)
                                         .child(
@@ -342,12 +415,22 @@ impl Render for MemoryView {
                                                 .text_color(theme.text_tertiary)
                                                 .when(self.graph_loading, |d| d.child(gpu_spinner(28.0, theme.text_tertiary)))
                                                 .when(!self.graph_loading, |d| d.child(cursor_icon("brain", 28.0, theme.text_tertiary)))
-                                                .child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_primary).child(if self.graph_loading { "Loading learning graph…" } else { "Learning graph is building" }))
-                                                .child("As you work with Hermes, learned skills and memories appear here.")
+                                                .child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_primary).child(
+                                                    if !has_client { "Connect to Hermes to view the learning graph." }
+                                                    else if self.graph_loading { "Loading learning graph…" }
+                                                    else if self.graph_error.is_some() { "Could not load the learning graph." }
+                                                    else { "No learned skills or memories yet." }
+                                                ))
+                                                .when_some(self.graph_error.as_deref(), |view, error| {
+                                                    view.child(error.to_owned())
+                                                        .child(gb_btn("mem-retry-graph", &theme, BtnVariant::Secondary, true, false)
+                                                            .child("Retry")
+                                                            .on_click(cx.listener(|this, _, _, cx| this.load_graph(cx))))
+                                                })
                                                 .into_any_element()]
                                         } else {
                                             nodes
-                                                .into_iter()
+                                                .iter()
                                                 .map(|node| {
                                                     gb_row(&theme)
                                                         .child(
@@ -358,10 +441,10 @@ impl Render for MemoryView {
                                                                         .flex()
                                                                         .items_center()
                                                                         .gap(px(8.0))
-                                                                        .child(div().text_size(px(13.5)).font_weight(FontWeight::MEDIUM).child(node.label))
-                                                                        .child(gb_badge(&theme, BadgeTone::Accent, node.kind)),
+                                                                        .child(div().text_size(px(13.5)).font_weight(FontWeight::MEDIUM).child(node.label.clone()))
+                                                                        .child(gb_badge(&theme, BadgeTone::Accent, node.kind.clone())),
                                                                 )
-                                                                .when_some(node.summary, |d, sum| {
+                                                                .when_some(node.summary.clone(), |d, sum| {
                                                                     d.child(div().text_size(px(12.0)).text_color(theme.text_tertiary).child(sum))
                                                                 }),
                                                         )
@@ -374,7 +457,7 @@ impl Render for MemoryView {
                     )),
                     )
                     .vertical_scrollbar(&self.scroll_handle)
-                    .child(smooth_scroll_layer(&self.smooth_scroller)),
+                    .child(smooth_scroll_layer(&self.smooth_scroller).yield_to(&self.editor_regions)),
             )
     }
 }

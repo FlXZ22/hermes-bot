@@ -142,13 +142,17 @@ impl HermesClient {
         Ok(parsed)
     }
 
-    pub async fn test_connection(&self) -> Result<HermesStatus, String> {
-        let status_val = self.request_json(Method::GET, "/api/status", &[], None).await?;
-        let _profiles = self.request_json(Method::GET, "/api/profiles", &[], None).await?;
+    pub async fn test_connection(&self) -> Result<(HermesStatus, Vec<HermesProfile>), String> {
+        let (status_val, profiles_val) = tokio::try_join!(
+            self.request_json(Method::GET, "/api/status", &[], None),
+            self.request_json(Method::GET, "/api/profiles", &[], None),
+        )?;
         if !status_val.is_object() {
             return Err("This address did not return the Hermes dashboard API. Check the server URL.".into());
         }
-        Ok(serde_json::from_value(status_val).unwrap_or_default())
+        let status = serde_json::from_value(status_val).unwrap_or_default();
+        let profiles = extract_vec(&profiles_val, &["profiles", "items"]);
+        Ok((status, profiles))
     }
 
     pub async fn get_auth_providers(&self) -> Result<Vec<AuthProviderInfo>, String> {
@@ -349,6 +353,8 @@ impl HermesClient {
                                     },
                                     duration_ms: t.get("durationMs").and_then(Value::as_u64),
                                     preview: None,
+                                    inline_diff: t.get("inline_diff").and_then(Value::as_str).map(String::from),
+                                    waiting_approval: false,
                                 }
                             })
                             .collect()

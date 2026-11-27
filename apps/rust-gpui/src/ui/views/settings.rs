@@ -9,11 +9,12 @@ use crate::theme::components::{
 };
 use crate::theme::tokens::ThemeMode;
 use crate::ui::motion::gpu_spinner;
-use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
+use crate::ui::smooth_scroll::{smooth_scroll_layer, NestedScrollRegions, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
@@ -41,35 +42,48 @@ pub struct SettingsView {
     // Config YAML editor
     config_input: Entity<TextareaState>,
     synced_config: String,
+    config_source: (String, String),
+    config_drafts: HashMap<(String, String), String>,
+    config_saving: bool,
+    env_saving: bool,
+    profile_creating: bool,
 
     // SSH connection form (for remote mode)
     ssh_host_input: Entity<InputState>,
     ssh_user_input: Entity<InputState>,
     ssh_port_input: Entity<InputState>,
     ssh_key_input: Entity<InputState>,
-    synced_ssh_conn: String,
+    synced_ssh: [String; 4],
+    ssh_saving: bool,
 
     // Updater controls
     repo_path_input: Entity<InputState>,
     branch_input: Entity<InputState>,
     force_native_rebuild: bool,
-    synced_updater_key: String,
+    synced_updater: [String; 2],
     updater_busy: bool,
     diag_busy: bool,
     scroll_handle: ScrollHandle,
     smooth_scroller: SmoothScroller,
+    nested_scroll: NestedScrollRegions,
+    log_scroll: [ScrollHandle; 3],
 }
 
 impl SettingsView {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (cfg, conn, upd) = {
+        let (cfg, conn, profile, upd) = {
             let s = app.read(cx);
             (
                 s.raw_config.clone(),
                 s.connection.clone(),
-                s.updater.status(),
+                s.active_profile.clone(),
+                s.update_status.clone(),
             )
         };
+        if upd.is_none() {
+            app.update(cx, |s, cx| s.refresh_updater_status(cx));
+        }
+        let config_source = (conn.id.clone(), profile);
         let env_key_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("e.g. OPENROUTER_API_KEY"));
         let env_val_input = cx.new(|cx| {
@@ -109,7 +123,9 @@ impl SettingsView {
         let ssh_port_input = cx.new(|cx| {
             let mut st = InputState::new(window, cx).placeholder("22");
             st.set_value(
-                ssh.port.map(|p| p.to_string()).unwrap_or_else(|| "22".into()),
+                ssh.port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "22".into()),
                 window,
                 cx,
             );
@@ -123,20 +139,36 @@ impl SettingsView {
 
         let repo_path_input = cx.new(|cx| {
             let mut st = InputState::new(window, cx).placeholder("/path/to/hermes-bot");
-            st.set_value(upd.repo_path.clone().unwrap_or_default(), window, cx);
+            st.set_value(
+                upd.as_ref()
+                    .and_then(|status| status.repo_path.clone())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            );
             st
         });
         let branch_input = cx.new(|cx| {
             let mut st = InputState::new(window, cx).placeholder("main");
-            st.set_value(upd.target_branch.clone(), window, cx);
+            st.set_value(
+                upd.as_ref()
+                    .map(|status| status.target_branch.clone())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            );
             st
         });
 
-        let synced_ssh_conn = format!("{}:{:?}", conn.url, conn.ssh);
-        let synced_updater_key = format!("{:?}:{}", upd.repo_path, upd.target_branch);
+        let synced_ssh = ssh_fields(conn.ssh.as_ref());
+        let synced_updater = [
+            repo_path_input.read(cx).value().to_string(),
+            branch_input.read(cx).value().to_string(),
+        ];
 
         cx.observe(&app, |_, app_e, cx| {
-            if app_e.read(cx).active_view == AppViewId::Settings {
+            let app = app_e.read(cx);
+            if !app.setup_open && !app.initializing && app.active_view == AppViewId::Settings {
                 cx.notify();
             }
         })
@@ -152,53 +184,79 @@ impl SettingsView {
             profile_desc_input,
             config_input,
             synced_config: cfg,
+            config_source,
+            config_drafts: HashMap::new(),
+            config_saving: false,
+            env_saving: false,
+            profile_creating: false,
             ssh_host_input,
             ssh_user_input,
             ssh_port_input,
             ssh_key_input,
-            synced_ssh_conn,
+            synced_ssh,
+            ssh_saving: false,
             repo_path_input,
             branch_input,
             force_native_rebuild: false,
-            synced_updater_key,
+            synced_updater,
             updater_busy: false,
             diag_busy: false,
             scroll_handle,
             smooth_scroller,
+            nested_scroll: NestedScrollRegions::default(),
+            log_scroll: std::array::from_fn(|_| ScrollHandle::new()),
         }
     }
 
     fn save_env(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let key = self.env_key_input.read(cx).value().trim().to_string();
-        let val = self.env_val_input.read(cx).value().trim().to_string();
-        if key.is_empty() || val.is_empty() {
+        if self.env_saving {
             return;
         }
-        let (client, rt) = {
-            let s = self.app.read(cx);
-            (s.client.clone(), s.tokio_rt.clone())
-        };
-        let Some(client) = client else {
+        let key = self.env_key_input.read(cx).value().trim().to_string();
+        let value = self.env_val_input.read(cx).value().trim().to_string();
+        if key.is_empty() || value.is_empty() {
+            self.app
+                .update(cx, |s, cx| s.show_toast("Enter a key and value.", cx));
+            return;
+        }
+        let app = self.app.read(cx);
+        let Some(client) = app.client.clone() else {
             return;
         };
-        self.env_key_input
-            .update(cx, |st, cx| st.set_value("", window, cx));
-        self.env_val_input
-            .update(cx, |st, cx| st.set_value("", window, cx));
-        let k2 = key.clone();
-        cx.spawn(async move |this, cx| {
-            let res = rt
-                .spawn(async move { client.set_env(&k2, &val).await })
+        let rt = app.tokio_rt.clone();
+        let generation = app.profile_generation;
+        let submitted_key = key.clone();
+        let submitted_value = value.clone();
+        self.env_saving = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = rt
+                .spawn(async move { client.set_env(&submitted_key, &submitted_value).await })
                 .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            let _ = this.update(cx, |v, cx| {
-                v.app.update(cx, |s, cx| match res {
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.env_saving = false;
+                cx.notify();
+                if view.app.read(cx).profile_generation != generation {
+                    return;
+                }
+                match result {
                     Ok(_) => {
-                        s.show_toast(format!("Saved {key}"), cx);
-                        s.refresh_capabilities(false, cx);
+                        if view.env_key_input.read(cx).value().trim() == key
+                            && view.env_val_input.read(cx).value().trim() == value
+                        {
+                            view.env_key_input
+                                .update(cx, |st, cx| st.set_value("", window, cx));
+                            view.env_val_input
+                                .update(cx, |st, cx| st.set_value("", window, cx));
+                        }
+                        view.app.update(cx, |s, cx| {
+                            s.refresh_env(cx);
+                            s.show_toast(format!("Saved {key}"), cx);
+                        });
                     }
-                    Err(e) => s.show_toast(e, cx),
-                });
+                    Err(error) => view.app.update(cx, |s, cx| s.show_toast(error, cx)),
+                }
             });
         })
         .detach();
@@ -222,7 +280,7 @@ impl SettingsView {
                 v.app.update(cx, |s, cx| match res {
                     Ok(_) => {
                         s.show_toast(format!("Removed {key}"), cx);
-                        s.refresh_capabilities(false, cx);
+                        s.refresh_env(cx);
                     }
                     Err(e) => s.show_toast(e, cx),
                 });
@@ -232,64 +290,95 @@ impl SettingsView {
     }
 
     fn create_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self.profile_name_input.read(cx).value().trim().to_string();
-        let desc = self.profile_desc_input.read(cx).value().trim().to_string();
-        if name.is_empty() {
+        if self.profile_creating {
             return;
         }
-        let (client, rt) = {
-            let s = self.app.read(cx);
-            (s.client.clone(), s.tokio_rt.clone())
-        };
-        let Some(client) = client else {
+        let name = self.profile_name_input.read(cx).value().trim().to_string();
+        let description = self.profile_desc_input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.app
+                .update(cx, |s, cx| s.show_toast("Enter a profile name.", cx));
+            return;
+        }
+        let app = self.app.read(cx);
+        let Some(client) = app.client.clone() else {
             return;
         };
-        self.profile_name_input
-            .update(cx, |st, cx| st.set_value("", window, cx));
-        self.profile_desc_input
-            .update(cx, |st, cx| st.set_value("", window, cx));
-        let n2 = name.clone();
-        let desc_opt = if desc.is_empty() { None } else { Some(desc) };
-        cx.spawn(async move |this, cx| {
-            let res = rt
-                .spawn(async move { client.create_profile(&n2, desc_opt.as_deref()).await })
+        let rt = app.tokio_rt.clone();
+        let generation = app.profile_generation;
+        let submitted_name = name.clone();
+        let submitted_description = description.clone();
+        self.profile_creating = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = rt
+                .spawn(async move {
+                    let description = (!submitted_description.is_empty())
+                        .then_some(submitted_description.as_str());
+                    client.create_profile(&submitted_name, description).await
+                })
                 .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            let _ = this.update(cx, |v, cx| {
-                v.app.update(cx, |s, cx| match res {
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.profile_creating = false;
+                cx.notify();
+                if view.app.read(cx).profile_generation != generation {
+                    return;
+                }
+                match result {
                     Ok(_) => {
-                        s.show_toast(format!("Created bot profile \"{name}\""), cx);
-                        s.refresh_capabilities(false, cx);
+                        if view.profile_name_input.read(cx).value().trim() == name
+                            && view.profile_desc_input.read(cx).value().trim() == description
+                        {
+                            view.profile_name_input
+                                .update(cx, |st, cx| st.set_value("", window, cx));
+                            view.profile_desc_input
+                                .update(cx, |st, cx| st.set_value("", window, cx));
+                        }
+                        view.app.update(cx, |s, cx| {
+                            s.refresh_profiles(cx);
+                            s.show_toast(format!("Created bot profile \"{name}\""), cx);
+                        });
                     }
-                    Err(e) => s.show_toast(e, cx),
-                });
+                    Err(error) => view.app.update(cx, |s, cx| s.show_toast(error, cx)),
+                }
             });
         })
         .detach();
     }
 
     fn save_config_yaml(&mut self, cx: &mut Context<Self>) {
-        let content = self.config_input.read(cx).value().to_string();
-        let (client, rt) = {
-            let s = self.app.read(cx);
-            (s.client.clone(), s.tokio_rt.clone())
-        };
-        let Some(client) = client else {
+        let app = self.app.read(cx);
+        let source = (app.connection.id.clone(), app.active_profile.clone());
+        if self.config_saving || source != self.config_source {
+            return;
+        }
+        let Some(client) = app.client.clone() else {
             return;
         };
-        let c2 = content.clone();
+        let content = self.config_input.read(cx).value().to_string();
+        let submitted = content.clone();
+        let rt = app.tokio_rt.clone();
+        let generation = app.profile_generation;
+        self.config_saving = true;
+        cx.notify();
         cx.spawn(async move |this, cx| {
-            let res = rt
-                .spawn(async move { client.save_raw_config(&c2).await })
+            let result = rt
+                .spawn(async move { client.save_raw_config(&submitted).await })
                 .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            let _ = this.update(cx, |v, cx| {
-                v.app.update(cx, |s, cx| match res {
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |view, cx| {
+                view.config_saving = false;
+                cx.notify();
+                if view.app.read(cx).profile_generation != generation {
+                    return;
+                }
+                view.app.update(cx, |s, cx| match result {
                     Ok(_) => {
                         s.raw_config = content;
                         s.show_toast("Saved config.yaml", cx);
                     }
-                    Err(e) => s.show_toast(e, cx),
+                    Err(error) => s.show_toast(error, cx),
                 });
             });
         })
@@ -297,36 +386,82 @@ impl SettingsView {
     }
 
     fn save_ssh_settings(&mut self, cx: &mut Context<Self>) {
-        let host = self.ssh_host_input.read(cx).value().trim().to_string();
-        let user = self.ssh_user_input.read(cx).value().trim().to_string();
-        let port_raw = self.ssh_port_input.read(cx).value().trim().to_string();
-        let key = self.ssh_key_input.read(cx).value().trim().to_string();
-        let ssh = if host.is_empty() {
+        if self.ssh_saving {
+            return;
+        }
+        let [host, user, port_raw, key] = self.ssh_draft(cx).map(|value| value.trim().to_string());
+        let port = if host.is_empty() || port_raw.is_empty() {
             None
-        } else {
-            Some(SshTarget {
-                host,
-                user: if user.is_empty() { None } else { Some(user) },
-                port: port_raw.parse::<u16>().ok(),
-                identity_file: if key.is_empty() { None } else { Some(key) },
-                config_file: None,
-            })
-        };
-        self.app.update(cx, |s, cx| {
-            let mut next = s.connection.clone();
-            next.ssh = ssh;
-            s.connection = next.clone();
-            if let Ok(path) = crate::backend::remote::connection_path() {
-                if let Ok(val) = serde_json::to_value(&next) {
-                    let _ = crate::backend::remote::save_connection(&path, &val);
-                }
+        } else if let Ok(port) = port_raw.parse::<u16>() {
+            if port == 0 {
+                self.app.update(cx, |s, cx| {
+                    s.show_toast("SSH port must be between 1 and 65535.", cx)
+                });
+                return;
             }
-            s.show_toast("Saved SSH target for remote workspace & terminal", cx);
-            cx.notify();
+            Some(port)
+        } else {
+            self.app.update(cx, |s, cx| {
+                s.show_toast("SSH port must be between 1 and 65535.", cx)
+            });
+            return;
+        };
+        let app = self.app.read(cx);
+        let mut connection = app.connection.clone();
+        let source = connection.id.clone();
+        connection.ssh = (!host.is_empty()).then(|| SshTarget {
+            host,
+            user: (!user.is_empty()).then_some(user),
+            port,
+            identity_file: (!key.is_empty()).then_some(key),
+            config_file: connection
+                .ssh
+                .as_ref()
+                .and_then(|old| old.config_file.clone()),
         });
+        let rt = app.tokio_rt.clone();
+        self.ssh_saving = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let saved = rt
+                .spawn_blocking(move || {
+                    let path = crate::backend::remote::connection_path()?;
+                    let value =
+                        serde_json::to_value(&connection).map_err(|error| error.to_string())?;
+                    crate::backend::remote::save_connection(&path, &value)?;
+                    Ok::<_, String>(connection.ssh)
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |view, cx| {
+                view.ssh_saving = false;
+                cx.notify();
+                view.app.update(cx, |s, cx| match saved {
+                    Ok(ssh) if s.connection.id == source => {
+                        s.connection.ssh = ssh;
+                        s.show_toast("Saved SSH target for remote workspace & terminal", cx);
+                    }
+                    Ok(_) => {}
+                    Err(error) => s.show_toast(error, cx),
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn ssh_draft(&self, cx: &App) -> [String; 4] {
+        [
+            self.ssh_host_input.read(cx).value().to_string(),
+            self.ssh_user_input.read(cx).value().to_string(),
+            self.ssh_port_input.read(cx).value().to_string(),
+            self.ssh_key_input.read(cx).value().to_string(),
+        ]
     }
 
     fn run_diag(&mut self, security: bool, cx: &mut Context<Self>) {
+        if self.diag_busy {
+            return;
+        }
         let (client, rt) = {
             let s = self.app.read(cx);
             (s.client.clone(), s.tokio_rt.clone())
@@ -339,11 +474,12 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             let res = rt
                 .spawn(async move {
-                    if security {
+                    let report = if security {
                         client.run_security_audit().await
                     } else {
                         client.run_doctor().await
-                    }
+                    }?;
+                    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
                 })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
@@ -351,7 +487,7 @@ impl SettingsView {
                 v.diag_busy = false;
                 v.app.update(cx, |s, cx| match res {
                     Ok(val) => {
-                        s.diag_output = serde_json::to_string_pretty(&val).unwrap_or_default();
+                        s.diag_output = val;
                         s.show_toast(
                             if security {
                                 "Security audit completed"
@@ -373,6 +509,16 @@ impl SettingsView {
     }
 
     fn check_updates(&mut self, cx: &mut Context<Self>) {
+        if self.updater_busy
+            || self
+                .app
+                .read(cx)
+                .update_status
+                .as_ref()
+                .is_some_and(|status| update_in_progress(&status.phase))
+        {
+            return;
+        }
         let (updater, rt) = {
             let s = self.app.read(cx);
             (s.updater.clone(), s.tokio_rt.clone())
@@ -408,61 +554,123 @@ impl SettingsView {
     }
 
     fn save_updater_settings(&mut self, auto_check: Option<bool>, cx: &mut Context<Self>) {
-        let repo_path = self.repo_path_input.read(cx).value().trim().to_string();
-        let branch = self.branch_input.read(cx).value().trim().to_string();
-        let patch = UpdateSettingsPatch {
-            target_branch: if branch.is_empty() { None } else { Some(branch) },
-            repo_path: Some(repo_path),
-            auto_check,
-        };
-        let res = self.app.read(cx).updater.update_settings(patch);
-        self.app.update(cx, |s, cx| match res {
-            Ok(st) => {
-                s.update_status = Some(st);
-                s.show_toast("Updater settings saved", cx);
+        let app = self.app.read(cx);
+        if self.updater_busy
+            || app
+                .update_status
+                .as_ref()
+                .is_some_and(|status| update_in_progress(&status.phase))
+        {
+            return;
+        }
+        let patch = if let Some(enabled) = auto_check {
+            UpdateSettingsPatch {
+                target_branch: None,
+                repo_path: None,
+                auto_check: Some(enabled),
             }
-            Err(e) => s.show_toast(e, cx),
-        });
+        } else {
+            let repo_path = self.repo_path_input.read(cx).value().trim().to_string();
+            let branch = self.branch_input.read(cx).value().trim().to_string();
+            UpdateSettingsPatch {
+                target_branch: (!branch.is_empty()).then_some(branch),
+                repo_path: Some(repo_path),
+                auto_check: None,
+            }
+        };
+        let rt = app.tokio_rt.clone();
+        let updater = app.updater.clone();
+        self.updater_busy = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = rt
+                .spawn_blocking(move || updater.update_settings(patch))
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |view, cx| {
+                view.updater_busy = false;
+                cx.notify();
+                view.app.update(cx, |s, cx| match result {
+                    Ok(status) => {
+                        s.update_status = Some(status);
+                        s.show_toast("Updater settings saved", cx);
+                    }
+                    Err(error) => s.show_toast(error, cx),
+                });
+            });
+        })
+        .detach();
     }
 
     fn apply_update(&mut self, mode: &'static str, cx: &mut Context<Self>) {
-        let force = self.force_native_rebuild;
-        let updater = self.app.read(cx).updater.clone();
-        match updater.apply_update(mode.to_string(), force) {
-            Ok(st) => {
-                self.app.update(cx, |s, cx| {
-                    s.update_status = Some(st);
-                    s.show_toast("Update started — watching build logs", cx);
-                });
-                // Poll updater status while running
-                cx.spawn(async move |this, cx| {
-                    for _ in 0..180 {
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(800))
-                            .await;
-                        let done = this
-                            .update(cx, |v, cx| {
-                                let st = v.app.read(cx).updater.status();
-                                let finished =
-                                    matches!(st.phase.as_str(), "done" | "error" | "idle");
-                                v.app.update(cx, |s, cx| {
-                                    s.update_status = Some(st);
-                                    cx.notify();
-                                });
-                                finished
-                            })
-                            .unwrap_or(true);
-                        if done {
-                            break;
-                        }
-                    }
-                })
-                .detach();
-            }
-            Err(e) => {
-                self.app.update(cx, |s, cx| s.show_toast(e, cx));
-            }
+        let app = self.app.read(cx);
+        if self.updater_busy
+            || !app.update_status.as_ref().is_some_and(|status| {
+                status.repo_valid
+                    && !update_in_progress(&status.phase)
+                    && status.phase != "restart_required"
+            })
+        {
+            return;
         }
+        let force = self.force_native_rebuild;
+        let rt = app.tokio_rt.clone();
+        let handle = rt.handle().clone();
+        let updater = app.updater.clone();
+        self.updater_busy = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let status = rt
+                .spawn_blocking(move || updater.apply_update_on(&handle, mode.to_string(), force))
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let started = this
+                .update(cx, |view, cx| {
+                    view.updater_busy = false;
+                    cx.notify();
+                    view.app.update(cx, |s, cx| match status {
+                        Ok(status) => {
+                            let running = update_in_progress(&status.phase);
+                            s.update_status = Some(status);
+                            s.show_toast("Update started", cx);
+                            running
+                        }
+                        Err(error) => {
+                            s.show_toast(error, cx);
+                            false
+                        }
+                    })
+                })
+                .unwrap_or(false);
+            if !started {
+                return;
+            }
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1000))
+                    .await;
+                let running = this
+                    .update(cx, |view, cx| {
+                        if view
+                            .app
+                            .read(cx)
+                            .update_status
+                            .as_ref()
+                            .is_some_and(|status| update_in_progress(&status.phase))
+                        {
+                            view.app.update(cx, |s, cx| s.refresh_updater_status(cx));
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !running {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 }
 
@@ -489,73 +697,94 @@ impl Render for SettingsView {
             has_client,
         ) = {
             let s = self.app.read(cx);
+            let tabs = self.tab;
+            let backend_info = if tabs == SettingsTab::Connections {
+                s.rust_backend.as_ref().map(|backend| (backend.pid, backend.url.clone()))
+            } else {
+                None
+            };
+            let mut server_logs = Vec::new();
+            let mut sup_logs = Vec::new();
+            if tabs == SettingsTab::Logs {
+                server_logs.extend_from_slice(&s.server_logs[s.server_logs.len().saturating_sub(120)..]);
+                if let Some(backend) = s.rust_backend.as_ref() {
+                    let start = backend.logs.len().saturating_sub(60);
+                    sup_logs.extend(backend.logs.iter().skip(start).cloned());
+                }
+            }
             (
                 s.sand_theme(),
                 s.theme_mode(),
                 s.active_model.clone(),
                 s.connection.clone(),
-                s.rust_backend.clone(),
-                s.system_stats.clone(),
+                backend_info,
+                (tabs == SettingsTab::Appearance).then(|| s.system_stats.clone()).flatten(),
                 s.bootstrap_ms,
                 s.restarting_backend,
-                s.env_entries.clone(),
-                s.profiles.clone(),
+                if tabs == SettingsTab::ApiKeys { s.env_entries.clone() } else { Vec::new() },
+                if tabs == SettingsTab::Profiles { s.profiles.clone() } else { Vec::new() },
                 s.active_profile.clone(),
-                s.bot_avatars.clone(),
-                s.raw_config.clone(),
-                s.server_logs.clone(),
-                s.rust_backend
-                    .as_ref()
-                    .map(|b| b.logs.clone())
-                    .unwrap_or_default(),
-                s.diag_output.clone(),
-                s.update_status.clone().unwrap_or_else(|| s.updater.status()),
+                if tabs == SettingsTab::Profiles { s.bot_avatars.clone() } else { HashMap::new() },
+                (tabs == SettingsTab::Config).then(|| s.raw_config.clone()),
+                server_logs,
+                sup_logs,
+                if tabs == SettingsTab::Logs { s.diag_output.clone() } else { String::new() },
+                (tabs == SettingsTab::Updates).then(|| s.update_status.clone()).flatten(),
                 s.client.is_some(),
             )
         };
 
-        if raw_config != self.synced_config {
-            self.synced_config = raw_config.clone();
-            self.config_input
-                .update(cx, |st, cx| st.set_value(raw_config.clone(), window, cx));
-        }
-        let ssh_key = format!("{}:{:?}", conn.url, conn.ssh);
-        if ssh_key != self.synced_ssh_conn {
-            self.synced_ssh_conn = ssh_key;
-            let ssh = conn.ssh.clone().unwrap_or(SshTarget {
-                host: String::new(),
-                user: None,
-                port: Some(22),
-                identity_file: None,
-                config_file: None,
-            });
-            self.ssh_host_input
-                .update(cx, |st, cx| st.set_value(ssh.host, window, cx));
-            self.ssh_user_input.update(cx, |st, cx| {
-                st.set_value(ssh.user.unwrap_or_default(), window, cx)
-            });
-            self.ssh_port_input.update(cx, |st, cx| {
-                st.set_value(
-                    ssh.port.map(|p| p.to_string()).unwrap_or_else(|| "22".into()),
-                    window,
-                    cx,
-                )
-            });
-            self.ssh_key_input.update(cx, |st, cx| {
-                st.set_value(ssh.identity_file.unwrap_or_default(), window, cx)
-            });
-        }
-        let upd_key = format!("{:?}:{}", upd_status.repo_path, upd_status.target_branch);
-        if upd_key != self.synced_updater_key {
-            self.synced_updater_key = upd_key;
-            self.repo_path_input.update(cx, |st, cx| {
-                st.set_value(upd_status.repo_path.clone().unwrap_or_default(), window, cx)
-            });
-            self.branch_input.update(cx, |st, cx| {
-                st.set_value(upd_status.target_branch.clone(), window, cx)
-            });
+        let source = (conn.id.clone(), active_profile.clone());
+        let source_changed = source != self.config_source;
+        if let Some(raw_config) = raw_config {
+            if source_changed {
+                let previous = std::mem::replace(&mut self.config_source, source);
+                let draft = self.config_input.read(cx).value().to_string();
+                if draft != self.synced_config {
+                    self.config_drafts.insert(previous, draft);
+                }
+                let draft = self.config_drafts.remove(&self.config_source).unwrap_or_else(|| raw_config.clone());
+                self.synced_config.clone_from(&raw_config);
+                self.config_input.update(cx, |st, cx| st.set_value(draft, window, cx));
+            } else if raw_config != self.synced_config {
+                let clean = self.config_input.read(cx).value().to_string() == self.synced_config;
+                self.synced_config.clone_from(&raw_config);
+                if clean {
+                    self.config_input.update(cx, |st, cx| st.set_value(raw_config, window, cx));
+                }
+            }
         }
 
+        let ssh = ssh_fields(conn.ssh.as_ref());
+        if ssh != self.synced_ssh {
+            let clean = self.ssh_draft(cx) == self.synced_ssh;
+            self.synced_ssh = ssh.clone();
+            if clean {
+                for (input, value) in [
+                    &self.ssh_host_input, &self.ssh_user_input, &self.ssh_port_input, &self.ssh_key_input,
+                ].into_iter().zip(ssh) {
+                    input.update(cx, |st, cx| st.set_value(value, window, cx));
+                }
+            }
+        }
+
+        if let Some(status) = upd_status.as_ref() {
+            let next = [status.repo_path.clone().unwrap_or_default(), status.target_branch.clone()];
+            if next != self.synced_updater {
+                for ((input, old), value) in [&self.repo_path_input, &self.branch_input]
+                    .into_iter().zip(&self.synced_updater).zip(&next)
+                {
+                    if input.read(cx).value().to_string() == *old {
+                        input.update(cx, |st, cx| st.set_value(value.clone(), window, cx));
+                    }
+                }
+                self.synced_updater = next;
+            }
+        }
+
+        let sidebar_width = if self.app.read(cx).sidebar_collapsed { px(68.0) } else { px(280.0) };
+        let inspector_reserve = if self.app.read(cx).right_pane_open { px(360.0) } else { px(0.0) };
+        let narrow = window.viewport_size().width - sidebar_width - inspector_reserve < px(580.0);
         let tabs: &[(SettingsTab, &str)] = &[
             (SettingsTab::Appearance, "Appearance"),
             (SettingsTab::Connections, "Connections"),
@@ -578,6 +807,7 @@ impl Render for SettingsView {
                     .min_h_0()
                     .w_full()
                     .relative()
+                    .child(self.nested_scroll.reset_marker())
                     .child(
                         div()
                             .id("settings-scroll")
@@ -592,6 +822,7 @@ impl Render for SettingsView {
                         div()
                             .w_full()
                             .max_w(px(900.0))
+                            .flex_shrink_0()
                             .flex()
                             .flex_col()
                             .gap(px(18.0))
@@ -627,8 +858,15 @@ impl Render for SettingsView {
                                             *label,
                                         )
                                         .on_click(cx.listener(move |v, _, _, cx| {
-                                            v.tab = tab_val;
-                                            cx.notify();
+                                            if v.tab != tab_val {
+                                                v.tab = tab_val;
+                                                v.smooth_scroller.cancel();
+                                                v.scroll_handle.set_offset(Point::default());
+                                                if tab_val == SettingsTab::Updates && v.app.read(cx).update_status.is_none() {
+                                                    v.app.update(cx, |s, cx| s.refresh_updater_status(cx));
+                                                }
+                                                cx.notify();
+                                            }
                                         }))
                                     }),
                                 ),
@@ -703,6 +941,41 @@ impl Render for SettingsView {
                                                                 ),
                                                         ),
                                                 )
+                                                .child({
+                                                    let reduced = self.app.read(cx).reduced_motion();
+                                                    gb_row(&theme)
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .flex_col()
+                                                                .gap(px(2.0))
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(13.5))
+                                                                        .font_weight(FontWeight::MEDIUM)
+                                                                        .text_color(theme.text_primary)
+                                                                        .child("Reduced Motion"),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(12.0))
+                                                                        .text_color(theme.text_secondary)
+                                                                        .child("Freeze inline face animations on static state expressions while preserving state cues."),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            gb_toggle_switch(
+                                                                "settings-reduced-motion",
+                                                                &theme,
+                                                                reduced,
+                                                            )
+                                                            .on_click(cx.listener(move |v, _, _, cx| {
+                                                                v.app.update(cx, |s, cx| {
+                                                                    s.set_reduced_motion(!reduced, cx);
+                                                                });
+                                                            })),
+                                                        )
+                                                })
                                                 .child(
                                                     gb_row(&theme)
                                                         .child(
@@ -841,10 +1114,10 @@ impl Render for SettingsView {
                                                                         .text_size(px(11.5))
                                                                         .text_color(theme.text_secondary)
                                                                         .child(match &backend_info {
-                                                                            Some(bi) => format!(
+                                                                            Some((pid, url)) => format!(
                                                                                 "Managed PID {:?} · {}",
-                                                                                bi.pid,
-                                                                                bi.url.as_deref().unwrap_or("starting")
+                                                                                pid,
+                                                                                url.as_deref().unwrap_or("starting")
                                                                             ),
                                                                             None => format!("Mode: {:?}", conn.mode),
                                                                         }),
@@ -860,6 +1133,7 @@ impl Render for SettingsView {
                                                                         .on_click(cx.listener(|v, _, _, cx| {
                                                                             v.app.update(cx, |s, cx| {
                                                                                 s.setup_open = true;
+                                                                                s.bump_shell();
                                                                                 cx.notify();
                                                                             });
                                                                         })),
@@ -868,7 +1142,7 @@ impl Render for SettingsView {
                                                                     gb_btn("refresh-conn-btn", &theme, BtnVariant::Secondary, true, !has_client)
                                                                         .child("Refresh")
                                                                         .on_click(cx.listener(|v, _, _, cx| {
-                                                                            v.app.update(cx, |s, cx| s.refresh_capabilities(true, cx));
+                                                                            v.app.update(cx, |s, cx| s.refresh_core_capabilities(true, cx));
                                                                         })),
                                                                 ),
                                                         ),
@@ -895,7 +1169,7 @@ impl Render for SettingsView {
                                                         .child(
                                                             div()
                                                                 .grid()
-                                                                .grid_cols(2)
+                                                                .grid_cols(if narrow { 1 } else { 2 })
                                                                 .gap(px(10.0))
                                                                 .child(labeled_input(&theme, "SSH Host", &self.ssh_host_input))
                                                                 .child(labeled_input(&theme, "SSH User", &self.ssh_user_input))
@@ -907,7 +1181,7 @@ impl Render for SettingsView {
                                                                 .flex()
                                                                 .justify_end()
                                                                 .child(
-                                                                    gb_btn("save-ssh-btn", &theme, BtnVariant::Primary, true, false)
+                                                                    gb_btn("save-ssh-btn", &theme, BtnVariant::Primary, true, self.ssh_saving)
                                                                         .child("Save SSH Target")
                                                                         .on_click(cx.listener(|v, _, _, cx| {
                                                                             v.save_ssh_settings(cx);
@@ -1076,7 +1350,7 @@ impl Render for SettingsView {
                                                 )
                                                 .children(profiles.iter().enumerate().map(|(idx, prof)| {
                                                     let pname = prof.name.clone();
-                                                    let seed = format!("profile:{pname}");
+                                                    let seed = pname.clone();
                                                     let ov = avatars.get(&seed);
                                                     let active = pname == active_profile;
                                                     let display = ov
@@ -1152,6 +1426,7 @@ impl Render for SettingsView {
                                                                     .child("Customize")
                                                                     .on_click(cx.listener(move |v, _, _, cx| {
                                                                         v.app.update(cx, |s, cx| {
+                                                                            s.bump_shell();
                                                                             s.avatar_editor_target = Some(AvatarEditorTarget {
                                                                                 seed: seed_edit.clone(),
                                                                                 title: title_edit.clone(),
@@ -1192,7 +1467,7 @@ impl Render for SettingsView {
                                                             .child("~/.hermes/config.yaml"),
                                                     )
                                                     .child(
-                                                        gb_btn("save-yaml-btn", &theme, BtnVariant::Primary, true, !has_client)
+                                                        gb_btn("save-yaml-btn", &theme, BtnVariant::Primary, true, !has_client || self.config_saving)
                                                             .child("Save YAML")
                                                             .on_click(cx.listener(|v, _, _, cx| {
                                                                 v.save_config_yaml(cx);
@@ -1203,15 +1478,16 @@ impl Render for SettingsView {
                                                 div()
                                                     .p(px(14.0))
                                                     .font_family(FONT_MONO)
+                                                    .relative()
+                                                    .child(self.nested_scroll.mark_nested())
                                                     .child(Textarea::new(&self.config_input)),
                                             ),
                                     )
                                 }
                                 SettingsTab::Updates => {
-                                    let updating = !matches!(
-                                        upd_status.phase.as_str(),
-                                        "idle" | "done" | "error"
-                                    );
+                                    if let Some(upd_status) = upd_status.as_ref() {
+                                    let updating = update_in_progress(&upd_status.phase);
+                                    let restart_required = upd_status.phase == "restart_required";
                                     div()
                                         .flex()
                                         .flex_col()
@@ -1248,12 +1524,14 @@ impl Render for SettingsView {
                                                         )
                                                         .child(gb_badge(
                                                             &theme,
-                                                            if upd_status.update_available {
+                                                            if restart_required || upd_status.update_available {
                                                                 BadgeTone::Warning
                                                             } else {
                                                                 BadgeTone::Success
                                                             },
-                                                            if upd_status.update_available {
+                                                            if restart_required {
+                                                                "Restart required".into()
+                                                            } else if upd_status.update_available {
                                                                 format!("{} commits behind", upd_status.commits_behind)
                                                             } else {
                                                                 "Up to date".into()
@@ -1322,12 +1600,12 @@ impl Render for SettingsView {
                                                                         &theme,
                                                                         BtnVariant::Primary,
                                                                         true,
-                                                                        updating || !upd_status.repo_valid,
+                                                                        self.updater_busy || updating || restart_required || !upd_status.repo_valid,
                                                                     )
                                                                     .when(updating, |d| d.child(gpu_spinner(12.0, theme.text_on_primary)))
                                                                     .child(if updating { "Updating…" } else { "Update Now" })
                                                                     .on_click(cx.listener(|v, _, _, cx| {
-                                                                        v.apply_update("git", cx);
+                                                                        v.apply_update("remote", cx);
                                                                     })),
                                                                 )
                                                                 .child(
@@ -1336,7 +1614,7 @@ impl Render for SettingsView {
                                                                         &theme,
                                                                         BtnVariant::Secondary,
                                                                         true,
-                                                                        updating || !upd_status.repo_valid,
+                                                                        self.updater_busy || updating || restart_required || !upd_status.repo_valid,
                                                                     )
                                                                     .child("Install Local")
                                                                     .on_click(cx.listener(|v, _, _, cx| {
@@ -1367,7 +1645,7 @@ impl Render for SettingsView {
                                                         .child(
                                                             div()
                                                                 .grid()
-                                                                .grid_cols(2)
+                                                                .grid_cols(if narrow { 1 } else { 2 })
                                                                 .gap(px(10.0))
                                                                 .child(labeled_input(&theme, "Local Git Repository", &self.repo_path_input))
                                                                 .child(labeled_input(&theme, "Target Branch", &self.branch_input)),
@@ -1387,7 +1665,8 @@ impl Render for SettingsView {
                                                                                 .flex()
                                                                                 .items_center()
                                                                                 .gap(px(8.0))
-                                                                                .child(
+                                                                                .child({
+                                                                                    let next_auto_check = !upd_status.auto_check;
                                                                                     gb_toggle_switch(
                                                                                         "upd-auto-check",
                                                                                         &theme,
@@ -1396,12 +1675,12 @@ impl Render for SettingsView {
                                                                                     .on_click(cx.listener(
                                                                                         move |v, _, _, cx| {
                                                                                             v.save_updater_settings(
-                                                                                                Some(!upd_status.auto_check),
+                                                                                                Some(next_auto_check),
                                                                                                 cx,
                                                                                             );
                                                                                         },
-                                                                                    )),
-                                                                                )
+                                                                                    ))
+                                                                                })
                                                                                 .child(
                                                                                     div()
                                                                                         .text_size(px(12.5))
@@ -1462,19 +1741,13 @@ impl Render for SettingsView {
                                                         ),
                                                     )
                                                     .child(
-                                                        div()
-                                                            .id("upd-logs-box")
-                                                            .max_h(px(220.0))
-                                                            .overflow_y_scroll()
-                                                            .p(px(12.0))
-                                                            .bg(theme.bg_tertiary)
-                                                            .font_family(FONT_MONO)
-                                                            .text_size(px(11.5))
-                                                            .text_color(theme.text_secondary)
-                                                            .child(upd_status.logs.join("\n")),
+                                                        log_panel("upd-logs-box", upd_status.logs.join("\n"), px(220.0), theme.bg_tertiary, theme.text_secondary, &self.log_scroll[0], &self.nested_scroll),
                                                     ),
                                             )
                                         })
+                                    } else {
+                                        gb_section_card(&theme).child(div().p(px(16.0)).child("Loading updater status…"))
+                                    }
                                 }
                                 SettingsTab::Logs => {
                                     let mut combined = Vec::new();
@@ -1533,16 +1806,7 @@ impl Render for SettingsView {
                                                 )
                                                 .when(!diag_output.is_empty(), |d| {
                                                     d.child(
-                                                        div()
-                                                            .id("diag-out-scroll")
-                                                            .max_h(px(240.0))
-                                                            .overflow_y_scroll()
-                                                            .p(px(14.0))
-                                                            .bg(theme.bg_tertiary)
-                                                            .font_family(FONT_MONO)
-                                                            .text_size(px(11.5))
-                                                            .text_color(theme.text_primary)
-                                                            .child(diag_output),
+                                                        log_panel("diag-out-scroll", diag_output, px(240.0), theme.bg_tertiary, theme.text_primary, &self.log_scroll[1], &self.nested_scroll),
                                                     )
                                                 }),
                                         )
@@ -1562,25 +1826,12 @@ impl Render for SettingsView {
                                                                 .child(cursor_icon("refresh", 12.5, theme.text_secondary))
                                                                 .child("Refresh")
                                                                 .on_click(cx.listener(|v, _, _, cx| {
-                                                                    v.app.update(cx, |s, cx| s.refresh_capabilities(false, cx));
+                                                                    v.app.update(cx, |s, cx| s.refresh_logs(cx));
                                                                 })),
                                                         ),
                                                 )
                                                 .child(
-                                                    div()
-                                                        .id("server-logs-scroll")
-                                                        .max_h(px(340.0))
-                                                        .overflow_y_scroll()
-                                                        .p(px(14.0))
-                                                        .bg(theme.bg_tertiary)
-                                                        .font_family(FONT_MONO)
-                                                        .text_size(px(11.5))
-                                                        .text_color(theme.text_secondary)
-                                                        .child(if combined.is_empty() {
-                                                            "No log lines collected yet.".to_string()
-                                                        } else {
-                                                            combined.join("\n")
-                                                        }),
+                                                    log_panel("server-logs-scroll", if combined.is_empty() { "No log lines collected yet.".to_string() } else { combined.join("\n") }, px(340.0), theme.bg_tertiary, theme.text_secondary, &self.log_scroll[2], &self.nested_scroll),
                                                 ),
                                         )
                                 }
@@ -1588,9 +1839,65 @@ impl Render for SettingsView {
                     ),
                     )
                     .vertical_scrollbar(&self.scroll_handle)
-                    .child(smooth_scroll_layer(&self.smooth_scroller)),
+                    .child(smooth_scroll_layer(&self.smooth_scroller).yield_to(&self.nested_scroll)),
             )
     }
+}
+
+fn update_in_progress(phase: &str) -> bool {
+    !matches!(phase, "idle" | "done" | "error" | "restart_required")
+}
+
+fn ssh_fields(ssh: Option<&SshTarget>) -> [String; 4] {
+    [
+        ssh.map(|target| target.host.clone()).unwrap_or_default(),
+        ssh.and_then(|target| target.user.clone()).unwrap_or_default(),
+        ssh.and_then(|target| target.port).unwrap_or(22).to_string(),
+        ssh.and_then(|target| target.identity_file.clone()).unwrap_or_default(),
+    ]
+}
+
+fn log_panel(
+    id: &'static str,
+    text: String,
+    max_height: Pixels,
+    background: Hsla,
+    foreground: Hsla,
+    scroll: &ScrollHandle,
+    nested: &NestedScrollRegions,
+) -> impl IntoElement {
+    let handle = scroll.clone();
+    div()
+        .id(id)
+        .relative()
+        .w_full()
+        .on_scroll(move |event, window, cx| {
+            let delta = event.delta.pixel_delta(window.line_height()).y;
+            let max = handle.max_offset().y;
+            let offset = handle.offset().y;
+            // The inner Div has already applied the delta in the bubble phase.
+            let previous = offset - delta;
+            if max > px(0.0) && ((delta < px(0.0) && previous > -max) || (delta > px(0.0) && previous < px(0.0))) {
+                cx.stop_propagation();
+            }
+        })
+        .child(nested.mark_nested())
+        .child(
+            div()
+                .id("content")
+                .track_scroll(scroll)
+                .w_full()
+                .max_h(max_height)
+                .overflow_y_scroll()
+                .restrict_scroll_to_axis()
+                .p(px(12.0))
+                .bg(background)
+                .font_family(FONT_MONO)
+                .text_size(px(11.5))
+                .text_color(foreground)
+                .child(text),
+        )
+        .vertical_scrollbar(scroll)
 }
 
 fn labeled_input(

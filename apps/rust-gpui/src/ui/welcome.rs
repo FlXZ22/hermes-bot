@@ -8,9 +8,11 @@ use crate::theme::components::{
 };
 use crate::theme::tokens::{SandTheme, ThemeMode};
 use crate::ui::motion::{gpu_spinner, view_enter, EntranceKey};
+use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState};
+use gpui_component::scroll::ScrollableElement;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,11 @@ pub struct WelcomeView {
     selected_provider: String,
     copied_login: bool,
     op_gen: u64,
+    scroll_step: Option<(WelcomeStep, bool)>,
+    scroll_handle: ScrollHandle,
+    smooth_scroller: SmoothScroller,
+    providers_url: String,
+    browser_auth_pending: bool,
 }
 
 impl WelcomeView {
@@ -146,6 +153,12 @@ impl WelcomeView {
 
         cx.observe(&app, |this, app, cx| {
             let s = app.read(cx);
+            if !s.setup_open && !s.initializing {
+                return;
+            }
+            if this.browser_auth_pending {
+                return;
+            }
             if !s.initializing && s.connection_status == ConnectionStatus::Connected {
                 if !this.busy.is_empty() {
                     this.busy.clear();
@@ -162,6 +175,8 @@ impl WelcomeView {
         })
         .detach();
 
+        let scroll_handle = ScrollHandle::new();
+        let smooth_scroller = SmoothScroller::for_handle(scroll_handle.clone());
         Self {
             app,
             step: init_step,
@@ -185,6 +200,11 @@ impl WelcomeView {
             selected_provider: String::new(),
             copied_login: false,
             op_gen: 0,
+            scroll_step: None,
+            scroll_handle,
+            smooth_scroller,
+            providers_url: String::new(),
+            browser_auth_pending: false,
         }
     }
 
@@ -244,7 +264,11 @@ impl WelcomeView {
             };
             let opt = |e: &Entity<InputState>| {
                 let v = e.read(cx).value().trim().to_string();
-                if v.is_empty() { None } else { Some(v) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v)
+                }
             };
             Some(SshTarget {
                 host: h,
@@ -299,8 +323,23 @@ impl WelcomeView {
 
         // Native PKCE browser login
         self.busy = "Finding sign-in options…".into();
+        if self.providers_url == normalized_url
+            && !self.providers.is_empty()
+            && self.selected_provider.is_empty()
+        {
+            self.busy.clear();
+            self.error = "Choose your sign-in provider.".into();
+            cx.notify();
+            return;
+        }
+        self.browser_auth_pending = true;
         let rt = self.app.read(cx).tokio_rt.clone();
         let remote_login = self.app.read(cx).remote_login.clone();
+        if self.providers_url != normalized_url {
+            self.providers_url.clone_from(&normalized_url);
+            self.providers.clear();
+            self.selected_provider.clear();
+        }
         let preselected = self.selected_provider.clone();
         let existing_providers = self.providers.clone();
         cx.notify();
@@ -328,6 +367,7 @@ impl WelcomeView {
                 Err(err) => {
                     let _ = this.update(cx, |v, cx| {
                         if v.op_gen == gen {
+                            v.browser_auth_pending = false;
                             v.busy.clear();
                             v.error = err;
                             cx.notify();
@@ -337,12 +377,16 @@ impl WelcomeView {
                 }
             };
 
-            let needs_pick = list.len() > 1 && this.read_with(cx, |v, _| v.selected_provider.is_empty()).unwrap_or(false);
+            let Some(needs_pick) = this.read_with(cx, |v, _| {
+                (v.op_gen == gen).then(|| list.len() > 1 && v.selected_provider.is_empty())
+            }).ok().flatten() else {
+                return;
+            };
             if needs_pick {
                 let _ = this.update(cx, |v, cx| {
                     if v.op_gen == gen {
                         v.providers = list;
-                        v.selected_provider = selected;
+                        v.browser_auth_pending = false;
                         v.busy.clear();
                         cx.notify();
                     }
@@ -363,6 +407,7 @@ impl WelcomeView {
                 Err(err) => {
                     let _ = this.update(cx, |v, cx| {
                         if v.op_gen == gen {
+                            v.browser_auth_pending = false;
                             v.busy.clear();
                             v.error = err;
                             cx.notify();
@@ -414,6 +459,7 @@ impl WelcomeView {
                         let _ = this.update(cx, |v, cx| {
                             if v.op_gen == gen {
                                 v.login_url.clear();
+                                v.browser_auth_pending = false;
                                 v.busy = "Checking access and live chat…".into();
                                 v.app.update(cx, |s, cx| s.connect_to_hermes(candidate, false, cx));
                                 cx.notify();
@@ -426,6 +472,7 @@ impl WelcomeView {
                         let _ = this.update(cx, |v, cx| {
                             if v.op_gen == gen {
                                 v.login_url.clear();
+                                v.browser_auth_pending = false;
                                 v.busy.clear();
                                 v.error = err;
                                 cx.notify();
@@ -442,6 +489,7 @@ impl WelcomeView {
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
         self.op_gen = self.op_gen.wrapping_add(1);
         self.login_url.clear();
+        self.browser_auth_pending = false;
         self.busy.clear();
         let rl = self.app.read(cx).remote_login.clone();
         let rt = self.app.read(cx).tokio_rt.clone();
@@ -472,7 +520,12 @@ impl Render for WelcomeView {
         });
 
         let step = self.step;
-        let step_id = self.step_entrance.id("welcome-step", (step, initializing));
+        let current_step = (step, initializing);
+        if self.scroll_step.replace(current_step) != Some(current_step) {
+            self.smooth_scroller.cancel();
+            self.scroll_handle.set_offset(Point::default());
+        }
+        let step_id = self.step_entrance.id("welcome-step", current_step);
         let is_busy = !self.busy.is_empty();
         let title = if initializing {
             "Opening Hermes…"
@@ -550,6 +603,7 @@ impl Render for WelcomeView {
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.app.update(cx, |s, cx| {
                                                     s.setup_open = false;
+                                                    s.bump_shell();
                                                     cx.notify();
                                                 });
                                             })),
@@ -581,17 +635,32 @@ impl Render for WelcomeView {
             // Scrollable centered onboarding stage
             .child(
                 div()
-                    .id("welcome-scroll")
                     .flex_1()
+                    .min_h_0()
                     .w_full()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .px(px(24.0))
-                    .py(px(24.0))
-                    .child(view_enter(step_id,
+                    .relative()
+                    .child(
+                        div()
+                            .id("welcome-scroll")
+                            .track_scroll(&self.scroll_handle)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .restrict_scroll_to_axis()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .px(px(24.0))
+                            .py(px(24.0))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_h_full()
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(view_enter(step_id,
                         div()
                             .w(px(460.0))
                             .max_w_full()
@@ -927,8 +996,9 @@ impl Render for WelcomeView {
                                                 .child(cursor_icon("arrow-right", 15.0, theme.text_on_primary))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.app.update(cx, |s, cx| {
-                                                        s.active_view = AppViewId::Chat;
+                                                        s.set_active_view(AppViewId::Chat, cx);
                                                         s.setup_open = false;
+                                                        s.bump_shell();
                                                         cx.notify();
                                                     });
                                                 })),
@@ -945,8 +1015,9 @@ impl Render for WelcomeView {
                                                     .child("Choose a model")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.app.update(cx, |s, cx| {
-                                                            s.active_view = AppViewId::Chat;
+                                                            s.set_active_view(AppViewId::Chat, cx);
                                                             s.setup_open = false;
+                                                            s.bump_shell();
                                                             s.model_picker_open = true;
                                                             cx.notify();
                                                         });
@@ -969,6 +1040,11 @@ impl Render for WelcomeView {
                                         .child(gpu_spinner(16.0, theme.text_secondary))
                                         .child(if is_busy { self.busy.clone() } else { conn_detail }),
                                 )
+                            })
+                            .when(self.browser_auth_pending && self.login_url.is_empty(), |d| {
+                                d.child(gb_btn("welcome-cancel-pending", &theme, BtnVariant::Ghost, true, false)
+                                    .child("Cancel sign-in")
+                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))))
                             })
                             // PKCE sign-in actions
                             .when(!self.login_url.is_empty(), |d| {
@@ -1046,17 +1122,16 @@ impl Render for WelcomeView {
                     .flex_shrink_0()
                     .child("Hermes for Linux")
                     .child("Your agent. Your infrastructure."),
+                            ),
+                    )
+                    .vertical_scrollbar(&self.scroll_handle)
+                    .child(smooth_scroll_layer(&self.smooth_scroller))
             )
     }
 }
 
 impl WelcomeView {
-    fn render_remote_form(
-        &self,
-        theme: &SandTheme,
-        is_busy: bool,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    fn render_remote_form(&self, theme: &SandTheme, is_busy: bool, cx: &mut Context<Self>) -> Div {
         let auth_options = [
             RemoteAuthKind::Browser,
             RemoteAuthKind::Bearer,
@@ -1172,6 +1247,30 @@ impl WelcomeView {
                             })),
                     ),
             )
+            .when(self.auth == RemoteAuthKind::Browser && self.providers.len() > 1, |form| {
+                form.child(
+                    div().flex().flex_wrap().gap(px(6.0))
+                        .children(self.providers.iter().map(|provider| {
+                            let name = provider.name.clone();
+                            let selected = self.selected_provider == name;
+                            gb_btn(
+                                SharedString::from(format!("welcome-provider-{name}")),
+                                theme,
+                                if selected { BtnVariant::Primary } else { BtnVariant::Secondary },
+                                true,
+                                is_busy,
+                            )
+                            .child(provider.display_name.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.busy.is_empty() {
+                                    this.selected_provider.clone_from(&name);
+                                    this.error.clear();
+                                    cx.notify();
+                                }
+                            }))
+                        })),
+                )
+            })
             // Browser hint OR Token field
             .when(self.auth == RemoteAuthKind::Browser, |d| {
                 d.child(
@@ -1267,16 +1366,16 @@ impl WelcomeView {
                                         })),
                                 )
                                 .when(self.ssh_enabled, |d| {
-                                    d.child(Input::new(&self.ssh_host).h(px(34.0)))
+                                    d.child(Input::new(&self.ssh_host).h(px(34.0)).disabled(is_busy))
                                         .child(
                                             div()
                                                 .flex()
                                                 .gap(px(8.0))
-                                                .child(div().flex_1().child(Input::new(&self.ssh_user).h(px(34.0))))
-                                                .child(div().w(px(90.0)).child(Input::new(&self.ssh_port).h(px(34.0)))),
+                                                .child(div().flex_1().child(Input::new(&self.ssh_user).h(px(34.0)).disabled(is_busy)))
+                                                .child(div().w(px(90.0)).child(Input::new(&self.ssh_port).h(px(34.0)).disabled(is_busy))),
                                         )
-                                        .child(Input::new(&self.ssh_identity).h(px(34.0)))
-                                        .child(Input::new(&self.ssh_config).h(px(34.0)))
+                                        .child(Input::new(&self.ssh_identity).h(px(34.0)).disabled(is_busy))
+                                        .child(Input::new(&self.ssh_config).h(px(34.0)).disabled(is_busy))
                                 }),
                         )
                     }),

@@ -5,11 +5,11 @@ use std::collections::{HashMap, VecDeque};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendInfo {
@@ -56,6 +56,7 @@ struct BackendInner {
 pub struct HermesSupervisor {
     inner: Arc<Mutex<BackendInner>>,
     boot_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    status_notify: Arc<Notify>,
     http: reqwest::Client,
     hermes_home: PathBuf,
 }
@@ -75,6 +76,7 @@ impl HermesSupervisor {
 
         Self {
             boot_task: Arc::new(Mutex::new(None)),
+            status_notify: Arc::new(Notify::new()),
             inner: Arc::new(Mutex::new(BackendInner {
                 child: None,
                 status: "stopped".into(),
@@ -88,6 +90,30 @@ impl HermesSupervisor {
             })),
             http,
             hermes_home,
+        }
+    }
+
+    pub async fn wait_until_ready(&self, timeout: Duration) -> Result<BackendInfo, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let notified = self.status_notify.notified();
+            let info = self.info().await;
+            if info.status == "ready" {
+                return Ok(info);
+            }
+            if info.status == "error" {
+                return Err(info.error.unwrap_or_else(|| {
+                    "Hermes could not start. Install Hermes Agent, or connect to a server.".into()
+                }));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    "Hermes took too long to start. Check the runtime in Settings, or connect to a server."
+                        .into(),
+                );
+            }
+            let _ = tokio::time::timeout(remaining.min(Duration::from_secs(2)), notified).await;
         }
     }
 
@@ -135,6 +161,8 @@ impl HermesSupervisor {
         g.pid = None;
         g.url = None;
         g.token = None;
+        drop(g);
+        self.status_notify.notify_waiters();
     }
 
     pub async fn start_in_background(&self) {
@@ -163,6 +191,8 @@ impl HermesSupervisor {
                 g.pid = None;
                 g.status = "error".into();
                 g.error = Some(err);
+                drop(g);
+                sup.status_notify.notify_waiters();
                 return;
             }
             loop {
@@ -174,6 +204,8 @@ impl HermesSupervisor {
                         g.pid = None;
                         g.status = "error".into();
                         g.error = Some(format!("Hermes backend exited with status {exit}"));
+                        drop(g);
+                        sup.status_notify.notify_waiters();
                         return;
                     }
                 }
@@ -269,10 +301,11 @@ impl HermesSupervisor {
             g.pid = pid;
         }
 
-        // Poll /api/status up to 25 seconds (fast 120ms cadence)
+        // Poll /api/status up to 25 seconds (start fast at 40ms, ramp to 120ms)
         let deadline = Instant::now() + Duration::from_secs(25);
         let status_url = format!("{url}/api/status");
         let mut ready = false;
+        let mut attempt = 0u32;
 
         while Instant::now() < deadline {
             // Check if child already exited prematurely
@@ -299,7 +332,13 @@ impl HermesSupervisor {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            let delay_ms = match attempt {
+                0..=5 => 40,
+                6..=15 => 80,
+                _ => 120,
+            };
+            attempt = attempt.saturating_add(1);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
 
         if !ready {
@@ -325,10 +364,13 @@ impl HermesSupervisor {
         g.token = Some(final_token);
         g.boot_ms = Some(elapsed);
         g.error = None;
+        drop(g);
+        self.status_notify.notify_waiters();
         Ok(())
     }
 
     async fn resolve_served_token(&self, base_url: &str) -> Option<String> {
+        static TOKEN_RE: OnceLock<Regex> = OnceLock::new();
         let resp = self
             .http
             .get(format!("{}/", base_url.trim_end_matches('/')))
@@ -337,8 +379,10 @@ impl HermesSupervisor {
             .await
             .ok()?;
         let html = resp.text().await.ok()?;
-        let re =
-            Regex::new(r#"window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")"#).ok()?;
+        let re = TOKEN_RE.get_or_init(|| {
+            Regex::new(r#"window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")"#)
+                .expect("valid session token regex")
+        });
         let caps = re.captures(&html)?;
         let json_str = caps.get(1)?.as_str();
         serde_json::from_str::<String>(json_str).ok()

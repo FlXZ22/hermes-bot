@@ -51,6 +51,8 @@ pub struct UiPreferences {
     pub theme: ThemeMode,
     pub right_pane_width: f32,
     pub drafts: HashMap<String, String>,
+    #[serde(default)]
+    pub reduced_motion: bool,
 }
 
 impl Default for UiPreferences {
@@ -59,6 +61,7 @@ impl Default for UiPreferences {
             theme: ThemeMode::Dark,
             right_pane_width: 336.0,
             drafts: HashMap::new(),
+            reduced_motion: false,
         }
     }
 }

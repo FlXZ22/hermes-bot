@@ -28,10 +28,17 @@ pub struct SkillsView {
     hub_input: Entity<InputState>,
     hub_results: Vec<Value>,
     hub_loading: bool,
+    hub_request: u64,
+    hub_source: Option<u64>,
     // Skill editor modal
     editing_skill: Option<String>,
     skill_modal: ModalMotion,
     skill_editor: Entity<TextareaState>,
+    skill_request: u64,
+    skill_source: Option<u64>,
+    skill_loaded: bool,
+    skill_saving: bool,
+    mcp_saving: bool,
     // Add MCP modal
     mcp_modal: ModalMotion,
     mcp_name: Entity<InputState>,
@@ -45,8 +52,8 @@ pub struct SkillsView {
 
 impl SkillsView {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter installed Hermes skills..."));
+        let search_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Filter installed Hermes skills..."));
         let hub_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Search Hermes Skills Hub (e.g. git, docker, arch, research)...")
@@ -61,8 +68,23 @@ impl SkillsView {
         });
         let mcp_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://..."));
 
-        cx.observe(&app, |_, app_e, cx| {
-            if app_e.read(cx).active_view == AppViewId::Skills {
+        cx.observe(&app, |this, app_e, cx| {
+            let app = app_e.read(cx);
+            if !app.setup_open && !app.initializing && app.active_view == AppViewId::Skills {
+                if this
+                    .hub_source
+                    .is_some_and(|source| source != app.profile_generation)
+                {
+                    this.hub_source = None;
+                    this.hub_results.clear();
+                    this.hub_loading = false;
+                }
+                if this
+                    .skill_source
+                    .is_some_and(|source| source != app.profile_generation)
+                {
+                    this.close_skill_editor();
+                }
                 cx.notify();
             }
         })
@@ -90,9 +112,16 @@ impl SkillsView {
             hub_input,
             hub_results: Vec::new(),
             hub_loading: false,
+            hub_request: 0,
+            hub_source: None,
             editing_skill: None,
             skill_modal: ModalMotion::default(),
             skill_editor,
+            skill_request: 0,
+            skill_source: None,
+            skill_loaded: false,
+            skill_saving: false,
+            mcp_saving: false,
             mcp_modal: ModalMotion::default(),
             mcp_name,
             mcp_transport: "stdio".into(),
@@ -105,29 +134,37 @@ impl SkillsView {
     }
 
     fn search_hub(&mut self, cx: &mut Context<Self>) {
-        let q = self.hub_input.read(cx).value().trim().to_string();
-        let (client, rt) = {
-            let s = self.app.read(cx);
-            (s.client.clone(), s.tokio_rt.clone())
-        };
-        let Some(client) = client else {
-            return;
-        };
-        if q.is_empty() {
+        let query = self.hub_input.read(cx).value().trim().to_string();
+        if query.is_empty() || self.hub_loading {
             return;
         }
+        let app = self.app.read(cx);
+        let Some(client) = app.client.clone() else {
+            return;
+        };
+        let rt = app.tokio_rt.clone();
+        let source = app.profile_generation;
+        self.hub_source = Some(source);
+        self.hub_request = self.hub_request.wrapping_add(1);
+        let request = self.hub_request;
         self.hub_loading = true;
+        self.hub_results.clear();
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let res = rt
-                .spawn(async move { client.search_skills_hub(&q).await })
+            let result = rt
+                .spawn(async move { client.search_skills_hub(&query).await })
                 .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            let _ = this.update(cx, |v, cx| {
-                v.hub_loading = false;
-                match res {
-                    Ok(items) => v.hub_results = items,
-                    Err(e) => v.app.update(cx, |s, cx| s.show_toast(e, cx)),
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |view, cx| {
+                if view.hub_request != request {
+                    return;
+                }
+                view.hub_loading = false;
+                if view.app.read(cx).profile_generation == source {
+                    match result {
+                        Ok(items) => view.hub_results = items,
+                        Err(error) => view.app.update(cx, |app, cx| app.show_toast(error, cx)),
+                    }
                 }
                 cx.notify();
             });
@@ -136,38 +173,108 @@ impl SkillsView {
     }
 
     fn open_skill_editor(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.editing_skill = Some(name.clone());
-        self.skill_modal.set_open(true);
-        self.skill_editor
-            .update(cx, |st, cx| st.set_value("Loading…", window, cx));
-        let (client, rt) = {
-            let s = self.app.read(cx);
-            (s.client.clone(), s.tokio_rt.clone())
-        };
-        let Some(client) = client else {
+        let app = self.app.read(cx);
+        let Some(client) = app.client.clone() else {
             return;
         };
-        let ed = self.skill_editor.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            let content = rt
-                .spawn(async move { client.get_skill_content(&name).await.unwrap_or_default() })
+        let rt = app.tokio_rt.clone();
+        let source = app.profile_generation;
+        self.skill_source = Some(source);
+        self.editing_skill = Some(name.clone());
+        self.skill_modal.set_open(true);
+        self.skill_loaded = false;
+        self.skill_saving = false;
+        self.skill_request = self.skill_request.wrapping_add(1);
+        let request = self.skill_request;
+        self.skill_editor
+            .update(cx, |state, cx| state.set_value("Loading…", window, cx));
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = rt
+                .spawn(async move { client.get_skill_content(&name).await })
                 .await
-                .unwrap_or_default();
-            let _ = cx.update(|window, cx| {
-                ed.update(cx, |st, cx| st.set_value(content, window, cx));
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update_in(cx, |view, window, cx| {
+                if view.skill_request != request || view.app.read(cx).profile_generation != source {
+                    return;
+                }
+                match result {
+                    Ok(content) => {
+                        view.skill_loaded = true;
+                        view.skill_editor
+                            .update(cx, |state, cx| state.set_value(content, window, cx));
+                        let focus = view.skill_editor.read(cx).focus_handle(cx);
+                        window.focus(&focus, cx);
+                    }
+                    Err(error) => {
+                        view.skill_editor.update(cx, |state, cx| {
+                            state.set_value("Could not load this skill.", window, cx)
+                        });
+                        view.app.update(cx, |app, cx| app.show_toast(error, cx));
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
     }
 
     fn close_skill_editor(&mut self) {
+        self.skill_request = self.skill_request.wrapping_add(1);
+        self.skill_source = None;
         self.editing_skill = None;
+        self.skill_loaded = false;
+        self.skill_saving = false;
         self.skill_modal.set_open(false);
+    }
+
+    fn save_skill(&mut self, cx: &mut Context<Self>) {
+        let app = self.app.read(cx);
+        if !self.skill_loaded
+            || self.skill_saving
+            || self.skill_source != Some(app.profile_generation)
+        {
+            return;
+        }
+        let (Some(client), Some(name)) = (app.client.clone(), self.editing_skill.clone()) else {
+            return;
+        };
+        let source = app.profile_generation;
+        let rt = app.tokio_rt.clone();
+        let content = self.skill_editor.read(cx).value().to_string();
+        let request = self.skill_request;
+        self.skill_saving = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = rt
+                .spawn(async move { client.save_skill_content(&name, &content).await })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |view, cx| {
+                if view.skill_request != request || view.app.read(cx).profile_generation != source {
+                    return;
+                }
+                view.skill_saving = false;
+                match result {
+                    Ok(_) => {
+                        view.close_skill_editor();
+                        view.app.update(cx, |app, cx| {
+                            app.refresh_skills(cx);
+                            app.show_toast("Saved skill", cx);
+                        });
+                    }
+                    Err(error) => view.app.update(cx, |app, cx| app.show_toast(error, cx)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
 impl Render for SkillsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let modal_height = (window.viewport_size().height - px(48.0)).max(px(0.0));
         let s = self.app.read(cx);
         let theme = s.sand_theme();
         let skills = s.skills.clone();
@@ -235,11 +342,13 @@ impl Render for SkillsView {
                             .items_center()
                             .gap(px(8.0))
                             .child(
-                                gb_segmented_shell(&theme)
+                                gb_segmented_shell(&theme).flex_wrap()
                                     .child(
                                         gb_segmented_item("sk-tab-skills", &theme, self.tab == SkillsTab::Skills, "Skills")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.tab = SkillsTab::Skills;
+                                                this.smooth_scroller.cancel();
+                                                this.scroll_handle.set_offset(Point::default());
                                                 cx.notify();
                                             })),
                                     )
@@ -247,6 +356,8 @@ impl Render for SkillsView {
                                         gb_segmented_item("sk-tab-hub", &theme, self.tab == SkillsTab::Hub, "Hub")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.tab = SkillsTab::Hub;
+                                                this.smooth_scroller.cancel();
+                                                this.scroll_handle.set_offset(Point::default());
                                                 cx.notify();
                                             })),
                                     )
@@ -254,6 +365,8 @@ impl Render for SkillsView {
                                         gb_segmented_item("sk-tab-tools", &theme, self.tab == SkillsTab::Toolsets, "Toolsets")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.tab = SkillsTab::Toolsets;
+                                                this.smooth_scroller.cancel();
+                                                this.scroll_handle.set_offset(Point::default());
                                                 cx.notify();
                                             })),
                                     )
@@ -261,6 +374,8 @@ impl Render for SkillsView {
                                         gb_segmented_item("sk-tab-mcp", &theme, self.tab == SkillsTab::Mcp, "MCP")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.tab = SkillsTab::Mcp;
+                                                this.smooth_scroller.cancel();
+                                                this.scroll_handle.set_offset(Point::default());
                                                 cx.notify();
                                             })),
                                     ),
@@ -294,11 +409,13 @@ impl Render for SkillsView {
                             .px(px(24.0))
                     .py(px(20.0))
                     .flex()
-                    .justify_center()
+                    .flex_col()
+                    .items_center()
                     .child(
                         div()
                             .w(px(920.0))
                             .max_w_full()
+                            .flex_shrink_0()
                             .flex()
                             .flex_col()
                             .gap(px(16.0))
@@ -376,20 +493,9 @@ impl Render for SkillsView {
                                                                         sk.enabled,
                                                                     )
                                                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                                                        let (client, rt) = {
-                                                                            let s = this.app.read(cx);
-                                                                            (s.client.clone(), s.tokio_rt.clone())
-                                                                        };
-                                                                        let n = name_tog.clone();
-                                                                        if let Some(c) = client {
-                                                                            cx.spawn(async move |this, cx| {
-                                                                                let _ = rt.spawn(async move { c.toggle_skill(&n, next_en).await }).await;
-                                                                                let _ = this.update(cx, |v, cx| {
-                                                                                    v.app.update(cx, |s, cx| s.refresh_capabilities(false, cx));
-                                                                                });
-                                                                            })
-                                                                            .detach();
-                                                                        }
+                                                                        this.app.update(cx, |s, cx| {
+                                                                            if s.client.is_some() { s.toggle_skill_optimistic(name_tog.clone(), next_en, cx); }
+                                                                        });
                                                                     })),
                                                                 ),
                                                         )
@@ -472,11 +578,15 @@ impl Render for SkillsView {
                                                             if let Some(c) = client {
                                                                 cx.spawn(async move |this, cx| {
                                                                     let id3 = id2.clone();
-                                                                    let _ = rt.spawn(async move { c.install_hub_skill(&id3).await }).await;
+                                                                    let result = rt.spawn(async move { c.install_hub_skill(&id3).await })
+                                                                        .await.unwrap_or_else(|e| Err(e.to_string()));
                                                                     let _ = this.update(cx, |v, cx| {
-                                                                        v.app.update(cx, |s, cx| {
-                                                                            s.refresh_capabilities(false, cx);
-                                                                            s.show_toast(format!("Installed {id2}"), cx);
+                                                                        v.app.update(cx, |s, cx| match result {
+                                                                            Ok(_) => {
+                                                                                s.refresh_skills(cx);
+                                                                                s.show_toast(format!("Installed {id2}"), cx);
+                                                                            }
+                                                                            Err(e) => s.show_toast(e, cx),
                                                                         });
                                                                     });
                                                                 })
@@ -535,20 +645,9 @@ impl Render for SkillsView {
                                                             ts.enabled,
                                                         )
                                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                                            let (client, rt) = {
-                                                                let s = this.app.read(cx);
-                                                                (s.client.clone(), s.tokio_rt.clone())
-                                                            };
-                                                            let n = tname.clone();
-                                                            if let Some(c) = client {
-                                                                cx.spawn(async move |this, cx| {
-                                                                    let _ = rt.spawn(async move { c.toggle_toolset(&n, next).await }).await;
-                                                                    let _ = this.update(cx, |v, cx| {
-                                                                        v.app.update(cx, |s, cx| s.refresh_capabilities(false, cx));
-                                                                    });
-                                                                })
-                                                                .detach();
-                                                            }
+                                                            this.app.update(cx, |s, cx| {
+                                                                if s.client.is_some() { s.toggle_toolset_optimistic(tname.clone(), next, cx); }
+                                                            });
                                                         })),
                                                     )
                                                     .into_any_element()
@@ -662,20 +761,9 @@ impl Render for SkillsView {
                                                                     enabled,
                                                                 )
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    let (client, rt) = {
-                                                                        let s = this.app.read(cx);
-                                                                        (s.client.clone(), s.tokio_rt.clone())
-                                                                    };
-                                                                    let n = sname_tog.clone();
-                                                                    if let Some(c) = client {
-                                                                        cx.spawn(async move |this, cx| {
-                                                                            let _ = rt.spawn(async move { c.toggle_mcp_server(&n, !enabled).await }).await;
-                                                                            let _ = this.update(cx, |v, cx| {
-                                                                                v.app.update(cx, |s, cx| s.refresh_capabilities(false, cx));
-                                                                            });
-                                                                        })
-                                                                        .detach();
-                                                                    }
+                                                                    this.app.update(cx, |s, cx| {
+                                                                        if s.client.is_some() { s.toggle_mcp_optimistic(sname_tog.clone(), !enabled, cx); }
+                                                                    });
                                                                 })),
                                                             )
                                                             .child(
@@ -688,24 +776,9 @@ impl Render for SkillsView {
                                                                 )
                                                                 .child(cursor_icon("trash", 12.0, theme.danger_text))
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    let (client, rt) = {
-                                                                        let s = this.app.read(cx);
-                                                                        (s.client.clone(), s.tokio_rt.clone())
-                                                                    };
-                                                                    let n = sname_del.clone();
-                                                                    if let Some(c) = client {
-                                                                        cx.spawn(async move |this, cx| {
-                                                                            let n2 = n.clone();
-                                                                            let _ = rt.spawn(async move { c.delete_mcp_server(&n2).await }).await;
-                                                                            let _ = this.update(cx, |v, cx| {
-                                                                                v.app.update(cx, |s, cx| {
-                                                                                    s.refresh_capabilities(false, cx);
-                                                                                    s.show_toast(format!("Removed MCP \"{n}\""), cx);
-                                                                                });
-                                                                            });
-                                                                        })
-                                                                        .detach();
-                                                                    }
+                                                                    this.app.update(cx, |s, cx| {
+                                                                        if s.client.is_some() { s.delete_mcp_optimistic(sname_del.clone(), cx); }
+                                                                    });
                                                                 })),
                                                             ),
                                                     )
@@ -722,10 +795,10 @@ impl Render for SkillsView {
             )
             // Skill editor modal
             .when_some(self.editing_skill.clone(), |d, sk_name| {
-                let sk_save = sk_name.clone();
                 d.child(deferred(
                     div()
                         .id("sk-edit-backdrop")
+                        .occlude()
                         .absolute()
                         .inset_0()
                         .child(self.skill_modal.backdrop("skill-scrim-enter", theme.bg_scrim))
@@ -741,6 +814,8 @@ impl Render for SkillsView {
                             div()
                                 .id("sk-edit-modal")
                                 .w(px(600.0))
+                                .max_w_full()
+                                .max_h(modal_height)
                                 .rounded(px(22.0))
                                 .bg(theme.bg_elevated)
                                 .border_1()
@@ -765,7 +840,7 @@ impl Render for SkillsView {
                                                 })),
                                         ),
                                 )
-                                .child(Textarea::new(&self.skill_editor).h(px(320.0)))
+                                .child(Textarea::new(&self.skill_editor).h(px(320.0)).readonly(!self.skill_loaded || self.skill_saving))
                                 .child(
                                     div()
                                         .flex()
@@ -780,46 +855,29 @@ impl Render for SkillsView {
                                                 })),
                                         )
                                         .child(
-                                            gb_btn("sk-ed-save", &theme, BtnVariant::Primary, false, false)
+                                            gb_btn("sk-ed-save", &theme, BtnVariant::Primary, false, !self.skill_loaded || self.skill_saving)
                                                 .child("Save SKILL.md")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    let content = this.skill_editor.read(cx).value().to_string();
-                                                    let (client, rt) = {
-                                                        let s = this.app.read(cx);
-                                                        (s.client.clone(), s.tokio_rt.clone())
-                                                    };
-                                                    let nm = sk_save.clone();
-                                                    this.close_skill_editor();
-                                                    cx.notify();
-                                                    if let Some(c) = client {
-                                                        cx.spawn(async move |this, cx| {
-                                                            let nm2 = nm.clone();
-                                                            let _ = rt.spawn(async move { c.save_skill_content(&nm2, &content).await }).await;
-                                                            let _ = this.update(cx, |v, cx| {
-                                                                v.app.update(cx, |s, cx| s.show_toast(format!("Saved skill \"{nm}\""), cx));
-                                                            });
-                                                        })
-                                                        .detach();
-                                                    }
-                                                })),
+                                                .on_click(cx.listener(|this, _, _, cx| this.save_skill(cx))),
                                         ),
-                                ),
+                                )
+                                .overflow_y_scrollbar()
                         )),
                 ))
             })
             // Add MCP Modal
             .when(self.mcp_modal.is_open(), |d| {
-                d.child(self.render_mcp_modal(&theme, cx))
+                d.child(self.render_mcp_modal(&theme, modal_height, cx))
             })
     }
 }
 
 impl SkillsView {
-    fn render_mcp_modal(&self, theme: &SandTheme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_mcp_modal(&self, theme: &SandTheme, modal_height: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
         let is_stdio = self.mcp_transport == "stdio";
         deferred(
             div()
                 .id("mcp-modal-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .child(self.mcp_modal.backdrop("mcp-scrim-enter", theme.bg_scrim))
@@ -835,6 +893,8 @@ impl SkillsView {
                     div()
                         .id("mcp-modal")
                         .w(px(480.0))
+                                .max_w_full()
+                                .max_h(modal_height)
                         .rounded(px(22.0))
                         .bg(theme.bg_elevated)
                         .border_1()
@@ -845,7 +905,7 @@ impl SkillsView {
                         .gap(px(12.0))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(div().text_size(px(15.5)).font_weight(FontWeight::SEMIBOLD).child("Add MCP Server"))
-                        .child(Input::new(&self.mcp_name).h(px(36.0)))
+                        .child(Input::new(&self.mcp_name).h(px(36.0)).disabled(self.mcp_saving))
                         .child(
                             gb_segmented_shell(theme)
                                 .child(
@@ -871,10 +931,10 @@ impl SkillsView {
                                 ),
                         )
                         .when(is_stdio, |d| {
-                            d.child(Input::new(&self.mcp_command).h(px(36.0)))
-                                .child(Input::new(&self.mcp_args).h(px(36.0)))
+                            d.child(Input::new(&self.mcp_command).h(px(36.0)).disabled(self.mcp_saving))
+                                .child(Input::new(&self.mcp_args).h(px(36.0)).disabled(self.mcp_saving))
                         })
-                        .when(!is_stdio, |d| d.child(Input::new(&self.mcp_url).h(px(36.0))))
+                        .when(!is_stdio, |d| d.child(Input::new(&self.mcp_url).h(px(36.0)).disabled(self.mcp_saving)))
                         .child(
                             div()
                                 .flex()
@@ -889,58 +949,67 @@ impl SkillsView {
                                         })),
                                 )
                                 .child(
-                                    gb_btn("mcp-add-submit", theme, BtnVariant::Primary, false, false)
+                                    gb_btn("mcp-add-submit", theme, BtnVariant::Primary, false, self.mcp_saving)
                                         .child("Add Server")
                                         .on_click(cx.listener(|this, _, window, cx| {
-                                            let name = this.mcp_name.read(cx).value().trim().to_string();
-                                            if name.is_empty() {
+                                            if this.mcp_saving {
                                                 return;
                                             }
+                                            let name = this.mcp_name.read(cx).value().trim().to_string();
                                             let transport = this.mcp_transport.clone();
-                                            let cmd = this.mcp_command.read(cx).value().trim().to_string();
-                                            let args_raw = this.mcp_args.read(cx).value().trim().to_string();
+                                            let command = this.mcp_command.read(cx).value().trim().to_string();
+                                            let args = this.mcp_args.read(cx).value().trim().to_string();
                                             let url = this.mcp_url.read(cx).value().trim().to_string();
-                                            let srv = HermesMcpServer {
+                                            let stdio = transport == "stdio";
+                                            if name.is_empty() || (stdio && command.is_empty()) || (!stdio && url.is_empty()) {
+                                                this.app.update(cx, |app, cx| app.show_toast("Enter a server name and a command or URL.", cx));
+                                                return;
+                                            }
+                                            let app = this.app.read(cx);
+                                            let Some(client) = app.client.clone() else {
+                                                return;
+                                            };
+                                            let source = app.profile_generation;
+                                            let rt = app.tokio_rt.clone();
+                                            let server = HermesMcpServer {
                                                 name,
-                                                transport: Some(transport.clone()),
-                                                command: if transport == "stdio" { Some(cmd) } else { None },
-                                                args: if transport == "stdio" && !args_raw.is_empty() {
-                                                    Some(args_raw.split_whitespace().map(String::from).collect())
-                                                } else {
-                                                    None
-                                                },
-                                                url: if transport != "stdio" { Some(url) } else { None },
+                                                transport: Some(transport),
+                                                command: stdio.then_some(command),
+                                                args: (stdio && !args.is_empty()).then(|| args.split_whitespace().map(String::from).collect()),
+                                                url: (!stdio).then_some(url),
                                                 enabled: Some(true),
                                                 status: None,
                                             };
-                                            this.mcp_modal.set_open(false);
-                                            this.mcp_name.update(cx, |st, cx| st.set_value("", window, cx));
-                                            this.mcp_command.update(cx, |st, cx| st.set_value("", window, cx));
-                                            this.mcp_args.update(cx, |st, cx| st.set_value("", window, cx));
-                                            this.mcp_url.update(cx, |st, cx| st.set_value("", window, cx));
-                                            let (client, rt) = {
-                                                let s = this.app.read(cx);
-                                                (s.client.clone(), s.tokio_rt.clone())
-                                            };
-                                            if let Some(c) = client {
-                                                cx.spawn(async move |this, cx| {
-                                                    let res = rt.spawn(async move { c.add_mcp_server(&srv).await }).await.unwrap_or_else(|e| Err(e.to_string()));
-                                                    let _ = this.update(cx, |v, cx| {
-                                                        v.app.update(cx, |s, cx| match res {
-                                                            Ok(_) => {
-                                                                s.refresh_capabilities(false, cx);
-                                                                s.show_toast("Added MCP server", cx);
-                                                            }
-                                                            Err(e) => s.show_toast(e, cx),
-                                                        });
-                                                    });
-                                                })
-                                                .detach();
-                                            }
+                                            this.mcp_saving = true;
                                             cx.notify();
+                                            cx.spawn_in(window, async move |this, cx| {
+                                                let result = rt.spawn(async move { client.add_mcp_server(&server).await })
+                                                    .await.unwrap_or_else(|error| Err(error.to_string()));
+                                                let _ = this.update_in(cx, |view, window, cx| {
+                                                    view.mcp_saving = false;
+                                                    cx.notify();
+                                                    if view.app.read(cx).profile_generation != source {
+                                                        return;
+                                                    }
+                                                    match result {
+                                                        Ok(_) => {
+                                                            view.mcp_modal.set_open(false);
+                                                            for input in [&view.mcp_name, &view.mcp_command, &view.mcp_args, &view.mcp_url] {
+                                                                input.update(cx, |state, cx| state.set_value("", window, cx));
+                                                            }
+                                                            view.app.update(cx, |app, cx| {
+                                                                app.refresh_mcp_servers(cx);
+                                                                app.show_toast("Added MCP server", cx);
+                                                            });
+                                                        }
+                                                        Err(error) => view.app.update(cx, |app, cx| app.show_toast(error, cx)),
+                                                    }
+                                                });
+                                            }).detach();
                                         })),
                                 ),
-                        ),
+                        )
+                                .overflow_y_scrollbar()
                 )),
         )
     }

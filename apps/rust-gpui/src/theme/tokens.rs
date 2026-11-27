@@ -244,9 +244,10 @@ pub struct SandTheme {
     pub sidebar_separator: Hsla,
     pub sidebar_hover: Hsla,
     pub sidebar_selected: Hsla,
-    // Chat bubbles
+    // Chat bubbles (assistant responses render bare on page background per harness spec)
     pub bubble_user: Hsla,
     pub bubble_user_ink: Hsla,
+    #[allow(dead_code)]
     pub bubble_agent: Hsla,
     // Semantic roles
     pub accent_primary: Hsla,

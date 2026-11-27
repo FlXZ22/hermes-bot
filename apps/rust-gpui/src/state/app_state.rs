@@ -4,6 +4,17 @@ use crate::backend::sqlite_store;
 use crate::backend::terminal::TerminalManager;
 use crate::backend::updater::{AppUpdater, UpdateStatus as AppUpdateStatus};
 use crate::backend::workspace::{self, GitWorkspaceStatus, LinuxSystemStats, WorkspaceFileEntry};
+use crate::harness::events::{
+    builtin_hermes_commands, now_epoch_ms, ConversationMode, ExecutionState,
+    SessionModeBinding, SlashCommandInfo, SubagentNode, SubagentStatus, TrajectoryEvent,
+    TrajectoryEventKind, WorkProject,
+};
+use crate::harness::goal_worker::{
+    parse_goal_slash_command, GoalCommand, GoalRuntimeSnapshot, GoalWorker,
+};
+use crate::harness::metrics::SessionLiveMetrics;
+use crate::harness::ptc::is_ptc_tool;
+use crate::harness::store::HarnessStore;
 use crate::hermes::client::HermesClient;
 use crate::hermes::types::*;
 use crate::hermes::ws::HermesRealtimeSession;
@@ -20,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppViewId {
     Chat,
     Boards,
@@ -37,6 +48,8 @@ pub enum RightPaneTabId {
     Files,
     Terminal,
     Git,
+    Agents,
+    Trajectory,
     Bot,
 }
 
@@ -259,29 +272,40 @@ impl SessionChatState {
         Some(index)
     }
 
-    pub fn bot_state(&self) -> BotFaceState {
+    /// Single authoritative execution state driving inline chat/work animations and status.
+    pub fn execution_state(&self) -> ExecutionState {
         if self.awaiting_user_response {
-            return BotFaceState::Blocked;
+            return ExecutionState::Waiting;
         }
         if self.is_streaming {
             if let Some(tool) = self.active_tool_name.as_deref() {
-                return classify_hermes_activity(Some(tool), Some(&self.live_status_text));
+                let classified = classify_hermes_activity(Some(tool), Some(&self.live_status_text));
+                return match classified {
+                    BotFaceState::Writing => ExecutionState::Editing,
+                    BotFaceState::Waiting => ExecutionState::Waiting,
+                    _ => ExecutionState::ExecutingTools,
+                };
             }
             if self.has_streamed_text {
-                return BotFaceState::Streaming;
+                return ExecutionState::Writing;
             }
-            return classify_hermes_activity(None, Some(&self.live_status_text));
+            return ExecutionState::Thinking;
         }
         if let Some((outcome, settled_at)) = self.last_settlement {
             if settled_at.elapsed() < Duration::from_secs(8) {
                 return match outcome {
-                    TurnSettlementOutcome::Success => BotFaceState::Finished,
-                    TurnSettlementOutcome::Error => BotFaceState::Failed,
-                    TurnSettlementOutcome::Cancelled => BotFaceState::Idle,
+                    TurnSettlementOutcome::Success => ExecutionState::Completed,
+                    TurnSettlementOutcome::Error => ExecutionState::Failed,
+                    TurnSettlementOutcome::Cancelled => ExecutionState::Idle,
                 };
             }
         }
-        BotFaceState::Idle
+        ExecutionState::Idle
+    }
+
+    pub fn bot_state(&self) -> BotFaceState {
+        self.execution_state()
+            .to_face_state(self.active_tool_name.as_deref(), Some(&self.live_status_text))
     }
 }
 
@@ -297,7 +321,23 @@ pub struct AttachmentFile {
     #[allow(dead_code)]
     pub path: String,
     pub mime: String,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProfileCache {
+    sessions: Vec<HermesSession>,
+    chats: HashMap<String, SessionChatState>,
+    soul_md: String,
+    memory_md: String,
+    user_md: String,
+    active_model: Option<String>,
+    active_provider: Option<String>,
+    skills: Vec<HermesSkill>,
+    toolsets: Vec<HermesToolset>,
+    mcp_servers: Vec<HermesMcpServer>,
+    cron_jobs: Vec<HermesCronJob>,
+    loaded_views: HashSet<AppViewId>,
 }
 
 pub struct StateChanged;
@@ -315,6 +355,14 @@ pub struct AppState {
     pub client: Option<HermesClient>,
     pub realtime: Option<HermesRealtimeSession>,
     pub ws_generation: u64,
+    pub profile_generation: u64,
+    pub sidebar_version: u64,
+    pub shell_version: u64,
+    was_disconnected: bool,
+    loaded_views: HashSet<AppViewId>,
+    profile_cache: HashMap<String, ProfileCache>,
+    synced_session_config: HashMap<String, (ReasoningEffort, bool, bool)>,
+    pub bot_finished_at: HashMap<String, Instant>,
 
     // UI Shell state
     pub prefs: UiPreferences,
@@ -396,6 +444,24 @@ pub struct AppState {
     pub inspector_git: Option<GitWorkspaceStatus>,
     pub inspector_git_loading: bool,
     pub inspector_git_error: Option<String>,
+    inspector_files_gen: u64,
+    inspector_preview_gen: u64,
+    inspector_git_gen: u64,
+
+    // DeepSeek-inspired Coding Agent Harness state (durable via harness.db)
+    pub harness_store: Option<HarnessStore>,
+    pub goal_worker: Option<GoalWorker>,
+    pub draft_mode: ConversationMode,
+    pub session_modes: HashMap<String, SessionModeBinding>,
+    pub work_projects: Vec<WorkProject>,
+    pub selected_work_project_id: Option<String>,
+    pub project_picker_open: bool,
+    pub slash_commands: Vec<SlashCommandInfo>,
+    pub trajectory_events: HashMap<String, Vec<TrajectoryEvent>>,
+    pub subagents: HashMap<String, Vec<SubagentNode>>,
+    pub session_metrics: HashMap<String, SessionLiveMetrics>,
+    pub inspect_trajectory_call_id: Option<String>,
+    run_counters: HashMap<String, (String, u32, u32)>,
 }
 
 const HISTORY_PAGE_SIZE: usize = 48;
@@ -407,6 +473,21 @@ impl AppState {
         let home_dir = dirs::home_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "/home".into());
+        let harness_store = HarnessStore::open_default().ok();
+        let (goal_worker, session_modes, work_projects) = if let Some(ref st) = harness_store {
+            st.mark_running_subagents_interrupted_on_recovery();
+            let gw = GoalWorker::new(st.clone());
+            let modes = st
+                .load_all_mode_bindings()
+                .into_iter()
+                .map(|b| (b.session_id.clone(), b))
+                .collect();
+            let projs = st.list_projects(None);
+            (Some(gw), modes, projs)
+        } else {
+            (None, HashMap::new(), Vec::new())
+        };
+        let selected_work_project_id = work_projects.first().map(|p| p.id.clone());
 
         Self {
             tokio_rt,
@@ -417,6 +498,14 @@ impl AppState {
             client: None,
             realtime: None,
             ws_generation: 0,
+            profile_generation: 0,
+            sidebar_version: 0,
+            shell_version: 0,
+            was_disconnected: false,
+            loaded_views: HashSet::new(),
+            profile_cache: HashMap::new(),
+            synced_session_config: HashMap::new(),
+            bot_finished_at: HashMap::new(),
             prefs,
             active_view: AppViewId::Chat,
             sidebar_collapsed: false,
@@ -433,7 +522,7 @@ impl AppState {
             connection_detail: "Choose where Hermes runs".into(),
             rust_backend: None,
             hermes_status: None,
-            system_stats: Some(workspace::get_linux_system_stats()),
+            system_stats: None,
             bootstrap_ms: None,
             restarting_backend: false,
             refreshing_models: false,
@@ -487,6 +576,22 @@ impl AppState {
             inspector_git: None,
             inspector_git_loading: false,
             inspector_git_error: None,
+            inspector_files_gen: 0,
+            inspector_preview_gen: 0,
+            inspector_git_gen: 0,
+            harness_store,
+            goal_worker,
+            draft_mode: ConversationMode::Chat,
+            session_modes,
+            work_projects,
+            selected_work_project_id,
+            project_picker_open: false,
+            slash_commands: builtin_hermes_commands(),
+            trajectory_events: HashMap::new(),
+            subagents: HashMap::new(),
+            session_metrics: HashMap::new(),
+            inspect_trajectory_call_id: None,
+            run_counters: HashMap::new(),
         }
     }
 
@@ -520,9 +625,892 @@ impl AppState {
         self.chats.get(key).cloned().unwrap_or_default()
     }
 
+    pub fn active_chat_ref(&self) -> Option<&SessionChatState> {
+        let key = self.active_session_id.as_deref().unwrap_or("new");
+        self.chats.get(key)
+    }
+
+    pub fn active_bot_state(&self) -> BotFaceState {
+        self.active_chat_ref()
+            .map(SessionChatState::bot_state)
+            .unwrap_or(BotFaceState::Idle)
+    }
+
+    pub fn active_is_streaming(&self) -> bool {
+        self.active_chat_ref().is_some_and(|c| c.is_streaming)
+    }
+
+    pub fn active_execution_state(&self) -> ExecutionState {
+        self.active_chat_ref()
+            .map(SessionChatState::execution_state)
+            .unwrap_or(ExecutionState::Idle)
+    }
+
+    pub fn reduced_motion(&self) -> bool {
+        self.prefs.reduced_motion
+            || std::env::var("REDUCED_MOTION")
+                .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false)
+    }
+
+    pub fn set_reduced_motion(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.prefs.reduced_motion = enabled;
+        let prefs = self.prefs.clone();
+        self.tokio_rt.spawn_blocking(move || {
+            save_ui_prefs(&prefs);
+        });
+        self.bump_shell();
+        cx.notify();
+    }
+
+    pub fn active_conversation_mode(&self) -> ConversationMode {
+        if let Some(sid) = self.active_session_id.as_deref() {
+            if let Some(binding) = self.session_modes.get(sid) {
+                return binding.mode;
+            }
+            if let Some(sess) = self.sessions.iter().find(|s| s.id == sid) {
+                if sess.cwd.as_deref().is_some_and(|c| !c.trim().is_empty())
+                    && !self.draft_session_ids.contains(sid)
+                {
+                    return ConversationMode::Work;
+                }
+            }
+        }
+        self.draft_mode
+    }
+
+    pub fn is_active_mode_locked(&self) -> bool {
+        let Some(sid) = self.active_session_id.as_deref() else {
+            return false;
+        };
+        if self.session_modes.get(sid).is_some_and(|b| b.locked) {
+            return true;
+        }
+        self.chats
+            .get(sid)
+            .is_some_and(|c| !c.messages.is_empty())
+            || self
+                .sessions
+                .iter()
+                .find(|s| s.id == sid)
+                .and_then(|s| s.message_count)
+                .unwrap_or(0)
+                > 0
+    }
+
+    pub fn active_mode_binding(&self) -> Option<&SessionModeBinding> {
+        let sid = self.active_session_id.as_deref()?;
+        self.session_modes.get(sid)
+    }
+
+    pub fn active_work_project(&self) -> Option<&WorkProject> {
+        if let Some(binding) = self.active_mode_binding() {
+            if let Some(pid) = binding.project_id.as_deref() {
+                if let Some(p) = self.work_projects.iter().find(|p| p.id == pid) {
+                    return Some(p);
+                }
+            }
+            if let Some(cwd) = binding.cwd.as_deref() {
+                if let Some(p) = self.work_projects.iter().find(|p| p.cwd == cwd) {
+                    return Some(p);
+                }
+            }
+        }
+        let sel = self.selected_work_project_id.as_deref()?;
+        self.work_projects.iter().find(|p| p.id == sel)
+    }
+
+    pub fn active_work_cwd(&self) -> Option<String> {
+        self.active_mode_binding()
+            .and_then(|b| b.cwd.clone())
+            .filter(|c| !c.trim().is_empty())
+            .or_else(|| {
+                self.active_session()
+                    .and_then(|s| s.cwd.clone())
+                    .filter(|c| !c.trim().is_empty())
+            })
+            .or_else(|| self.active_work_project().map(|p| p.cwd.clone()))
+    }
+
+    pub fn set_draft_mode(&mut self, mode: ConversationMode, cx: &mut Context<Self>) {
+        if self.is_active_mode_locked() {
+            self.show_toast(
+                "Conversation mode is locked after the first message. Start a new conversation to switch modes.",
+                cx,
+            );
+            return;
+        }
+        self.draft_mode = mode;
+        if let Some(sid) = self.active_session_id.clone() {
+            let proj = if mode == ConversationMode::Work {
+                self.active_work_project().cloned()
+            } else {
+                None
+            };
+            let binding = SessionModeBinding {
+                session_id: sid.clone(),
+                mode,
+                locked: false,
+                project_id: proj.as_ref().map(|p| p.id.clone()),
+                project_name: proj.as_ref().map(|p| p.name.clone()),
+                cwd: proj.as_ref().map(|p| p.cwd.clone()),
+                server_id: Some(self.connection.id.clone()),
+                updated_at_ms: now_epoch_ms(),
+            };
+            if let Some(ref cwd) = binding.cwd {
+                self.inspector_cwd = cwd.clone();
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == sid) {
+                    s.cwd = Some(cwd.clone());
+                }
+            }
+            self.persist_mode_binding(binding);
+        }
+        if mode == ConversationMode::Work {
+            if let Some(p) = self.active_work_project().cloned() {
+                self.inspector_cwd = p.cwd;
+                self.refresh_inspector_git(cx);
+            }
+        }
+        self.bump_shell();
+        cx.notify();
+    }
+
+    pub fn open_project_picker(&mut self, cx: &mut Context<Self>) {
+        self.project_picker_open = true;
+        self.bump_shell();
+        cx.notify();
+    }
+
+    pub fn close_project_picker(&mut self, cx: &mut Context<Self>) {
+        self.project_picker_open = false;
+        self.bump_shell();
+        cx.notify();
+    }
+
+    pub fn select_work_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+        let Some(proj) = self.work_projects.iter().find(|p| p.id == project_id).cloned() else {
+            return;
+        };
+        self.selected_work_project_id = Some(proj.id.clone());
+        self.inspector_cwd = proj.cwd.clone();
+        self.project_picker_open = false;
+
+        if let Some(sid) = self.active_session_id.clone() {
+            let locked = self.is_active_mode_locked();
+            let binding = SessionModeBinding {
+                session_id: sid.clone(),
+                mode: ConversationMode::Work,
+                locked,
+                project_id: Some(proj.id.clone()),
+                project_name: Some(proj.name.clone()),
+                cwd: Some(proj.cwd.clone()),
+                server_id: Some(self.connection.id.clone()),
+                updated_at_ms: now_epoch_ms(),
+            };
+            self.persist_mode_binding(binding);
+            if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sid) {
+                sess.cwd = Some(proj.cwd.clone());
+            }
+            if let Some(ws) = self.realtime.clone().filter(|w| w.is_connected()) {
+                if let Some(live) = self.live_ids.get(&sid).cloned() {
+                    let cwd_sync = proj.cwd.clone();
+                    let rt = self.tokio_rt.clone();
+                    cx.spawn(async move |_, _| {
+                        let _ = rt.spawn(async move { ws.set_session_cwd(&live, &cwd_sync).await }).await;
+                    })
+                    .detach();
+                }
+            }
+        }
+
+        self.refresh_inspector_files(cx);
+        self.refresh_inspector_git(cx);
+        self.bump_sidebar();
+        self.bump_shell();
+        self.show_toast(format!("Project: {} ({})", proj.name, proj.cwd), cx);
+        cx.notify();
+    }
+
+    pub fn create_and_select_work_project(
+        &mut self,
+        name: String,
+        canonical_path: String,
+        is_home: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let clean_name = if name.trim().is_empty() {
+            std::path::Path::new(&canonical_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Workspace".into())
+        } else {
+            name.trim().to_string()
+        };
+        let now = now_epoch_ms();
+        let server_id = self.connection.id.clone();
+
+        let existing_id = self
+            .work_projects
+            .iter()
+            .find(|p| p.server_id == server_id && p.cwd == canonical_path)
+            .map(|p| p.id.clone());
+        let project = WorkProject {
+            id: existing_id.unwrap_or_else(|| format!("proj-{}", uuid::Uuid::new_v4().simple())),
+            name: clean_name.clone(),
+            cwd: canonical_path.clone(),
+            server_id: server_id.clone(),
+            is_home,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        self.work_projects
+            .retain(|p| !(p.server_id == server_id && p.cwd == canonical_path));
+        self.work_projects.insert(0, project.clone());
+
+        if let Some(store) = self.harness_store.clone() {
+            let p_save = project.clone();
+            let rt = self.tokio_rt.clone();
+            rt.spawn_blocking(move || {
+                let _ = store.upsert_project(&p_save);
+            });
+        }
+        // Best-effort sync to Hermes server projects.db
+        if let Some(ws) = self.realtime.clone().filter(|w| w.is_connected()) {
+            let n = clean_name.clone();
+            let c = canonical_path.clone();
+            let rt = self.tokio_rt.clone();
+            cx.spawn(async move |_, _| {
+                let _ = rt
+                    .spawn(async move { ws.create_project(&n, None, Some("blue"), &c, "default").await })
+                    .await;
+            })
+            .detach();
+        }
+
+        self.select_work_project(project.id, cx);
+    }
+
+    fn persist_mode_binding(&mut self, binding: SessionModeBinding) {
+        self.session_modes
+            .insert(binding.session_id.clone(), binding.clone());
+        if let Some(store) = self.harness_store.clone() {
+            let rt = self.tokio_rt.clone();
+            rt.spawn_blocking(move || {
+                let _ = store.save_mode_binding(&binding);
+            });
+        }
+    }
+
+    pub fn active_goal_snapshot(&self) -> Option<GoalRuntimeSnapshot> {
+        let sid = self.active_session_id.as_deref()?;
+        self.goal_worker.as_ref()?.snapshot_for_session(sid)
+    }
+
+    pub fn active_goal_events(&self) -> Vec<crate::harness::goal_worker::GoalEventRecord> {
+        let Some(snap) = self.active_goal_snapshot() else {
+            return Vec::new();
+        };
+        self.goal_worker
+            .as_ref()
+            .map(|gw| gw.goal_events(&snap.goal.goal_id))
+            .unwrap_or_default()
+    }
+
+    pub fn refresh_server_projects(&mut self, cx: &mut Context<Self>) {
+        let Some(ws) = self.realtime.clone().filter(|w| w.is_connected()) else {
+            return;
+        };
+        let server_id = self.connection.id.clone();
+        let rt = self.tokio_rt.clone();
+        let store = self.harness_store.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(val)) = rt.spawn(async move { ws.projects_list().await }).await else {
+                return;
+            };
+            let arr = val
+                .get("projects")
+                .and_then(Value::as_array)
+                .or_else(|| val.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if arr.is_empty() {
+                return;
+            }
+            let now = now_epoch_ms();
+            let mut fetched = Vec::new();
+            for item in arr {
+                let cwd = item
+                    .get("cwd")
+                    .or_else(|| item.get("path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if cwd.is_empty() {
+                    continue;
+                }
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(cwd)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Project".into())
+                    });
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|s| format!("srv-{server_id}-{s}"))
+                    .unwrap_or_else(|| format!("proj-{}", uuid::Uuid::new_v4().simple()));
+                fetched.push(WorkProject {
+                    id,
+                    name,
+                    cwd: cwd.to_string(),
+                    server_id: server_id.clone(),
+                    is_home: false,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                });
+            }
+            if fetched.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |s, cx| {
+                let mut changed = false;
+                for proj in fetched {
+                    if !s
+                        .work_projects
+                        .iter()
+                        .any(|p| p.server_id == proj.server_id && p.cwd == proj.cwd)
+                    {
+                        if let Some(ref st) = store {
+                            let st_c = st.clone();
+                            let p_save = proj.clone();
+                            s.tokio_rt.spawn_blocking(move || {
+                                let _ = st_c.upsert_project(&p_save);
+                            });
+                        }
+                        s.work_projects.push(proj);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn active_metrics(&self) -> SessionLiveMetrics {
+        let key = self.active_session_id.as_deref().unwrap_or("new");
+        self.session_metrics.get(key).cloned().unwrap_or_default()
+    }
+
+    pub fn active_trajectory(&self) -> Vec<TrajectoryEvent> {
+        let Some(sid) = self.active_session_id.as_deref() else {
+            return Vec::new();
+        };
+        self.trajectory_events.get(sid).cloned().unwrap_or_default()
+    }
+
+    pub fn active_subagents(&self) -> Vec<SubagentNode> {
+        let Some(sid) = self.active_session_id.as_deref() else {
+            return Vec::new();
+        };
+        self.subagents.get(sid).cloned().unwrap_or_default()
+    }
+
+    pub fn inspect_tool_in_trajectory(&mut self, tool_call_id: Option<String>, cx: &mut Context<Self>) {
+        self.inspect_trajectory_call_id = tool_call_id;
+        self.right_pane_open = true;
+        self.right_pane_tab = RightPaneTabId::Trajectory;
+        self.bump_shell();
+        cx.notify();
+    }
+
+    pub fn interrupt_subagent(&mut self, subagent_id: String, cx: &mut Context<Self>) {
+        let Some(sid) = self.active_session_id.clone() else {
+            return;
+        };
+        if let Some(list) = self.subagents.get_mut(&sid) {
+            if let Some(node) = list.iter_mut().find(|n| n.subagent_id == subagent_id) {
+                node.status = SubagentStatus::Interrupted;
+                node.current_operation = "Interrupted by user".into();
+                node.updated_at_ms = now_epoch_ms();
+                if let Some(store) = self.harness_store.clone() {
+                    let node_save = node.clone();
+                    self.tokio_rt.spawn_blocking(move || {
+                        let _ = store.upsert_subagent(&node_save);
+                    });
+                }
+            }
+        }
+        if let Some(ws) = self.realtime.clone().filter(|w| w.is_connected()) {
+            let live = self.live_ids.get(&sid).cloned().unwrap_or(sid);
+            let sub_id = subagent_id.clone();
+            let rt = self.tokio_rt.clone();
+            cx.spawn(async move |_, _| {
+                let _ = rt
+                    .spawn(async move { ws.interrupt_subagent(&live, &sub_id).await })
+                    .await;
+            })
+            .detach();
+        }
+        self.show_toast(format!("Interrupted subagent {subagent_id}"), cx);
+        cx.notify();
+    }
+
+    pub fn refresh_slash_commands(&mut self, cx: &mut Context<Self>) {
+        let Some(ws) = self.realtime.clone().filter(|w| w.is_connected()) else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(val)) = rt.spawn(async move { ws.commands_catalog().await }).await else {
+                return;
+            };
+            let merged = crate::harness::events::parse_hermes_commands_catalog(&val);
+            if merged.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |s, cx| {
+                s.slash_commands = merged;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn next_run_turn_step(&mut self, session_id: &str, new_turn: bool, new_step: bool) -> (String, u32, u32) {
+        let entry = self
+            .run_counters
+            .entry(session_id.to_string())
+            .or_insert_with(|| (format!("run-{}", uuid::Uuid::new_v4().simple()), 0, 0));
+        if new_turn {
+            entry.0 = format!("run-{}", uuid::Uuid::new_v4().simple());
+            entry.1 = entry.1.saturating_add(1);
+            entry.2 = 1;
+        } else if new_step {
+            if entry.1 == 0 {
+                entry.1 = 1;
+            }
+            entry.2 = entry.2.saturating_add(1);
+        } else if entry.1 == 0 {
+            entry.1 = 1;
+            entry.2 = 1;
+        }
+        entry.clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_trajectory_event(
+        &mut self,
+        session_id: &str,
+        event_id: String,
+        kind: TrajectoryEventKind,
+        agent_id: String,
+        parent_agent_id: Option<String>,
+        tool_call_id: Option<String>,
+        title: String,
+        summary: String,
+        is_error: bool,
+        duration_ms: Option<u64>,
+        payload: Value,
+    ) {
+        let new_turn = kind == TrajectoryEventKind::TurnStart;
+        let new_step = matches!(
+            kind,
+            TrajectoryEventKind::ToolCallStart | TrajectoryEventKind::PtcExecution
+        );
+        let (run_id, turn, step) = self.next_run_turn_step(session_id, new_turn, new_step);
+        let list = self.trajectory_events.entry(session_id.to_string()).or_default();
+        if list.iter().any(|e| e.event_id == event_id) {
+            return;
+        }
+        let next_seq = list.last().map(|e| e.seq + 1).unwrap_or(1);
+        let ev = TrajectoryEvent {
+            seq: next_seq,
+            event_id,
+            session_id: session_id.to_string(),
+            run_id,
+            turn,
+            step,
+            agent_id,
+            parent_agent_id,
+            tool_call_id,
+            kind,
+            title,
+            summary,
+            is_error,
+            duration_ms,
+            payload,
+            created_at_ms: now_epoch_ms(),
+        };
+        list.push(ev.clone());
+        if list.len() > 2000 {
+            let drain = list.len() - 2000;
+            list.drain(..drain);
+        }
+        if let Some(store) = self.harness_store.clone() {
+            let rt = self.tokio_rt.clone();
+            rt.spawn_blocking(move || {
+                let _ = store.append_trajectory_event(&ev);
+            });
+        }
+    }
+
+    fn hydrate_session_harness_data(&mut self, sid: String, cx: &mut Context<Self>) {
+        let Some(store) = self.harness_store.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        cx.spawn(async move |this, cx| {
+            let sid_l = sid.clone();
+            let (traj, subs) = rt
+                .spawn_blocking(move || {
+                    let t = store.load_trajectory_events(&sid_l, 500);
+                    let sub = store.load_subagents(&sid_l);
+                    (t, sub)
+                })
+                .await
+                .unwrap_or_default();
+            let _ = this.update(cx, |s, cx| {
+                if !traj.is_empty() && s.trajectory_events.get(&sid).map(|v| v.len()).unwrap_or(0) < traj.len() {
+                    s.trajectory_events.insert(sid.clone(), traj);
+                }
+                if !subs.is_empty() && !s.subagents.contains_key(&sid) {
+                    s.subagents.insert(sid.clone(), subs);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn pause_active_goal(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.active_session_id.clone() else {
+            return;
+        };
+        let Some(worker) = self.goal_worker.clone() else {
+            return;
+        };
+        match worker.pause_goal(&sid, None, "Paused by user") {
+            Ok(snap) => {
+                self.record_trajectory_event(
+                    &sid,
+                    format!("goal-pause-{}-{}", snap.goal.goal_id, snap.goal.revision),
+                    TrajectoryEventKind::GoalChanged,
+                    "lead".into(),
+                    None,
+                    None,
+                    "Goal paused".into(),
+                    snap.goal.objective.clone(),
+                    false,
+                    None,
+                    json!({"goalId": snap.goal.goal_id, "phase": "paused", "revision": snap.goal.revision}),
+                );
+                if self.chats.get(&sid).is_some_and(|c| c.is_streaming) {
+                    self.interrupt_stream(cx);
+                }
+                if let Some(ws) = self.realtime.clone().filter(|w| w.is_connected()) {
+                    let live = self.live_ids.get(&sid).cloned().unwrap_or(sid);
+                    let rt = self.tokio_rt.clone();
+                    cx.spawn(async move |_, _| {
+                        let _ = rt.spawn(async move { ws.dispatch_command(&live, "/goal pause").await }).await;
+                    })
+                    .detach();
+                }
+                self.show_toast("Goal paused", cx);
+                cx.notify();
+            }
+            Err(e) => self.show_toast(e, cx),
+        }
+    }
+
+    pub fn resume_active_goal(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.active_session_id.clone() else {
+            return;
+        };
+        let Some(worker) = self.goal_worker.clone() else {
+            return;
+        };
+        match worker.resume_goal(&sid, None) {
+            Ok(snap) => {
+                self.record_trajectory_event(
+                    &sid,
+                    format!("goal-resume-{}-{}", snap.goal.goal_id, snap.goal.revision),
+                    TrajectoryEventKind::GoalChanged,
+                    "lead".into(),
+                    None,
+                    None,
+                    "Goal resumed".into(),
+                    snap.goal.objective.clone(),
+                    false,
+                    None,
+                    json!({"goalId": snap.goal.goal_id, "phase": "active", "revision": snap.goal.revision}),
+                );
+                self.show_toast("Goal resumed", cx);
+                self.dispatch_next_goal_round(sid, cx);
+                cx.notify();
+            }
+            Err(e) => self.show_toast(e, cx),
+        }
+    }
+
+    pub fn cancel_active_goal(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.active_session_id.clone() else {
+            return;
+        };
+        let Some(worker) = self.goal_worker.clone() else {
+            return;
+        };
+        match worker.cancel_goal(&sid, "Cancelled by user") {
+            Ok(snap) => {
+                self.record_trajectory_event(
+                    &sid,
+                    format!("goal-cancel-{}-{}", snap.goal.goal_id, snap.goal.revision),
+                    TrajectoryEventKind::GoalChanged,
+                    "lead".into(),
+                    None,
+                    None,
+                    "Goal cancelled".into(),
+                    snap.goal.objective.clone(),
+                    false,
+                    None,
+                    json!({"goalId": snap.goal.goal_id, "phase": "cancelled", "revision": snap.goal.revision}),
+                );
+                if self.chats.get(&sid).is_some_and(|c| c.is_streaming) {
+                    self.interrupt_stream(cx);
+                }
+                if let Some(ws) = self.realtime.clone().filter(|w| w.is_connected()) {
+                    let live = self.live_ids.get(&sid).cloned().unwrap_or(sid);
+                    let rt = self.tokio_rt.clone();
+                    cx.spawn(async move |_, _| {
+                        let _ = rt.spawn(async move { ws.dispatch_command(&live, "/goal clear").await }).await;
+                    })
+                    .detach();
+                }
+                self.show_toast("Goal cancelled", cx);
+                cx.notify();
+            }
+            Err(e) => self.show_toast(e, cx),
+        }
+    }
+
+    pub fn complete_active_goal(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.active_session_id.clone() else {
+            return;
+        };
+        let Some(worker) = self.goal_worker.clone() else {
+            return;
+        };
+        match worker.complete_goal(&sid, Some("Completed by user".into())) {
+            Ok(snap) => {
+                self.record_trajectory_event(
+                    &sid,
+                    format!("goal-complete-{}-{}", snap.goal.goal_id, snap.goal.revision),
+                    TrajectoryEventKind::GoalChanged,
+                    "lead".into(),
+                    None,
+                    None,
+                    "Goal completed".into(),
+                    snap.goal.objective.clone(),
+                    false,
+                    None,
+                    json!({"goalId": snap.goal.goal_id, "phase": "complete", "revision": snap.goal.revision}),
+                );
+                self.show_toast("Goal marked complete", cx);
+                cx.notify();
+            }
+            Err(e) => self.show_toast(e, cx),
+        }
+    }
+
+    fn dispatch_next_goal_round(&mut self, session_id: String, cx: &mut Context<Self>) {
+        let Some(worker) = self.goal_worker.clone() else {
+            return;
+        };
+        let Some(ws) = self.realtime.clone().filter(|w| w.is_connected()) else {
+            return;
+        };
+        if self.chats.get(&session_id).is_some_and(|c| c.is_streaming) {
+            return;
+        }
+        let tokens_now = self
+            .session_metrics
+            .get(&session_id)
+            .and_then(|m| m.total_tokens().value);
+        let Ok(Some(round)) = worker.try_begin_round(&session_id, tokens_now) else {
+            cx.notify();
+            return;
+        };
+        let Some(snap) = worker.snapshot_for_session(&session_id) else {
+            return;
+        };
+
+        let prompt = if round == 1 {
+            format!(
+                "[Goal · Round 1/{}]\nObjective: {}\n\nWork autonomously toward this objective. Verify your changes and end your final message with `GOAL_COMPLETE` once every acceptance criterion is verified.",
+                snap.goal.max_rounds, snap.goal.objective
+            )
+        } else {
+            format!(
+                "[Goal Continuation · Round {}/{}]\nObjective: {}\n\nContinue making verified progress toward the objective. When completely finished and verified, include `GOAL_COMPLETE` in your response.",
+                round, snap.goal.max_rounds, snap.goal.objective
+            )
+        };
+
+        let chat = self.chats.entry(session_id.clone()).or_default();
+        chat.is_streaming = true;
+        chat.has_streamed_text = false;
+        chat.active_tool_name = None;
+        chat.last_settlement = None;
+        chat.live_status_text = format!("Goal round {round}/{}…", snap.goal.max_rounds);
+        self.session_metrics
+            .entry(session_id.clone())
+            .or_default()
+            .on_turn_start();
+
+        self.record_trajectory_event(
+            &session_id,
+            format!("goal-round-{}-{round}", snap.goal.goal_id),
+            TrajectoryEventKind::TurnStart,
+            "lead".into(),
+            None,
+            None,
+            format!("Goal round {round}/{}", snap.goal.max_rounds),
+            snap.goal.objective.clone(),
+            false,
+            None,
+            json!({"goalId": snap.goal.goal_id, "round": round, "maxRounds": snap.goal.max_rounds}),
+        );
+
+        let existing_live = self.live_ids.get(&session_id).cloned();
+        let profile = self.active_profile.clone();
+        let model = self.active_model.clone();
+        let provider = self.active_provider.clone();
+        let effort = self.reasoning_effort.as_str().to_string();
+        let fast = self.fast_mode;
+        let cwd = snap
+            .goal
+            .cwd
+            .clone()
+            .or_else(|| self.session_modes.get(&session_id).and_then(|b| b.cwd.clone()));
+        let rt = self.tokio_rt.clone();
+        let sid_bg = session_id.clone();
+
+        cx.spawn(async move |this, cx| {
+            let sid_inner = sid_bg.clone();
+            let res: Result<String, String> = rt
+                .spawn(async move {
+                    let mut live_sid = existing_live;
+                    if live_sid.is_none() && !sid_inner.starts_with("session_") {
+                        if let Ok(resumed) = ws.resume_session(&sid_inner, &profile).await {
+                            live_sid = resumed
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .map(String::from);
+                        }
+                    }
+                    if live_sid.is_none() {
+                        let mut params = json!({
+                            "source": "desktop",
+                            "profile": profile,
+                            "model": model,
+                            "reasoning_effort": effort,
+                            "fast": fast,
+                        });
+                        if provider != "auto" && !provider.is_empty() {
+                            params["provider"] = json!(provider);
+                        }
+                        if let Some(c) = cwd {
+                            params["cwd"] = json!(c);
+                        }
+                        let created = ws.create_session(params).await?;
+                        live_sid = created
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                    }
+                    let live = live_sid.unwrap_or(sid_inner);
+                    ws.submit_prompt(&live, &prompt).await?;
+                    Ok(live)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+
+            let _ = this.update(cx, |s, cx| match res {
+                Ok(live) => {
+                    s.live_ids.insert(sid_bg.clone(), live.clone());
+                    s.wire_to_stored.insert(live, sid_bg);
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(c) = s.chats.get_mut(&sid_bg) {
+                        c.is_streaming = false;
+                        c.last_settlement = Some((TurnSettlementOutcome::Error, Instant::now()));
+                    }
+                    if let Some(ref w) = s.goal_worker {
+                        let _ = w.fail_goal(&sid_bg, &err);
+                    }
+                    s.show_toast(format!("Goal round failed: {err}"), cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn bot_recently_finished(&self, profile: &str) -> bool {
+        if profile == self.active_profile && self.active_is_streaming() {
+            return false;
+        }
+        let any_streaming_for_profile = self.sessions.iter().any(|s| {
+            let p = s
+                .profile
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .unwrap_or(self.active_profile.as_str());
+            p == profile && self.chats.get(&s.id).is_some_and(|c| c.is_streaming)
+        });
+        if any_streaming_for_profile {
+            return false;
+        }
+        self.bot_finished_at
+            .get(profile)
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(8))
+    }
+
+    pub fn bump_sidebar(&mut self) {
+        self.sidebar_version = self.sidebar_version.wrapping_add(1);
+    }
+
+    pub fn bump_shell(&mut self) {
+        self.shell_version = self.shell_version.wrapping_add(1);
+    }
+
+    pub fn set_active_view(&mut self, view: AppViewId, cx: &mut Context<Self>) {
+        if self.active_view != view {
+            self.active_view = view;
+            self.bump_sidebar();
+            self.bump_shell();
+        }
+        self.ensure_view_data(view, cx);
+        cx.notify();
+    }
+
     pub fn set_theme(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
         self.prefs.theme = mode;
-        save_ui_prefs(&self.prefs);
+        let prefs = self.prefs.clone();
+        self.tokio_rt.spawn_blocking(move || {
+            save_ui_prefs(&prefs);
+        });
+        self.bump_sidebar();
+        self.bump_shell();
         cx.notify();
     }
 
@@ -536,21 +1524,26 @@ impl AppState {
 
     pub fn show_toast(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
         self.toast = Some((msg.into(), Instant::now()));
+        self.bump_shell();
         cx.notify();
     }
 
     pub fn persist_board_state(&self) {
+        if !self.connection.is_local() {
+            return;
+        }
         let state = PersistedBoardState {
             boards: self.boards.clone(),
             session_boards: self.session_boards.clone(),
             tasks: self.tasks.clone(),
             bot_avatars: self.bot_avatars.clone(),
         };
-        if self.connection.is_local() {
+        let home = self.supervisor.hermes_home().clone();
+        self.tokio_rt.spawn_blocking(move || {
             if let Ok(val) = serde_json::to_value(&state) {
-                let _ = sqlite_store::save_board_state(self.supervisor.hermes_home(), &val);
+                let _ = sqlite_store::save_board_state(&home, &val);
             }
-        }
+        });
     }
 
     pub fn bootstrap_saved_connection(&mut self, cx: &mut Context<Self>) {
@@ -563,6 +1556,7 @@ impl AppState {
         let Some(mut saved) = saved else {
             self.initializing = false;
             self.setup_open = true;
+            self.bump_shell();
             cx.notify();
             return;
         };
@@ -571,9 +1565,13 @@ impl AppState {
         self.initializing = true;
         self.connection_status = ConnectionStatus::Connecting;
         self.connection_detail = format!("Connecting to {}…", saved.name);
+        self.bump_sidebar();
+        self.bump_shell();
         cx.notify();
 
         if saved.is_local() {
+            // Hydrate local SQLite & stats off the UI thread while Hermes starts.
+            self.hydrate_local_async(None, cx);
             self.start_local_connection(true, cx);
         } else {
             // Check token expiry and refresh if needed
@@ -616,29 +1614,22 @@ impl AppState {
         let sup = self.supervisor.clone();
         self.connection_status = ConnectionStatus::Connecting;
         self.connection_detail = "Starting Hermes on this computer…".into();
+        self.bump_sidebar();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let boot_res: Result<(String, String, BackendInfo), String> = rt
                 .spawn(async move {
                     sup.start_in_background().await;
-                    for _ in 0..80 {
-                        let info = sup.info().await;
-                        if info.status == "ready" {
-                            if let (Some(url), Some(token)) = (info.url.clone(), info.token.clone())
-                            {
-                                return Ok((url, token, info));
-                            }
-                        }
-                        if info.status == "error" {
-                            return Err(info.error.unwrap_or_else(|| {
-                                "Hermes could not start. Install Hermes Agent, or connect to a server."
-                                    .into()
-                            }));
-                        }
-                        tokio::time::sleep(Duration::from_millis(350)).await;
+                    let info = sup.wait_until_ready(Duration::from_secs(28)).await?;
+                    if let (Some(url), Some(token)) = (info.url.clone(), info.token.clone()) {
+                        Ok((url, token, info))
+                    } else {
+                        Err(
+                            "Hermes could not start. Install Hermes Agent, or connect to a server."
+                                .into(),
+                        )
                     }
-                    Err("Hermes took too long to start. Check the runtime in Settings, or connect to a server.".into())
                 })
                 .await
                 .unwrap_or_else(|e| Err(format!("Supervisor task failed: {e}")));
@@ -662,6 +1653,8 @@ impl AppState {
                     s.initializing = false;
                     s.connection_status = ConnectionStatus::Error;
                     s.connection_detail = err;
+                    s.bump_sidebar();
+                    s.bump_shell();
                     cx.notify();
                 }
             });
@@ -687,15 +1680,19 @@ impl AppState {
 
         self.connection_status = ConnectionStatus::Connecting;
         self.connection_detail = format!("Checking {}…", conn.name);
+        self.bump_sidebar();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result: Result<(HermesClient, HermesRealtimeSession, HermesStatus), String> = rt
+            let result: Result<
+                (HermesClient, HermesRealtimeSession, HermesStatus, Vec<HermesProfile>),
+                String,
+            > = rt
                 .spawn(async move {
                     let client = HermesClient::new(conn_clone.clone(), Some(profile.clone()));
-                    let status = client.test_connection().await?;
                     let ws = HermesRealtimeSession::new(client.clone());
-                    ws.connect(Some(profile)).await?;
+                    let ((status, profiles), ()) =
+                        tokio::try_join!(client.test_connection(), ws.connect(Some(profile)))?;
                     let _ = ws.rpc("gateway.ping", json!({}), 10_000).await?;
                     if let Some(old) = prev_rt {
                         old.disconnect().await;
@@ -714,20 +1711,34 @@ impl AppState {
                             let _ = remote::save_connection(&path, &val);
                         }
                     }
-                    Ok((client, ws, status))
+                    Ok((client, ws, status, profiles))
                 })
                 .await
                 .unwrap_or_else(|e| Err(format!("Connection task failed: {e}")));
 
             let _ = this.update(cx, |s, cx| match result {
-                Ok((client, ws, status)) => {
+                Ok((client, ws, status, profiles)) => {
                     s.ws_generation = s.ws_generation.wrapping_add(1);
+                    s.profile_generation = s.profile_generation.wrapping_add(1);
+                    s.was_disconnected = false;
+                    s.loaded_views.clear();
+                    s.profile_cache.clear();
+                    s.synced_session_config.clear();
                     let gen = s.ws_generation;
                     let mut rx = ws.subscribe();
 
                     s.connection = conn;
                     s.client = Some(client);
                     s.realtime = Some(ws);
+                    if !profiles.is_empty() {
+                        if let Some(active) = profiles.iter().find(|p| p.active) {
+                            s.active_profile = active.name.clone();
+                            if let Some(c) = &s.client {
+                                c.set_profile(Some(active.name.clone()));
+                            }
+                        }
+                        s.profiles = profiles;
+                    }
                     s.hermes_status = Some(status);
                     s.connection_status = if s.connection.is_local() {
                         ConnectionStatus::Local
@@ -741,12 +1752,17 @@ impl AppState {
                     }
                     s.live_ids.clear();
                     s.wire_to_stored.clear();
+                    s.bump_sidebar();
+                    s.bump_shell();
 
                     if s.connection.is_local() {
-                        s.hydrate_local(None);
+                        let prof = s.active_profile.clone();
+                        s.hydrate_local_async(Some(prof), cx);
                     }
-                    s.refresh_capabilities(false, cx);
-                    s.refresh_inspector_files(cx);
+                    s.refresh_core_capabilities(false, cx);
+                    if s.right_pane_open {
+                        s.refresh_inspector_files(cx);
+                    }
 
                     // Bridge tokio broadcast stream into GPUI event loop cleanly
                     let (ev_tx, mut ev_rx) =
@@ -792,6 +1808,8 @@ impl AppState {
                     s.initializing = false;
                     s.connection_status = ConnectionStatus::Error;
                     s.connection_detail = err;
+                    s.bump_sidebar();
+                    s.bump_shell();
                     cx.notify();
                 }
             });
@@ -799,13 +1817,42 @@ impl AppState {
         .detach();
     }
 
-    pub fn hydrate_local(&mut self, profile: Option<&str>) {
+    pub fn hydrate_local_async(&mut self, profile: Option<String>, cx: &mut Context<Self>) {
         let home = self.supervisor.hermes_home().clone();
-        let target_home =
-            crate::backend::profile_home(&home, profile).unwrap_or_else(|_| home.clone());
-        let boot = sqlite_store::load_local_bootstrap(&target_home);
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok((boot, stats)) = rt
+                .spawn_blocking(move || {
+                    let target_home = crate::backend::profile_home(&home, profile.as_deref())
+                        .unwrap_or_else(|_| home.clone());
+                    let boot = sqlite_store::load_local_bootstrap(&target_home);
+                    let stats = workspace::get_linux_system_stats();
+                    (boot, stats)
+                })
+                .await
+            else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
+                s.apply_local_bootstrap(boot, stats);
+                s.bump_sidebar();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_local_bootstrap(
+        &mut self,
+        boot: sqlite_store::LocalBootstrapPayload,
+        stats: LinuxSystemStats,
+    ) {
         self.bootstrap_ms = Some(boot.elapsed_ms);
-        self.system_stats = Some(workspace::get_linux_system_stats());
+        self.system_stats = Some(stats);
 
         if let Some(m) = boot.active_model {
             self.active_model = m;
@@ -864,17 +1911,29 @@ impl AppState {
                 })
                 .collect();
         }
-        self.soul_md = boot.soul_md;
-        self.memory_md = boot.memory_md;
-        self.user_md = boot.user_md;
+        if self.soul_md.is_empty() && !boot.soul_md.is_empty() {
+            self.soul_md = boot.soul_md;
+        }
+        if self.memory_md.is_empty() && !boot.memory_md.is_empty() {
+            self.memory_md = boot.memory_md;
+        }
+        if self.user_md.is_empty() && !boot.user_md.is_empty() {
+            self.user_md = boot.user_md;
+        }
 
         if let Ok(bs) = serde_json::from_value::<PersistedBoardState>(boot.board_state) {
             if !bs.boards.is_empty() {
                 self.boards = bs.boards;
             }
-            self.session_boards = bs.session_boards;
-            self.tasks = bs.tasks;
-            self.bot_avatars = bs.bot_avatars;
+            if self.session_boards.is_empty() {
+                self.session_boards = bs.session_boards;
+            }
+            if self.tasks.is_empty() {
+                self.tasks = bs.tasks;
+            }
+            if self.bot_avatars.is_empty() {
+                self.bot_avatars = bs.bot_avatars;
+            }
         }
         for proj in boot.projects {
             if !self.boards.iter().any(|b| b.slug == proj.slug) {
@@ -890,93 +1949,29 @@ impl AppState {
         }
     }
 
-    pub fn refresh_capabilities(&mut self, refresh_models: bool, cx: &mut Context<Self>) {
+    /// Independent, non-blocking refresh of core sidebar/chat capabilities.
+    /// Each endpoint updates the UI immediately as it arrives so slow provider
+    /// discovery or secondary plugins never stall sessions or bot switching.
+    pub fn refresh_core_capabilities(&mut self, refresh_models: bool, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
         };
         let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
         let active_prof = self.active_profile.clone();
 
-        cx.spawn(async move |this, cx| {
-            let Ok((
-                status,
-                profiles,
-                sessions,
-                models,
-                model_info,
-                skills,
-                toolsets,
-                mcp_servers,
-                cron_jobs,
-                platforms,
-                webhooks,
-                boards,
-                soul,
-                raw_cfg,
-                env_list,
-                logs_list,
-            )) = rt
-                .spawn(async move {
-                    tokio::join!(
-                        client.get_status(),
-                        client.list_profiles(),
-                        client.list_sessions(120),
-                        client.get_model_options(refresh_models),
-                        client.get_model_info(),
-                        client.list_skills(),
-                        client.list_toolsets(),
-                        client.list_mcp_servers(),
-                        client.list_cron_jobs(),
-                        client.list_messaging_platforms(),
-                        client.list_webhooks(),
-                        client.list_kanban_boards(),
-                        client.get_profile_soul(&active_prof),
-                        client.get_raw_config(),
-                        client.list_env(),
-                        client.get_logs(160),
-                    )
-                })
-                .await
-            else {
-                return;
-            };
-
-            // Also fetch tasks for each kanban board
-            let board_tasks = if let Ok(ref b_list) = boards {
-                if let Some(c2) = this
-                    .read_with(cx, |s, _| s.client.clone())
-                    .ok()
-                    .flatten()
-                {
-                    let slugs: Vec<String> = b_list.iter().map(|b| b.slug.clone()).collect();
-                    rt.spawn(async move {
-                        let mut all = Vec::new();
-                        for slug in slugs {
-                            if let Ok(ts) = c2.get_kanban_board(&slug).await {
-                                all.extend(ts);
-                            }
-                        }
-                        all
-                    })
-                    .await
-                    .unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-
-            let _ = this.update(cx, |s, cx| {
-                if let Ok(st) = status {
-                    s.hermes_status = Some(st);
-                }
-                if let Ok(ps) = profiles {
-                    if !ps.is_empty() {
-                        s.profiles = ps;
+        // 1. Sessions (single fast page, highest priority for sidebar responsiveness)
+        {
+            let c = client.clone();
+            let rt = rt.clone();
+            cx.spawn(async move |this, cx| {
+                let Ok(Ok(rows)) = rt.spawn(async move { c.list_sessions(100).await }).await else {
+                    return;
+                };
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation != gen {
+                        return;
                     }
-                }
-                if let Ok(rows) = sessions {
                     let mut merged = rows;
                     for prev in &s.sessions {
                         if (prev.id.starts_with("session_")
@@ -987,47 +1982,171 @@ impl AppState {
                         }
                     }
                     s.sessions = merged;
-                }
-                if let Ok(ms) = models {
-                    if !ms.is_empty() {
-                        s.models = ms;
+                    s.bump_sidebar();
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        // 2. Active model info + profile SOUL (fast, small payloads)
+        {
+            let c = client.clone();
+            let rt = rt.clone();
+            let prof = active_prof.clone();
+            cx.spawn(async move |this, cx| {
+                let Ok((model_info, soul)) = rt
+                    .spawn(async move {
+                        tokio::join!(c.get_model_info(), c.get_profile_soul(&prof))
+                    })
+                    .await
+                else {
+                    return;
+                };
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation != gen {
+                        return;
                     }
-                }
-                if let Ok((m, p)) = model_info {
-                    if s.active_session_id.is_none() {
-                        if let Some(m) = m.filter(|v| !v.is_empty()) {
-                            s.active_model = m;
-                        }
-                        if let Some(p) = p.filter(|v| !v.is_empty()) {
-                            s.active_provider = p;
+                    if let Ok((m, p)) = model_info {
+                        if s.active_session_id.is_none() {
+                            if let Some(m) = m.filter(|v| !v.is_empty()) {
+                                s.active_model = m;
+                            }
+                            if let Some(p) = p.filter(|v| !v.is_empty()) {
+                                s.active_provider = p;
+                            }
                         }
                     }
-                }
-                if let Ok(sk) = skills {
-                    s.skills = sk;
-                }
-                if let Ok(ts) = toolsets {
-                    s.toolsets = ts;
-                }
-                if let Ok(mcps) = mcp_servers {
-                    s.mcp_servers = mcps;
-                }
-                if let Ok(crons) = cron_jobs {
-                    s.cron_jobs = crons;
-                }
-                if let Ok(plats) = platforms {
-                    s.messaging_platforms = plats;
-                }
-                if let Ok(hooks) = webhooks {
-                    s.webhooks = hooks;
-                }
-                if let Ok(b_list) = boards {
-                    for b in b_list {
-                        if let Some(existing) = s.boards.iter_mut().find(|x| x.slug == b.slug) {
-                            *existing = b;
-                        } else {
-                            s.boards.push(b);
+                    if let Ok(soul_txt) = soul {
+                        if !soul_txt.is_empty() || s.soul_md.is_empty() {
+                            s.soul_md = soul_txt;
                         }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        // 3. Model catalog (runs independently so upstream provider queries never block UI)
+        if refresh_models || self.models.is_empty() {
+            let c = client.clone();
+            let rt = rt.clone();
+            cx.spawn(async move |this, cx| {
+                let Ok(Ok(ms)) = rt
+                    .spawn(async move { c.get_model_options(refresh_models).await })
+                    .await
+                else {
+                    return;
+                };
+                if ms.is_empty() {
+                    return;
+                }
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation != gen {
+                        return;
+                    }
+                    s.models = ms;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        // 4. Refresh currently visible secondary view if needed
+        let current_view = self.active_view;
+        if current_view != AppViewId::Chat {
+            self.loaded_views.remove(&current_view);
+            self.ensure_view_data(current_view, cx);
+        }
+    }
+
+    /// Lazy per-view hydration so startup and bot switching never flood the backend
+    /// with endpoints for tabs the user hasn't opened.
+    pub fn ensure_view_data(&mut self, view: AppViewId, cx: &mut Context<Self>) {
+        if self.client.is_none() || self.loaded_views.contains(&view) {
+            return;
+        }
+        self.loaded_views.insert(view);
+        match view {
+            AppViewId::Chat | AppViewId::Analytics => {}
+            AppViewId::Boards => self.refresh_boards(cx),
+            AppViewId::Skills => {
+                self.refresh_skills(cx);
+                self.refresh_toolsets(cx);
+                self.refresh_mcp_servers(cx);
+            }
+            AppViewId::Cron => self.refresh_cron_jobs(cx),
+            AppViewId::Memory => {
+                if self.connection.is_local() {
+                    let prof = self.active_profile.clone();
+                    self.hydrate_local_async(Some(prof), cx);
+                }
+            }
+            AppViewId::Gateway => self.refresh_gateway_data(cx),
+            AppViewId::Settings => self.refresh_settings_data(cx),
+        }
+    }
+
+    pub fn refresh_profiles(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let ws_gen = self.ws_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(ps)) = rt.spawn(async move { c.list_profiles().await }).await else {
+                return;
+            };
+            if ps.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |s, cx| {
+                if s.ws_generation != ws_gen {
+                    return;
+                }
+                s.profiles = ps;
+                s.bump_sidebar();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn refresh_boards(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(b_list)) = rt.spawn(async move {
+                let boards = c.list_kanban_boards().await?;
+                let slugs: Vec<String> = boards.iter().map(|b| b.slug.clone()).collect();
+                let task_futs = slugs.into_iter().map(|slug| {
+                    let c2 = c.clone();
+                    async move { c2.get_kanban_board(&slug).await.unwrap_or_default() }
+                });
+                let all_tasks: Vec<HermesKanbanTask> =
+                    futures_util::future::join_all(task_futs)
+                        .await
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                Ok::<(Vec<HermesBoardSummary>, Vec<HermesKanbanTask>), String>((boards, all_tasks))
+            }).await else {
+                return;
+            };
+            let (boards, board_tasks) = b_list;
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
+                for b in boards {
+                    if let Some(existing) = s.boards.iter_mut().find(|x| x.slug == b.slug) {
+                        *existing = b;
+                    } else {
+                        s.boards.push(b);
                     }
                 }
                 if !board_tasks.is_empty() {
@@ -1040,10 +2159,154 @@ impl AppState {
                     keep_local.extend(board_tasks);
                     s.tasks = keep_local;
                 }
-                if let Ok(soul_txt) = soul {
-                    if !soul_txt.is_empty() || s.soul_md.is_empty() {
-                        s.soul_md = soul_txt;
-                    }
+                s.bump_sidebar();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn refresh_skills(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(sk)) = rt.spawn(async move { c.list_skills().await }).await else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
+                s.skills = sk;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn refresh_toolsets(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(ts)) = rt.spawn(async move { c.list_toolsets().await }).await else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
+                s.toolsets = ts;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn refresh_mcp_servers(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(mcps)) = rt.spawn(async move { c.list_mcp_servers().await }).await else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
+                s.mcp_servers = mcps;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn refresh_cron_jobs(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(crons)) = rt.spawn(async move { c.list_cron_jobs().await }).await else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
+                s.cron_jobs = crons;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn refresh_gateway_data(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok((status, platforms, webhooks)) = rt
+                .spawn(async move {
+                    tokio::join!(
+                        c.get_status(),
+                        c.list_messaging_platforms(),
+                        c.list_webhooks(),
+                    )
+                })
+                .await
+            else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
+                if let Ok(st) = status {
+                    s.hermes_status = Some(st);
+                }
+                if let Ok(plats) = platforms {
+                    s.messaging_platforms = plats;
+                }
+                if let Ok(hooks) = webhooks {
+                    s.webhooks = hooks;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn refresh_settings_data(&mut self, cx: &mut Context<Self>) {
+        self.refresh_profiles(cx);
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok((raw_cfg, env_list, logs_list)) = rt
+                .spawn(async move {
+                    tokio::join!(c.get_raw_config(), c.list_env(), c.get_logs(160))
+                })
+                .await
+            else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
                 }
                 if let Ok(cfg_txt) = raw_cfg {
                     if !cfg_txt.is_empty() {
@@ -1069,6 +2332,275 @@ impl AppState {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    pub fn refresh_env(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(envs)) = rt.spawn(async move { c.list_env().await }).await else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
+                s.env_entries = envs;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn refresh_logs(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(logs)) = rt.spawn(async move { c.get_logs(160).await }).await else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
+                s.server_logs = logs
+                    .into_iter()
+                    .map(|e| {
+                        let ts = e.timestamp.unwrap_or_default();
+                        let lvl = e.level.unwrap_or_else(|| "INFO".into());
+                        if ts.is_empty() {
+                            format!("[{lvl}] {}", e.message)
+                        } else {
+                            format!("{ts} [{lvl}] {}", e.message)
+                        }
+                    })
+                    .collect();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn toggle_skill_optimistic(&mut self, name: String, enabled: bool, cx: &mut Context<Self>) {
+        if let Some(sk) = self.skills.iter_mut().find(|s| s.name == name) {
+            sk.enabled = enabled;
+        }
+        cx.notify();
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        let name_c = name.clone();
+        cx.spawn(async move |this, cx| {
+            let res = rt
+                .spawn(async move { c.toggle_skill(&name_c, enabled).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            if let Err(err) = res {
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation == gen {
+                        if let Some(sk) = s.skills.iter_mut().find(|x| x.name == name) {
+                            sk.enabled = !enabled;
+                        }
+                    }
+                    s.show_toast(err, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn toggle_toolset_optimistic(
+        &mut self,
+        name: String,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ts) = self.toolsets.iter_mut().find(|t| t.name == name) {
+            ts.enabled = enabled;
+        }
+        cx.notify();
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        let name_c = name.clone();
+        cx.spawn(async move |this, cx| {
+            let res = rt
+                .spawn(async move { c.toggle_toolset(&name_c, enabled).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            if let Err(err) = res {
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation == gen {
+                        if let Some(ts) = s.toolsets.iter_mut().find(|x| x.name == name) {
+                            ts.enabled = !enabled;
+                        }
+                    }
+                    s.show_toast(err, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn toggle_mcp_optimistic(&mut self, name: String, enabled: bool, cx: &mut Context<Self>) {
+        if let Some(srv) = self.mcp_servers.iter_mut().find(|m| m.name == name) {
+            srv.enabled = Some(enabled);
+        }
+        cx.notify();
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        let name_c = name.clone();
+        cx.spawn(async move |this, cx| {
+            let res = rt
+                .spawn(async move { c.toggle_mcp_server(&name_c, enabled).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            if let Err(err) = res {
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation == gen {
+                        if let Some(srv) = s.mcp_servers.iter_mut().find(|x| x.name == name) {
+                            srv.enabled = Some(!enabled);
+                        }
+                    }
+                    s.show_toast(err, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn delete_mcp_optimistic(&mut self, name: String, cx: &mut Context<Self>) {
+        let prev = self.mcp_servers.clone();
+        self.mcp_servers.retain(|m| m.name != name);
+        self.show_toast(format!("Removed MCP \"{name}\""), cx);
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let res = rt
+                .spawn(async move { c.delete_mcp_server(&name).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            if let Err(err) = res {
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation == gen {
+                        s.mcp_servers = prev;
+                    }
+                    s.show_toast(err, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn toggle_cron_pause_optimistic(
+        &mut self,
+        id: String,
+        pause: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(job) = self.cron_jobs.iter_mut().find(|j| j.id == id) {
+            job.paused = pause;
+            job.enabled = Some(!pause);
+        }
+        cx.notify();
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        let id_c = id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = rt
+                .spawn(async move {
+                    if pause {
+                        c.pause_cron_job(&id_c).await
+                    } else {
+                        c.resume_cron_job(&id_c).await
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            if let Err(err) = res {
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation == gen {
+                        if let Some(job) = s.cron_jobs.iter_mut().find(|j| j.id == id) {
+                            job.paused = !pause;
+                            job.enabled = Some(pause);
+                        }
+                    }
+                    s.show_toast(err, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn delete_cron_optimistic(&mut self, id: String, cx: &mut Context<Self>) {
+        let prev = self.cron_jobs.clone();
+        self.cron_jobs.retain(|j| j.id != id);
+        self.show_toast("Deleted cron job", cx);
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let res = rt
+                .spawn(async move { c.delete_cron_job(&id).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            if let Err(err) = res {
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation == gen {
+                        s.cron_jobs = prev;
+                    }
+                    s.show_toast(err, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn delete_webhook_optimistic(&mut self, id: String, cx: &mut Context<Self>) {
+        let prev = self.webhooks.clone();
+        self.webhooks.retain(|w| w.id != id);
+        self.show_toast("Webhook deleted", cx);
+        let Some(c) = self.client.clone() else {
+            return;
+        };
+        let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+        cx.spawn(async move |this, cx| {
+            let res = rt
+                .spawn(async move { c.delete_webhook(&id).await })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            if let Err(err) = res {
+                let _ = this.update(cx, |s, cx| {
+                    if s.profile_generation == gen {
+                        s.webhooks = prev;
+                    }
+                    s.show_toast(err, cx);
+                });
+            }
         })
         .detach();
     }
@@ -1150,52 +2682,119 @@ impl AppState {
     }
 
     pub fn switch_profile(&mut self, name: String, cx: &mut Context<Self>) {
-        if self.profile_switching || name == self.active_profile {
+        if name == self.active_profile {
             return;
         }
         let Some(client) = self.client.clone() else {
             self.show_toast("Connect to Hermes to switch bots", cx);
             return;
         };
-        let rt = self.tokio_rt.clone();
+
+        // Snapshot current profile into cache so switching back is instant (<1ms)
+        let prev_profile = self.active_profile.clone();
+        self.profile_cache.insert(
+            prev_profile.clone(),
+            ProfileCache {
+                sessions: std::mem::take(&mut self.sessions),
+                chats: std::mem::take(&mut self.chats),
+                soul_md: std::mem::take(&mut self.soul_md),
+                memory_md: std::mem::take(&mut self.memory_md),
+                user_md: std::mem::take(&mut self.user_md),
+                active_model: Some(self.active_model.clone()),
+                active_provider: Some(self.active_provider.clone()),
+                skills: std::mem::take(&mut self.skills),
+                toolsets: std::mem::take(&mut self.toolsets),
+                mcp_servers: std::mem::take(&mut self.mcp_servers),
+                cron_jobs: std::mem::take(&mut self.cron_jobs),
+                loaded_views: std::mem::take(&mut self.loaded_views),
+            },
+        );
+
+        // Optimistically switch UI on frame 0
+        self.profile_generation = self.profile_generation.wrapping_add(1);
+        let gen = self.profile_generation;
+        self.active_profile = name.clone();
+        self.active_session_id = None;
+        self.active_view = AppViewId::Chat;
+        self.live_ids.clear();
+        self.wire_to_stored.clear();
+        self.synced_session_config.clear();
         self.profile_switching = true;
+        for p in &mut self.profiles {
+            p.active = p.name == name;
+        }
+        if let Some(cached) = self.profile_cache.remove(&name) {
+            self.sessions = cached.sessions;
+            self.chats = cached.chats;
+            self.soul_md = cached.soul_md;
+            self.memory_md = cached.memory_md;
+            self.user_md = cached.user_md;
+            if let Some(m) = cached.active_model {
+                self.active_model = m;
+            }
+            if let Some(p) = cached.active_provider {
+                self.active_provider = p;
+            }
+            self.skills = cached.skills;
+            self.toolsets = cached.toolsets;
+            self.mcp_servers = cached.mcp_servers;
+            self.cron_jobs = cached.cron_jobs;
+            self.loaded_views = cached.loaded_views;
+        }
+        client.set_profile(Some(name.clone()));
+        self.bump_sidebar();
+        self.bump_shell();
         cx.notify();
 
+        // Hydrate local SQLite/files off the UI thread immediately
+        if self.connection.is_local() {
+            self.hydrate_local_async(Some(name.clone()), cx);
+        }
+
+        let rt = self.tokio_rt.clone();
         cx.spawn(async move |this, cx| {
             let name_clone = name.clone();
             let res = rt
-                .spawn(async move {
-                    client.set_active_profile(&name_clone).await?;
-                    client.set_profile(Some(name_clone.clone()));
-                    let soul = client.get_profile_soul(&name_clone).await.unwrap_or_default();
-                    Ok::<String, String>(soul)
-                })
+                .spawn(async move { client.set_active_profile(&name_clone).await })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
 
             let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
                 s.profile_switching = false;
                 match res {
-                    Ok(soul) => {
-                        s.active_profile = name.clone();
-                        s.active_session_id = None;
-                        s.active_view = AppViewId::Chat;
-                        s.sessions.clear();
-                        s.chats.clear();
-                        s.live_ids.clear();
-                        s.wire_to_stored.clear();
-                        s.soul_md = soul;
-                        for p in &mut s.profiles {
-                            p.active = p.name == name;
-                        }
-                        if s.connection.is_local() {
-                            s.hydrate_local(Some(&name));
-                        }
-                        s.refresh_capabilities(false, cx);
+                    Ok(_) => {
+                        s.loaded_views.clear();
+                        s.refresh_core_capabilities(false, cx);
                         let label = if name == "default" { "Hermes" } else { &name };
                         s.show_toast(format!("Switched to {label}"), cx);
                     }
-                    Err(err) => s.show_toast(err, cx),
+                    Err(err) => {
+                        // Roll back to previous profile if server rejected the switch
+                        if let Some(prev_cache) = s.profile_cache.remove(&prev_profile) {
+                            s.sessions = prev_cache.sessions;
+                            s.chats = prev_cache.chats;
+                            s.soul_md = prev_cache.soul_md;
+                            s.memory_md = prev_cache.memory_md;
+                            s.user_md = prev_cache.user_md;
+                            s.skills = prev_cache.skills;
+                            s.toolsets = prev_cache.toolsets;
+                            s.mcp_servers = prev_cache.mcp_servers;
+                            s.cron_jobs = prev_cache.cron_jobs;
+                            s.loaded_views = prev_cache.loaded_views;
+                        }
+                        s.active_profile = prev_profile.clone();
+                        for p in &mut s.profiles {
+                            p.active = p.name == prev_profile;
+                        }
+                        if let Some(c) = &s.client {
+                            c.set_profile(Some(prev_profile));
+                        }
+                        s.bump_sidebar();
+                        s.show_toast(err, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -1208,6 +2807,14 @@ impl AppState {
         self.active_view = AppViewId::Chat;
 
         if let Some(ref sid) = session_id {
+            if let Some(binding) = self.session_modes.get(sid).cloned() {
+                if let Some(cwd) = binding.cwd.filter(|c| !c.is_empty()) {
+                    self.inspector_cwd = cwd;
+                }
+                if let Some(pid) = binding.project_id {
+                    self.selected_work_project_id = Some(pid);
+                }
+            }
             if let Some(sess) = self.sessions.iter().find(|s| &s.id == sid) {
                 if let Some(m) = sess.model.clone() {
                     self.active_model = m;
@@ -1219,7 +2826,13 @@ impl AppState {
                     self.inspector_cwd = cwd;
                 }
             }
+            self.hydrate_session_harness_data(sid.clone(), cx);
+            if self.active_conversation_mode() == ConversationMode::Work {
+                self.refresh_inspector_git(cx);
+            }
         }
+        self.bump_sidebar();
+        self.bump_shell();
         cx.notify();
 
         let Some(sid) = session_id else {
@@ -1238,19 +2851,21 @@ impl AppState {
         let is_local = self.connection.is_local();
         let home = self.supervisor.hermes_home().clone();
         let profile = self.active_profile.clone();
+        let gen = self.profile_generation;
         let client = self.client.clone();
         let realtime = self.realtime.clone();
         let already_live = self.live_ids.contains_key(&sid);
         let rt = self.tokio_rt.clone();
 
         cx.spawn(async move |this, cx| {
-            // Instant local SQLite read first
+            // Instant local SQLite read on a blocking thread first
             if is_local && !had_messages {
-                let target_home =
-                    crate::backend::profile_home(&home, Some(&profile)).unwrap_or(home);
                 let sid_l = sid.clone();
+                let prof_l = profile.clone();
                 let local_rows = rt
-                    .spawn(async move {
+                    .spawn_blocking(move || {
+                        let target_home =
+                            crate::backend::profile_home(&home, Some(&prof_l)).unwrap_or(home);
                         sqlite_store::load_local_session_messages(
                             &target_home,
                             &sid_l,
@@ -1261,6 +2876,9 @@ impl AppState {
                     .unwrap_or_default();
                 if !local_rows.is_empty() {
                     let _ = this.update(cx, |s, cx| {
+                        if s.profile_generation != gen {
+                            return;
+                        }
                         let entry = s.chats.entry(sid.clone()).or_default();
                         if entry.messages.is_empty() {
                             entry.messages = local_rows
@@ -1290,42 +2908,47 @@ impl AppState {
                 }
             }
 
-            // Authoritative gateway history + resume WS session
+            // Authoritative gateway history + resume WS session concurrently
             let sid_r = sid.clone();
             let prof_r = profile.clone();
             let (remote_msgs, wire_id) = rt
                 .spawn(async move {
-                    let msgs = if let Some(c) = client {
-                        c.get_session_messages(&sid_r, HISTORY_PAGE_SIZE, 0)
-                            .await
-                            .ok()
-                    } else {
-                        None
-                    };
-                    let wid = if !already_live {
-                        if let Some(ws) = realtime {
-                            if ws.is_connected() {
-                                ws.resume_session(&sid_r, &prof_r)
-                                    .await
-                                    .ok()
-                                    .and_then(|v| {
-                                        v.get("session_id").and_then(Value::as_str).map(String::from)
-                                    })
-                            } else {
-                                None
-                            }
+                    let msgs_fut = async {
+                        if let Some(c) = client {
+                            c.get_session_messages(&sid_r, HISTORY_PAGE_SIZE, 0)
+                                .await
+                                .ok()
                         } else {
                             None
                         }
-                    } else {
+                    };
+                    let wid_fut = async {
+                        if !already_live {
+                            if let Some(ws) = realtime {
+                                if ws.is_connected() {
+                                    return ws
+                                        .resume_session(&sid_r, &prof_r)
+                                        .await
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.get("session_id")
+                                                .and_then(Value::as_str)
+                                                .map(String::from)
+                                        });
+                                }
+                            }
+                        }
                         None
                     };
-                    (msgs, wid)
+                    tokio::join!(msgs_fut, wid_fut)
                 })
                 .await
                 .unwrap_or((None, None));
 
             let _ = this.update(cx, |s, cx| {
+                if s.profile_generation != gen {
+                    return;
+                }
                 if let Some(wid) = wire_id {
                     s.live_ids.insert(sid.clone(), wid.clone());
                     s.wire_to_stored.insert(wid, sid.clone());
@@ -1432,9 +3055,75 @@ impl AppState {
         let fast = self.fast_mode;
         let realtime = self.realtime.clone();
         let rt = self.tokio_rt.clone();
+        let gen = self.profile_generation;
+
+        let resolved_cwd = resolved_cwd.or_else(|| {
+            if self.draft_mode == ConversationMode::Work {
+                self.active_work_project().map(|p| p.cwd.clone())
+            } else {
+                None
+            }
+        });
+        let initial_mode = self.draft_mode;
+        let initial_project = if initial_mode == ConversationMode::Work {
+            self.active_work_project().cloned()
+        } else {
+            None
+        };
+
+        // Instant optimistic draft session on frame 0 (0ms latency)
+        let local_id = format!("session_{}", uuid::Uuid::new_v4().simple());
+        let sess = HermesSession {
+            id: local_id.clone(),
+            title: Some(title.clone().unwrap_or_else(|| {
+                if initial_mode == ConversationMode::Work {
+                    "New Work".into()
+                } else {
+                    "New Chat".into()
+                }
+            })),
+            profile: Some(profile.clone()),
+            model: Some(resolved_model.clone()),
+            provider: Some(resolved_provider.clone()),
+            source: Some("desktop".into()),
+            cwd: resolved_cwd.clone(),
+            board_slug: Some(b_slug.clone()),
+            message_count: Some(0),
+            created_at: Some(json!(now_secs())),
+            updated_at: Some(json!(now_secs())),
+            ..Default::default()
+        };
+        self.draft_session_ids.insert(local_id.clone());
+        self.sessions.retain(|x| x.id != local_id);
+        self.sessions.insert(0, sess);
+        self.session_boards.insert(local_id.clone(), b_slug.clone());
+        self.persist_mode_binding(SessionModeBinding {
+            session_id: local_id.clone(),
+            mode: initial_mode,
+            locked: false,
+            project_id: initial_project.as_ref().map(|p| p.id.clone()),
+            project_name: initial_project.as_ref().map(|p| p.name.clone()),
+            cwd: resolved_cwd.clone(),
+            server_id: Some(self.connection.id.clone()),
+            updated_at_ms: now_epoch_ms(),
+        });
+        if let Some(ref c) = resolved_cwd {
+            self.inspector_cwd = c.clone();
+        }
+        self.persist_board_state();
+        self.active_model = resolved_model.clone();
+        self.active_provider = resolved_provider.clone();
+        self.active_session_id = Some(local_id.clone());
+        self.active_view = AppViewId::Chat;
+        self.bump_sidebar();
+        self.bump_shell();
+        cx.notify();
+
+        let Some(ws) = realtime.filter(|w| w.is_connected()) else {
+            return;
+        };
 
         cx.spawn(async move |this, cx| {
-            let fallback_id = format!("session_{}", uuid::Uuid::new_v4().simple());
             let mut params = json!({
                 "source": "desktop",
                 "profile": profile,
@@ -1453,123 +3142,273 @@ impl AppState {
             }
 
             let created = rt
-                .spawn(async move {
-                    if let Some(ws) = realtime {
-                        if ws.is_connected() {
-                            return ws.create_session(params).await.ok();
-                        }
-                    }
-                    None
-                })
+                .spawn(async move { ws.create_session(params).await.ok() })
                 .await
                 .unwrap_or(None);
 
-            let (new_id, wire_id) = if let Some(res) = created {
-                let stored = res
-                    .get("stored_session_id")
-                    .or_else(|| res.get("session_key"))
-                    .or_else(|| res.get("session_id"))
-                    .and_then(Value::as_str)
-                    .map(String::from)
-                    .unwrap_or(fallback_id);
-                let wire = res
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                (stored, wire)
-            } else {
-                (fallback_id, None)
+            let Some(res) = created else {
+                return;
             };
+            let stored = res
+                .get("stored_session_id")
+                .or_else(|| res.get("session_key"))
+                .or_else(|| res.get("session_id"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            let wire = res
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(String::from);
 
             let _ = this.update(cx, |s, cx| {
-                if let Some(wid) = wire_id {
-                    s.live_ids.insert(new_id.clone(), wid.clone());
-                    s.wire_to_stored.insert(wid, new_id.clone());
+                if s.profile_generation != gen {
+                    return;
                 }
-                let sess = HermesSession {
-                    id: new_id.clone(),
-                    title: Some(title.unwrap_or_else(|| "New Chat".into())),
-                    profile: Some(s.active_profile.clone()),
-                    model: Some(resolved_model.clone()),
-                    provider: Some(resolved_provider.clone()),
-                    source: Some("desktop".into()),
-                    cwd: resolved_cwd,
-                    board_slug: Some(b_slug.clone()),
-                    message_count: Some(0),
-                    created_at: Some(json!(now_secs())),
-                    updated_at: Some(json!(now_secs())),
-                    ..Default::default()
-                };
-                s.draft_session_ids.insert(new_id.clone());
-                s.sessions.retain(|x| x.id != new_id);
-                s.sessions.insert(0, sess);
-                s.session_boards.insert(new_id.clone(), b_slug);
-                s.persist_board_state();
-                s.active_model = resolved_model;
-                s.active_provider = resolved_provider;
-                s.active_session_id = Some(new_id);
-                s.active_view = AppViewId::Chat;
+                let final_id = stored.unwrap_or_else(|| local_id.clone());
+                if final_id != local_id {
+                    if let Some(existing) = s.sessions.iter_mut().find(|x| x.id == local_id) {
+                        existing.id = final_id.clone();
+                    }
+                    if let Some(chat) = s.chats.remove(&local_id) {
+                        s.chats.insert(final_id.clone(), chat);
+                    }
+                    if s.draft_session_ids.remove(&local_id) {
+                        s.draft_session_ids.insert(final_id.clone());
+                    }
+                    if let Some(b) = s.session_boards.remove(&local_id) {
+                        s.session_boards.insert(final_id.clone(), b);
+                    }
+                    if let Some(mut mb) = s.session_modes.remove(&local_id) {
+                        mb.session_id = final_id.clone();
+                        s.session_modes.insert(final_id.clone(), mb);
+                    }
+                    if let Some(traj) = s.trajectory_events.remove(&local_id) {
+                        s.trajectory_events.insert(final_id.clone(), traj);
+                    }
+                    if let Some(subs) = s.subagents.remove(&local_id) {
+                        s.subagents.insert(final_id.clone(), subs);
+                    }
+                    if let Some(met) = s.session_metrics.remove(&local_id) {
+                        s.session_metrics.insert(final_id.clone(), met);
+                    }
+                    if let Some(ref gw) = s.goal_worker {
+                        gw.rekey_session(&local_id, &final_id);
+                    }
+                    if let Some(store) = s.harness_store.clone() {
+                        let old_k = local_id.clone();
+                        let new_k = final_id.clone();
+                        s.tokio_rt.spawn_blocking(move || {
+                            let _ = store.rekey_session_id(&old_k, &new_k);
+                        });
+                    }
+                    if s.active_session_id.as_deref() == Some(local_id.as_str()) {
+                        s.active_session_id = Some(final_id.clone());
+                    }
+                    s.persist_board_state();
+                }
+                if let Some(wid) = wire {
+                    s.live_ids.insert(final_id.clone(), wid.clone());
+                    s.wire_to_stored.insert(wid, final_id);
+                }
+                s.bump_sidebar();
                 cx.notify();
             });
         })
         .detach();
     }
 
-    pub fn send_message(&mut self, raw_text: String, cx: &mut Context<Self>) {
-        let attachments = std::mem::take(&mut self.attachments);
-        let text = if raw_text.trim().is_empty() && !attachments.is_empty() {
+    pub fn send_message(&mut self, raw_text: String, cx: &mut Context<Self>) -> bool {
+        let text = if raw_text.trim().is_empty() && !self.attachments.is_empty() {
             "Please review the attached files.".to_string()
         } else {
             raw_text.trim().to_string()
         };
         if text.is_empty() {
-            return;
+            return false;
         }
 
         // Client-side UI shortcut slash commands
         match text.as_str() {
             "/model" => {
                 self.model_picker_open = true;
+                self.bump_shell();
                 cx.notify();
-                return;
+                return true;
             }
             "/restart" => {
                 self.restart_backend(cx);
-                return;
+                return true;
             }
             "/boards" => {
-                self.active_view = AppViewId::Boards;
-                cx.notify();
-                return;
+                self.set_active_view(AppViewId::Boards, cx);
+                return true;
             }
             "/skills" => {
-                self.active_view = AppViewId::Skills;
-                cx.notify();
-                return;
+                self.set_active_view(AppViewId::Skills, cx);
+                return true;
             }
             "/cron" => {
-                self.active_view = AppViewId::Cron;
-                cx.notify();
-                return;
+                self.set_active_view(AppViewId::Cron, cx);
+                return true;
             }
             "/memory" => {
-                self.active_view = AppViewId::Memory;
-                cx.notify();
-                return;
+                self.set_active_view(AppViewId::Memory, cx);
+                return true;
             }
             "/clear" => {
                 self.create_new_session(None, None, None, None, None, cx);
-                return;
+                return true;
             }
             "/compress" => {
                 self.compress_active_session(cx);
-                return;
+                return true;
             }
             "/branch" => {
                 self.branch_active_session(cx);
-                return;
+                return true;
             }
             _ => {}
+        }
+
+        // Require a saved project & directory before starting a Work conversation
+        let active_mode = self.active_conversation_mode();
+        if active_mode == ConversationMode::Work && self.active_work_cwd().is_none() {
+            self.project_picker_open = true;
+            self.bump_shell();
+            self.show_toast("Choose or create a project directory before starting Work mode.", cx);
+            cx.notify();
+            return false;
+        }
+
+        // Persistent Rust `/goal` entry point (coordinates Hermes runs & durable background state)
+        if let Some(goal_cmd) = parse_goal_slash_command(&text) {
+            match goal_cmd {
+                GoalCommand::Status => {
+                    let msg = if let Some(snap) = self.active_goal_snapshot() {
+                        format!(
+                            "Goal [{}] ({:?}) · round {}/{} · {}",
+                            snap.goal.phase.label(),
+                            snap.activation,
+                            snap.goal.rounds_started,
+                            snap.goal.max_rounds,
+                            snap.goal.objective
+                        )
+                    } else {
+                        "No active goal in this conversation. Start one with `/goal <objective>`.".into()
+                    };
+                    self.show_toast(msg, cx);
+                    return true;
+                }
+                GoalCommand::Pause => {
+                    self.pause_active_goal(cx);
+                    return true;
+                }
+                GoalCommand::Resume => {
+                    self.resume_active_goal(cx);
+                    return true;
+                }
+                GoalCommand::Cancel => {
+                    self.cancel_active_goal(cx);
+                    return true;
+                }
+                GoalCommand::Complete(summary) => {
+                    if let Some(sid) = self.active_session_id.clone() {
+                        if let Some(ref w) = self.goal_worker {
+                            match w.complete_goal(&sid, summary) {
+                                Ok(_) => self.show_toast("Goal completed", cx),
+                                Err(e) => self.show_toast(e, cx),
+                            }
+                        }
+                    }
+                    cx.notify();
+                    return true;
+                }
+                GoalCommand::Create {
+                    objective,
+                    max_rounds,
+                    max_duration_secs,
+                    max_tokens,
+                } => {
+                    if self.realtime.as_ref().is_none_or(|w| !w.is_connected()) {
+                        self.show_toast("Connect to Hermes before starting a goal.", cx);
+                        return false;
+                    }
+                    // Ensure session exists and mode is locked
+                    let sid = self.active_session_id.clone().unwrap_or_else(|| {
+                        let id = format!("session_{}", uuid::Uuid::new_v4().simple());
+                        let cwd = self.active_work_cwd();
+                        let sess = HermesSession {
+                            id: id.clone(),
+                            title: Some(format!("Goal: {}", objective.chars().take(40).collect::<String>())),
+                            profile: Some(self.active_profile.clone()),
+                            model: Some(self.active_model.clone()),
+                            provider: Some(self.active_provider.clone()),
+                            source: Some("desktop".into()),
+                            cwd,
+                            message_count: Some(0),
+                            created_at: Some(json!(now_secs())),
+                            updated_at: Some(json!(now_secs())),
+                            ..Default::default()
+                        };
+                        self.sessions.insert(0, sess);
+                        self.active_session_id = Some(id.clone());
+                        id
+                    });
+                    let proj = self.active_work_project().cloned();
+                    let cwd = self.active_work_cwd();
+                    self.persist_mode_binding(SessionModeBinding {
+                        session_id: sid.clone(),
+                        mode: active_mode,
+                        locked: true,
+                        project_id: proj.as_ref().map(|p| p.id.clone()),
+                        project_name: proj.as_ref().map(|p| p.name.clone()),
+                        cwd: cwd.clone(),
+                        server_id: Some(self.connection.id.clone()),
+                        updated_at_ms: now_epoch_ms(),
+                    });
+                    if let Some(worker) = self.goal_worker.clone() {
+                        match worker.create_goal(
+                            &sid,
+                            objective.clone(),
+                            proj.as_ref().map(|p| p.id.clone()),
+                            proj.as_ref().map(|p| p.name.clone()),
+                            cwd,
+                            max_rounds,
+                            max_duration_secs,
+                            max_tokens,
+                        ) {
+                            Ok(snap) => {
+                                self.record_trajectory_event(
+                                    &sid,
+                                    format!("goal-create-{}", snap.goal.goal_id),
+                                    TrajectoryEventKind::GoalChanged,
+                                    "lead".into(),
+                                    None,
+                                    None,
+                                    "Goal created".into(),
+                                    objective,
+                                    false,
+                                    None,
+                                    json!({
+                                        "goalId": snap.goal.goal_id,
+                                        "maxRounds": snap.goal.max_rounds,
+                                        "maxDurationSecs": snap.goal.max_duration_secs,
+                                        "maxTokens": snap.goal.max_tokens,
+                                    }),
+                                );
+                                self.bump_sidebar();
+                                self.bump_shell();
+                                self.dispatch_next_goal_round(sid, cx);
+                                return true;
+                            }
+                            Err(e) => {
+                                self.show_toast(e, cx);
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let Some(ws) = self.realtime.clone().filter(|w| w.is_connected()) else {
@@ -1577,8 +3416,20 @@ impl AppState {
                 "Hermes is disconnected. Check Settings → Connections.",
                 cx,
             );
-            return;
+            return false;
         };
+
+        if self
+            .active_session_id
+            .as_deref()
+            .and_then(|id| self.chats.get(id))
+            .is_some_and(|c| c.is_streaming)
+        {
+            self.show_toast("Wait for the current response before sending another message.", cx);
+            return false;
+        }
+
+        let attachments = std::mem::take(&mut self.attachments);
 
         // Ensure we have an active session ID synchronously
         let sid = match self.active_session_id.clone() {
@@ -1614,8 +3465,9 @@ impl AppState {
         };
 
         if self.chats.get(&sid).is_some_and(|c| c.is_streaming) {
+            self.attachments = attachments;
             self.show_toast("Wait for the current response before sending another message.", cx);
-            return;
+            return false;
         }
 
         let user_msg = HermesMessage {
@@ -1631,6 +3483,36 @@ impl AppState {
             clarify: None,
             streaming: false,
         };
+        let user_msg_id = user_msg.id.clone();
+
+        // Lock conversation mode (Chat | Work) on the first message and persist across restarts.
+        let active_proj = if active_mode == ConversationMode::Work {
+            self.active_work_project().cloned()
+        } else {
+            None
+        };
+        let bound_cwd = if active_mode == ConversationMode::Work {
+            self.active_work_cwd()
+        } else {
+            self.active_session().and_then(|s| s.cwd.clone())
+        };
+        self.persist_mode_binding(SessionModeBinding {
+            session_id: sid.clone(),
+            mode: active_mode,
+            locked: true,
+            project_id: active_proj.as_ref().map(|p| p.id.clone()),
+            project_name: active_proj.as_ref().map(|p| p.name.clone()),
+            cwd: bound_cwd.clone(),
+            server_id: Some(self.connection.id.clone()),
+            updated_at_ms: now_epoch_ms(),
+        });
+        if let Some(ref c) = bound_cwd {
+            self.inspector_cwd = c.clone();
+            if let Some(s) = self.sessions.iter_mut().find(|s| s.id == sid) {
+                s.cwd = Some(c.clone());
+            }
+        }
+
         let chat = self.chats.entry(sid.clone()).or_default();
         chat.messages.push(user_msg);
         chat.is_streaming = true;
@@ -1638,6 +3520,36 @@ impl AppState {
         chat.active_tool_name = None;
         chat.last_settlement = None;
         chat.live_status_text = "Thinking...".into();
+        self.session_metrics
+            .entry(sid.clone())
+            .or_default()
+            .on_turn_start();
+        self.record_trajectory_event(
+            &sid,
+            format!("turn-start-{user_msg_id}"),
+            TrajectoryEventKind::TurnStart,
+            "lead".into(),
+            None,
+            None,
+            format!("{} turn", active_mode.label()),
+            text.chars().take(120).collect(),
+            false,
+            None,
+            json!({"mode": active_mode.as_str(), "cwd": bound_cwd}),
+        );
+        self.record_trajectory_event(
+            &sid,
+            format!("user-msg-{user_msg_id}"),
+            TrajectoryEventKind::UserMessage,
+            "user".into(),
+            None,
+            None,
+            "User prompt".into(),
+            text.chars().take(160).collect(),
+            false,
+            None,
+            json!({"text": text}),
+        );
 
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == sid) {
             if s.title
@@ -1654,15 +3566,21 @@ impl AppState {
         cx.notify();
 
         let existing_live = self.live_ids.get(&sid).cloned();
+        let prev_synced_cfg = existing_live
+            .as_deref()
+            .and_then(|l| self.synced_session_config.get(l).copied());
         let profile = self.active_profile.clone();
         let model = self.active_model.clone();
         let provider = self.active_provider.clone();
-        let effort = self.reasoning_effort.as_str().to_string();
+        let effort_enum = self.reasoning_effort;
+        let effort = effort_enum.as_str().to_string();
         let fast = self.fast_mode;
         let yolo = self.yolo_mode;
         let sess_cwd = self.active_session().and_then(|s| s.cwd.clone());
         let sess_title = self.active_session().and_then(|s| s.title.clone());
         let rt = self.tokio_rt.clone();
+        self.bot_finished_at.remove(&profile);
+        self.bump_sidebar();
 
         cx.spawn(async move |this, cx| {
             let sid_inner = sid.clone();
@@ -1702,11 +3620,26 @@ impl AppState {
                     }
                     let live = live_sid.unwrap_or_else(|| sid_inner.clone());
 
-                    // Gateway slash command check
+                    // Gateway slash command check (`command.dispatch` then `slash.exec` fallback)
                     if text.starts_with('/') {
-                        if let Ok(cmd_res) = ws.dispatch_command(&live, &text).await {
+                        let cmd_res = match ws.dispatch_command(&live, &text).await {
+                            Ok(v) => Ok(v),
+                            Err(_) => ws.slash_exec(&live, &text).await,
+                        };
+                        if let Ok(cmd_res) = cmd_res {
+                            if cmd_res.get("type").and_then(Value::as_str) == Some("send") {
+                                if let Some(msg) = cmd_res
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    ws.submit_prompt(&live, msg).await?;
+                                    return Ok((live, None));
+                                }
+                            }
                             if let Some(out) = cmd_res
                                 .get("output")
+                                .or_else(|| cmd_res.get("notice"))
                                 .and_then(Value::as_str)
                                 .filter(|s| !s.is_empty())
                             {
@@ -1715,19 +3648,40 @@ impl AppState {
                         }
                     }
 
-                    let _ = ws.set_session_config(&live, "reasoning", &effort).await;
-                    let _ = ws
-                        .set_session_config(&live, "fast", if fast { "on" } else { "off" })
-                        .await;
-                    let _ = ws
-                        .set_session_config(&live, "yolo", if yolo { "on" } else { "off" })
-                        .await;
+                    // Only send config.set RPCs when session config actually changed, and send concurrently
+                    let desired_cfg = (effort_enum, fast, yolo);
+                    if prev_synced_cfg != Some(desired_cfg) {
+                        let send_effort = prev_synced_cfg.map(|c| c.0) != Some(effort_enum);
+                        let send_fast = prev_synced_cfg.map(|c| c.1) != Some(fast);
+                        let send_yolo = prev_synced_cfg.map(|c| c.2) != Some(yolo);
+                        let f_effort = async {
+                            if send_effort {
+                                let _ = ws.set_session_config(&live, "reasoning", &effort).await;
+                            }
+                        };
+                        let f_fast = async {
+                            if send_fast {
+                                let _ = ws
+                                    .set_session_config(&live, "fast", if fast { "on" } else { "off" })
+                                    .await;
+                            }
+                        };
+                        let f_yolo = async {
+                            if send_yolo {
+                                let _ = ws
+                                    .set_session_config(&live, "yolo", if yolo { "on" } else { "off" })
+                                    .await;
+                            }
+                        };
+                        tokio::join!(f_effort, f_fast, f_yolo);
+                    }
 
                     // Attachments
                     let mut prompt = text;
                     for att in attachments {
                         use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&att.bytes);
+                        let b64 =
+                            base64::engine::general_purpose::STANDARD.encode(att.bytes.as_slice());
                         let data_url = format!("data:{};base64,{b64}", att.mime);
                         if att.mime.starts_with("image/") {
                             let _ = ws
@@ -1780,6 +3734,8 @@ impl AppState {
 
             let _ = this.update(cx, |s, cx| match res {
                 Ok((live, immediate_output)) => {
+                    s.synced_session_config
+                        .insert(live.clone(), (effort_enum, fast, yolo));
                     s.live_ids.insert(sid.clone(), live.clone());
                     s.wire_to_stored.insert(live, sid.clone());
                     s.draft_session_ids.remove(&sid);
@@ -1799,6 +3755,7 @@ impl AppState {
                             clarify: None,
                             streaming: false,
                         });
+                        s.bump_sidebar();
                     }
                     cx.notify();
                 }
@@ -1819,12 +3776,14 @@ impl AppState {
                         clarify: None,
                         streaming: false,
                     });
+                    s.bump_sidebar();
                     s.show_toast(err, cx);
                     cx.notify();
                 }
             });
         })
         .detach();
+        true
     }
 
     pub fn interrupt_stream(&mut self, cx: &mut Context<Self>) {
@@ -1841,6 +3800,48 @@ impl AppState {
             c.last_settlement = Some((TurnSettlementOutcome::Cancelled, Instant::now()));
             c.settle_stream_text(None, None);
         }
+        // If an armed goal is active for this session, pause it so cancelling the turn
+        // never auto-dispatches another round unexpectedly.
+        if let Some(worker) = self.goal_worker.clone() {
+            if let Some(snap) = worker.snapshot_for_session(&sid) {
+                if snap.goal.phase == crate::harness::goal_worker::GoalPhase::Active
+                    && snap.activation == crate::harness::goal_worker::GoalActivation::Armed
+                {
+                    if let Ok(paused) = worker.pause_goal(&sid, None, "Interrupted by user") {
+                        self.record_trajectory_event(
+                            &sid,
+                            format!(
+                                "goal-interrupt-{}-{}",
+                                paused.goal.goal_id, paused.goal.revision
+                            ),
+                            TrajectoryEventKind::GoalChanged,
+                            "lead".into(),
+                            None,
+                            None,
+                            "Goal paused on interrupt".into(),
+                            paused.goal.objective,
+                            false,
+                            None,
+                            json!({"goalId": paused.goal.goal_id, "phase": "paused", "revision": paused.goal.revision}),
+                        );
+                    }
+                }
+            }
+        }
+        self.record_trajectory_event(
+            &sid,
+            format!("turn-cancel-{}", uuid::Uuid::new_v4().simple()),
+            TrajectoryEventKind::TurnCompleted,
+            "lead".into(),
+            None,
+            None,
+            "Turn interrupted".into(),
+            "Stopped by user".into(),
+            false,
+            None,
+            json!({"cancelled": true}),
+        );
+        self.bump_sidebar();
         cx.notify();
         cx.spawn(async move |_, _| {
             let _ = rt.spawn(async move { ws.interrupt_session(&live).await }).await;
@@ -1853,19 +3854,36 @@ impl AppState {
             HermesStreamEvent::Status { status, detail } => {
                 match status.as_str() {
                     "connected" => {
-                        self.connection_status = ConnectionStatus::Connected;
+                        self.connection_status = if self.connection.is_local() {
+                            ConnectionStatus::Local
+                        } else {
+                            ConnectionStatus::Connected
+                        };
                         self.connection_detail = "Live Hermes Gateway".into();
-                        self.refresh_capabilities(false, cx);
+                        if let Some(ref gw) = self.goal_worker {
+                            gw.set_worker_connected(true);
+                        }
+                        self.refresh_slash_commands(cx);
+                        self.refresh_server_projects(cx);
+                        if self.was_disconnected {
+                            self.was_disconnected = false;
+                            self.refresh_core_capabilities(false, cx);
+                        }
                     }
                     "connecting" => {
                         self.connection_status = ConnectionStatus::Connecting;
                         self.connection_detail = "Connecting WebSocket...".into();
                     }
                     "disconnected" => {
+                        self.was_disconnected = true;
                         self.connection_status = ConnectionStatus::Disconnected;
                         self.connection_detail = "Connection lost. Reconnecting…".into();
+                        if let Some(ref gw) = self.goal_worker {
+                            gw.set_worker_connected(false);
+                        }
                         self.live_ids.clear();
                         self.wire_to_stored.clear();
+                        self.synced_session_config.clear();
                         for chat in self.chats.values_mut() {
                             chat.is_streaming = false;
                             chat.settle_stream_text(None, None);
@@ -1876,6 +3894,7 @@ impl AppState {
                         self.connection_detail = detail.unwrap_or_else(|| "WebSocket error".into());
                     }
                 }
+                self.bump_sidebar();
                 cx.notify();
                 return;
             }
@@ -1887,13 +3906,18 @@ impl AppState {
             HermesStreamEvent::SessionInfo { session_id, .. }
             | HermesStreamEvent::SessionUsage { session_id, .. }
             | HermesStreamEvent::StatusUpdate { session_id, .. }
+            | HermesStreamEvent::SessionTitle { session_id, .. }
             | HermesStreamEvent::MessageStart { session_id }
             | HermesStreamEvent::TextDelta { session_id, .. }
             | HermesStreamEvent::ThinkingDelta { session_id, .. }
             | HermesStreamEvent::MessageInterim { session_id, .. }
+            | HermesStreamEvent::ToolGenerating { session_id, .. }
             | HermesStreamEvent::ToolStart { session_id, .. }
             | HermesStreamEvent::ToolProgress { session_id, .. }
             | HermesStreamEvent::ToolEnd { session_id, .. }
+            | HermesStreamEvent::SubagentStart { session_id, .. }
+            | HermesStreamEvent::SubagentUpdate { session_id, .. }
+            | HermesStreamEvent::SubagentComplete { session_id, .. }
             | HermesStreamEvent::TodoUpdated { session_id, .. }
             | HermesStreamEvent::ApprovalRequest { session_id, .. }
             | HermesStreamEvent::ApprovalSettled { session_id, .. }
@@ -1922,11 +3946,36 @@ impl AppState {
                     }
                 }
             }
+            HermesStreamEvent::SessionTitle { title, .. } => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == target_sid) {
+                    s.title = Some(title);
+                    self.bump_sidebar();
+                }
+            }
             HermesStreamEvent::SessionUsage { usage, .. } => {
+                self.session_metrics
+                    .entry(target_sid.clone())
+                    .or_default()
+                    .on_provider_usage(&usage);
                 let chat = self.chats.entry(target_sid).or_default();
                 chat.session_usage = Some(usage);
             }
-            HermesStreamEvent::StatusUpdate { text, .. } => {
+            HermesStreamEvent::StatusUpdate { kind, text, .. } => {
+                if kind.as_deref() == Some("goal") && !text.trim().is_empty() {
+                    self.record_trajectory_event(
+                        &target_sid,
+                        format!("status-goal-{}", now_epoch_ms()),
+                        TrajectoryEventKind::GoalChanged,
+                        "lead".into(),
+                        None,
+                        None,
+                        "Goal status update".into(),
+                        text.clone(),
+                        false,
+                        None,
+                        json!({"kind": "goal", "text": text}),
+                    );
+                }
                 let chat = self.chats.entry(target_sid).or_default();
                 chat.live_status_text = text;
             }
@@ -1935,7 +3984,20 @@ impl AppState {
                 chat.todos = todos;
             }
             HermesStreamEvent::MessageStart { .. } => {
+                let starting_profile = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == target_sid)
+                    .and_then(|s| s.profile.clone())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| self.active_profile.clone());
+                let cleared_finish = self.bot_finished_at.remove(&starting_profile).is_some();
+                self.session_metrics
+                    .entry(target_sid.clone())
+                    .or_default()
+                    .on_turn_start();
                 let chat = self.chats.entry(target_sid).or_default();
+                let was_streaming = chat.is_streaming;
                 chat.is_streaming = true;
                 chat.has_streamed_text = false;
                 chat.active_tool_name = None;
@@ -1946,8 +4008,17 @@ impl AppState {
                         uuid::Uuid::new_v4().simple()
                     )));
                 }
+                if !was_streaming || cleared_finish {
+                    self.bump_sidebar();
+                }
             }
             HermesStreamEvent::TextDelta { delta, thinking, .. } => {
+                if !delta.is_empty() {
+                    self.session_metrics
+                        .entry(target_sid.clone())
+                        .or_default()
+                        .on_first_token();
+                }
                 let chat = self.chats.entry(target_sid).or_default();
                 chat.is_streaming = true;
                 chat.append_stream_text(&delta, thinking.as_deref());
@@ -1962,14 +4033,47 @@ impl AppState {
                 chat.is_streaming = true;
                 chat.apply_interim_snapshot(&content, thinking.as_deref());
             }
+            HermesStreamEvent::ToolGenerating { name, .. } => {
+                let chat = self.chats.entry(target_sid).or_default();
+                chat.is_streaming = true;
+                chat.live_status_text = format!("Preparing {name}…");
+            }
             HermesStreamEvent::ToolStart { tool_call, .. } => {
+                let tc_id = tool_call.id.clone();
+                let tc_name = tool_call.name.clone();
+                let tc_args = tool_call.arguments.clone().unwrap_or(Value::Null);
+                let tc_preview = tool_call.preview.clone().unwrap_or_default();
+                let kind = if is_ptc_tool(&tc_name) {
+                    TrajectoryEventKind::PtcExecution
+                } else {
+                    TrajectoryEventKind::ToolCallStart
+                };
+                self.record_trajectory_event(
+                    &target_sid,
+                    format!("tc-start-{tc_id}"),
+                    kind,
+                    "lead".into(),
+                    None,
+                    Some(tc_id.clone()),
+                    tc_name.clone(),
+                    if tc_preview.is_empty() {
+                        format!("Calling {tc_name}")
+                    } else {
+                        tc_preview
+                    },
+                    false,
+                    None,
+                    json!({"tool": tc_name, "arguments": tc_args}),
+                );
                 let chat = self.chats.entry(target_sid).or_default();
                 chat.is_streaming = true;
                 chat.has_streamed_text = false;
                 chat.active_tool_name = Some(tool_call.name.clone());
                 chat.live_status_text = format!("Running {}…", tool_call.name);
                 if let Some(m) = chat.messages.iter_mut().rev().find(|m| m.streaming) {
-                    m.tool_calls.push(tool_call);
+                    if !m.tool_calls.iter().any(|existing| existing.id == tool_call.id) {
+                        m.tool_calls.push(tool_call);
+                    }
                 } else {
                     let mut m =
                         HermesMessage::new_assistant(format!("asst-{}", uuid::Uuid::new_v4().simple()));
@@ -1998,9 +4102,19 @@ impl AppState {
                 output,
                 error,
                 duration_ms,
+                inline_diff,
                 ..
             } => {
-                let chat = self.chats.entry(target_sid).or_default();
+                if let Some(ref diff) = inline_diff {
+                    self.session_metrics
+                        .entry(target_sid.clone())
+                        .or_default()
+                        .record_agent_diff(diff);
+                }
+                let is_err = error.is_some();
+                let mut matched_name = "tool".to_string();
+                let mut matched_args = Value::Null;
+                let chat = self.chats.entry(target_sid.clone()).or_default();
                 chat.live_status_text.clear();
                 chat.active_tool_name = None;
                 for m in chat.messages.iter_mut().rev() {
@@ -2008,21 +4122,235 @@ impl AppState {
                         (!tool_call_id.is_empty() && t.id == tool_call_id)
                             || t.status == ToolCallStatus::Running
                     }) {
-                        tc.status = if error.is_some() {
+                        matched_name = tc.name.clone();
+                        matched_args = tc.arguments.clone().unwrap_or(Value::Null);
+                        tc.waiting_approval = false;
+                        tc.status = if is_err {
                             ToolCallStatus::Error
                         } else {
                             ToolCallStatus::Done
                         };
-                        tc.output = error.or(output).or(tc.output.take());
+                        tc.output = error.clone().or(output.clone()).or(tc.output.take());
                         tc.duration_ms = duration_ms;
+                        tc.inline_diff = inline_diff.clone();
                         break;
                     }
                 }
+                let summary = error
+                    .as_deref()
+                    .or(output.as_deref())
+                    .unwrap_or("Completed")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(140)
+                    .collect();
+                self.record_trajectory_event(
+                    &target_sid,
+                    format!("tc-end-{tool_call_id}"),
+                    TrajectoryEventKind::ToolCallResult,
+                    "lead".into(),
+                    None,
+                    Some(tool_call_id),
+                    format!("{matched_name} result"),
+                    summary,
+                    is_err,
+                    duration_ms,
+                    json!({
+                        "tool": matched_name,
+                        "arguments": matched_args,
+                        "output": output,
+                        "error": error,
+                        "inlineDiff": inline_diff,
+                    }),
+                );
+                if self.active_conversation_mode() == ConversationMode::Work
+                    && matches!(matched_name.as_str(), "write_file" | "patch" | "edit" | "terminal")
+                {
+                    self.refresh_inspector_git(cx);
+                }
+            }
+            HermesStreamEvent::SubagentStart {
+                subagent_id,
+                parent_id,
+                child_session_id,
+                depth,
+                goal,
+                model,
+                ..
+            } => {
+                let now = now_epoch_ms();
+                let parent = parent_id.unwrap_or_else(|| "lead".into());
+                let node = SubagentNode {
+                    subagent_id: subagent_id.clone(),
+                    session_id: target_sid.clone(),
+                    parent_agent_id: parent.clone(),
+                    child_session_id,
+                    depth,
+                    goal: goal.clone(),
+                    model,
+                    status: SubagentStatus::Running,
+                    current_operation: "Starting…".into(),
+                    tool_count: 0,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: None,
+                    summary: None,
+                    started_at_ms: now,
+                    updated_at_ms: now,
+                };
+                let list = self.subagents.entry(target_sid.clone()).or_default();
+                list.retain(|n| n.subagent_id != subagent_id);
+                list.insert(0, node.clone());
+                if let Some(store) = self.harness_store.clone() {
+                    let rt = self.tokio_rt.clone();
+                    rt.spawn_blocking(move || {
+                        let _ = store.upsert_subagent(&node);
+                    });
+                }
+                self.record_trajectory_event(
+                    &target_sid,
+                    format!("sub-start-{subagent_id}"),
+                    TrajectoryEventKind::SubagentSpawned,
+                    subagent_id,
+                    Some(parent),
+                    None,
+                    "Subagent spawned".into(),
+                    goal,
+                    false,
+                    None,
+                    json!({"depth": depth}),
+                );
+            }
+            HermesStreamEvent::SubagentUpdate {
+                subagent_id,
+                tool_name,
+                operation,
+                tool_count,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                let now = now_epoch_ms();
+                let op_display = match tool_name.as_deref() {
+                    Some(t) if !t.is_empty() && !operation.contains(t) => {
+                        format!("{t}: {operation}")
+                    }
+                    _ => operation.clone(),
+                };
+                if let Some(ref t) = tool_name {
+                    if !t.is_empty() {
+                        self.record_trajectory_event(
+                            &target_sid,
+                            format!("sub-tool-{subagent_id}-{t}-{}", tool_count.unwrap_or(0)),
+                            TrajectoryEventKind::ToolCallStart,
+                            subagent_id.clone(),
+                            Some("lead".into()),
+                            None,
+                            format!("Subagent tool: {t}"),
+                            op_display.clone(),
+                            false,
+                            None,
+                            json!({"subagentId": subagent_id, "tool": t, "toolCount": tool_count}),
+                        );
+                    }
+                }
+                let list = self.subagents.entry(target_sid.clone()).or_default();
+                if let Some(node) = list.iter_mut().find(|n| n.subagent_id == subagent_id) {
+                    node.current_operation = op_display;
+                    if let Some(tc) = tool_count {
+                        node.tool_count = tc;
+                    }
+                    if input_tokens.is_some() {
+                        node.input_tokens = input_tokens;
+                    }
+                    if output_tokens.is_some() {
+                        node.output_tokens = output_tokens;
+                    }
+                    node.updated_at_ms = now;
+                    if let Some(store) = self.harness_store.clone() {
+                        let node_save = node.clone();
+                        self.tokio_rt.spawn_blocking(move || {
+                            let _ = store.upsert_subagent(&node_save);
+                        });
+                    }
+                }
+            }
+            HermesStreamEvent::SubagentComplete {
+                subagent_id,
+                status,
+                summary,
+                duration_ms,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                let now = now_epoch_ms();
+                let parsed_status = SubagentStatus::from_str_lossy(&status);
+                let is_err = parsed_status == SubagentStatus::Failed;
+                let list = self.subagents.entry(target_sid.clone()).or_default();
+                if let Some(node) = list.iter_mut().find(|n| n.subagent_id == subagent_id) {
+                    node.status = parsed_status;
+                    node.current_operation = summary
+                        .clone()
+                        .unwrap_or_else(|| status.clone());
+                    node.summary = summary.clone();
+                    node.duration_ms = duration_ms;
+                    if input_tokens.is_some() {
+                        node.input_tokens = input_tokens;
+                    }
+                    if output_tokens.is_some() {
+                        node.output_tokens = output_tokens;
+                    }
+                    node.updated_at_ms = now;
+                    if let Some(store) = self.harness_store.clone() {
+                        let node_save = node.clone();
+                        self.tokio_rt.spawn_blocking(move || {
+                            let _ = store.upsert_subagent(&node_save);
+                        });
+                    }
+                }
+                self.record_trajectory_event(
+                    &target_sid,
+                    format!("sub-done-{subagent_id}"),
+                    TrajectoryEventKind::SubagentCompleted,
+                    subagent_id,
+                    Some("lead".into()),
+                    None,
+                    format!("Subagent {status}"),
+                    summary.unwrap_or(status),
+                    is_err,
+                    duration_ms,
+                    json!({}),
+                );
             }
             HermesStreamEvent::ApprovalRequest { approval, .. } => {
+                let appr_id = approval.id.clone();
+                let appr_title = approval.title.clone();
+                let appr_cmd = approval.command.clone();
+                self.record_trajectory_event(
+                    &target_sid,
+                    format!("appr-req-{appr_id}"),
+                    TrajectoryEventKind::ApprovalRequested,
+                    "lead".into(),
+                    None,
+                    None,
+                    "Waiting for approval".into(),
+                    appr_cmd.clone().unwrap_or_else(|| appr_title.clone()),
+                    false,
+                    None,
+                    json!({"approvalId": appr_id, "command": appr_cmd}),
+                );
                 let chat = self.chats.entry(target_sid).or_default();
                 let id = format!("appr-{}", approval.id);
                 chat.awaiting_user_response = true;
+                for m in chat.messages.iter_mut().rev() {
+                    if let Some(tc) = m.tool_calls.iter_mut().rev().find(|t| t.status == ToolCallStatus::Running) {
+                        tc.waiting_approval = true;
+                        break;
+                    }
+                }
                 if !chat.messages.iter().any(|m| m.id == id) {
                     let mut m = HermesMessage::new_assistant(id);
                     m.streaming = false;
@@ -2031,12 +4359,28 @@ impl AppState {
                 }
             }
             HermesStreamEvent::ApprovalSettled { id, decision, .. } => {
+                self.record_trajectory_event(
+                    &target_sid,
+                    format!("appr-dec-{id}"),
+                    TrajectoryEventKind::ApprovalDecided,
+                    "user".into(),
+                    None,
+                    None,
+                    format!("Approval {decision:?}"),
+                    id.clone(),
+                    decision == ApprovalDecision::Denied,
+                    None,
+                    json!({"approvalId": id, "decision": decision}),
+                );
                 let chat = self.chats.entry(target_sid).or_default();
                 for m in &mut chat.messages {
                     if let Some(ap) = &mut m.approval {
                         if ap.id == id {
                             ap.settled = Some(decision.clone());
                         }
+                    }
+                    for tc in &mut m.tool_calls {
+                        tc.waiting_approval = false;
                     }
                 }
                 chat.awaiting_user_response = chat.messages.iter().any(|m| {
@@ -2069,18 +4413,182 @@ impl AppState {
                         || m.clarify.as_ref().is_some_and(|c| c.answered.is_none())
                 });
             }
-            HermesStreamEvent::MessageComplete { content, thinking, .. } => {
-                let chat = self.chats.entry(target_sid).or_default();
-                chat.is_streaming = false;
-                chat.active_tool_name = None;
-                chat.live_status_text.clear();
-                chat.last_settlement = Some((TurnSettlementOutcome::Success, Instant::now()));
-                if let Some(index) = chat.settle_stream_text(content.as_deref(), thinking.as_deref()) {
-                    chat.messages[index].model.get_or_insert_with(|| self.active_model.clone());
+            HermesStreamEvent::MessageComplete {
+                content,
+                thinking,
+                status,
+                error,
+                usage,
+                ..
+            } => {
+                if let Some(ref u) = usage {
+                    self.session_metrics
+                        .entry(target_sid.clone())
+                        .or_default()
+                        .on_provider_usage(u);
                 }
-                chat.has_streamed_text = false;
+                self.session_metrics
+                    .entry(target_sid.clone())
+                    .or_default()
+                    .on_turn_end();
+                let turn_elapsed_ms = self
+                    .session_metrics
+                    .get(&target_sid)
+                    .and_then(|m| m.elapsed_ms());
+                let total_tokens_now = self
+                    .session_metrics
+                    .get(&target_sid)
+                    .and_then(|m| m.total_tokens().value);
+
+                let is_failed = status.as_deref() == Some("error") || error.is_some();
+                let is_interrupted = status.as_deref() == Some("interrupted");
+                let finished_profile = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == target_sid)
+                    .and_then(|s| s.profile.clone())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| self.active_profile.clone());
+
+                let (settled_text, settled_thinking) = {
+                    let chat = self.chats.entry(target_sid.clone()).or_default();
+                    chat.is_streaming = false;
+                    chat.active_tool_name = None;
+                    chat.live_status_text.clear();
+                    if let Some(u) = usage {
+                        chat.session_usage = Some(u);
+                    }
+                    let finished_at = Instant::now();
+                    chat.last_settlement = Some((
+                        if is_failed {
+                            TurnSettlementOutcome::Error
+                        } else if is_interrupted {
+                            TurnSettlementOutcome::Cancelled
+                        } else {
+                            TurnSettlementOutcome::Success
+                        },
+                        finished_at,
+                    ));
+                    let mut settled_c = content.clone().unwrap_or_default();
+                    let mut settled_t = thinking.clone();
+                    if let Some(index) = chat.settle_stream_text(content.as_deref(), thinking.as_deref()) {
+                        chat.messages[index]
+                            .model
+                            .get_or_insert_with(|| self.active_model.clone());
+                        settled_c = chat.messages[index].content.clone();
+                        settled_t = chat.messages[index].thinking.clone();
+                    }
+                    chat.has_streamed_text = false;
+                    (settled_c, settled_t)
+                };
+
+                if let Some(thought) = settled_thinking.filter(|t| !t.trim().is_empty()) {
+                    self.record_trajectory_event(
+                        &target_sid,
+                        format!("thought-{}", uuid::Uuid::new_v4().simple()),
+                        TrajectoryEventKind::ReasoningSummary,
+                        "lead".into(),
+                        None,
+                        None,
+                        "Reasoning summary".into(),
+                        thought.lines().next().unwrap_or("").chars().take(140).collect(),
+                        false,
+                        None,
+                        json!({"thinking": thought}),
+                    );
+                }
+                self.record_trajectory_event(
+                    &target_sid,
+                    format!("turn-done-{}", uuid::Uuid::new_v4().simple()),
+                    if is_failed {
+                        TrajectoryEventKind::Error
+                    } else {
+                        TrajectoryEventKind::TurnCompleted
+                    },
+                    "lead".into(),
+                    None,
+                    None,
+                    if is_failed {
+                        "Turn failed".into()
+                    } else if is_interrupted {
+                        "Turn interrupted".into()
+                    } else {
+                        "Turn completed".into()
+                    },
+                    error
+                        .clone()
+                        .unwrap_or_else(|| settled_text.lines().next().unwrap_or("").chars().take(140).collect()),
+                    is_failed,
+                    turn_elapsed_ms,
+                    json!({"status": status, "error": error, "tokens": total_tokens_now}),
+                );
+
+                // Goal continuation driver (runs in background even if user switched conversations!)
+                let should_continue_goal = if let Some(ref gw) = self.goal_worker {
+                    let completed_marker = settled_text.contains("GOAL_COMPLETE");
+                    gw.on_turn_settled(
+                        &target_sid,
+                        !is_failed && !is_interrupted,
+                        Some(settled_text.chars().take(200).collect()),
+                        total_tokens_now,
+                        completed_marker,
+                    )
+                } else {
+                    false
+                };
+
+                if should_continue_goal {
+                    let next_sid = target_sid.clone();
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(600))
+                            .await;
+                        let _ = this.update(cx, |s, cx| {
+                            s.dispatch_next_goal_round(next_sid, cx);
+                        });
+                    })
+                    .detach();
+                } else if !is_failed && !is_interrupted {
+                    let finished_at = Instant::now();
+                    self.bot_finished_at.insert(finished_profile.clone(), finished_at);
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_secs(8)).await;
+                        let _ = this.update(cx, |s, cx| {
+                            if s.bot_finished_at.get(&finished_profile) == Some(&finished_at) {
+                                s.bot_finished_at.remove(&finished_profile);
+                                s.bump_sidebar();
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+                }
+                if self.active_conversation_mode() == ConversationMode::Work {
+                    self.refresh_inspector_git(cx);
+                }
+                self.bump_sidebar();
             }
             HermesStreamEvent::Error { message, .. } => {
+                self.session_metrics
+                    .entry(target_sid.clone())
+                    .or_default()
+                    .on_turn_end();
+                self.record_trajectory_event(
+                    &target_sid,
+                    format!("err-{}", uuid::Uuid::new_v4().simple()),
+                    TrajectoryEventKind::Error,
+                    "lead".into(),
+                    None,
+                    None,
+                    "Runtime error".into(),
+                    message.clone(),
+                    true,
+                    None,
+                    json!({"error": message}),
+                );
+                if let Some(ref gw) = self.goal_worker {
+                    gw.on_turn_settled(&target_sid, false, Some(message.clone()), None, false);
+                }
                 let chat = self.chats.entry(target_sid).or_default();
                 chat.is_streaming = false;
                 chat.last_settlement = Some((TurnSettlementOutcome::Error, Instant::now()));
@@ -2090,6 +4598,7 @@ impl AppState {
                 m.content = message.clone();
                 m.streaming = false;
                 chat.messages.push(m);
+                self.bump_sidebar();
                 self.show_toast(message, cx);
             }
             _ => {}
@@ -2166,6 +4675,7 @@ impl AppState {
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             s.title = Some(clean.clone());
         }
+        self.bump_sidebar();
         cx.notify();
         let client = self.client.clone();
         let ws = self.realtime.clone();
@@ -2202,6 +4712,7 @@ impl AppState {
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             s.pinned = next;
         }
+        self.bump_sidebar();
         cx.notify();
         if let Some(c) = self.client.clone() {
             let rt = self.tokio_rt.clone();
@@ -2221,6 +4732,7 @@ impl AppState {
         if archived && self.active_session_id.as_deref() == Some(session_id.as_str()) {
             self.active_session_id = None;
         }
+        self.bump_sidebar();
         self.show_toast(
             if archived {
                 "Session archived"
@@ -2289,7 +4801,7 @@ impl AppState {
                                 s.live_ids.insert(ns.clone(), w.to_string());
                                 s.wire_to_stored.insert(w.to_string(), ns.clone());
                             }
-                            s.refresh_capabilities(false, cx);
+                            s.refresh_core_capabilities(false, cx);
                             s.select_session(Some(ns), cx);
                             s.show_toast("Branched session", cx);
                             return;
@@ -2393,6 +4905,7 @@ impl AppState {
             entry.color_id = color_id;
         }
         self.persist_board_state();
+        self.bump_sidebar();
         cx.notify();
     }
 
@@ -2452,6 +4965,7 @@ impl AppState {
     ) {
         self.session_boards.insert(session_id, board_slug);
         self.persist_board_state();
+        self.bump_sidebar();
         cx.notify();
     }
 
@@ -2476,6 +4990,7 @@ impl AppState {
         self.boards.push(board.clone());
         self.active_board_slug = slug;
         self.persist_board_state();
+        self.bump_sidebar();
         self.show_toast(format!("Created board \"{}\"", board.name), cx);
 
         let client = self.client.clone();
@@ -2517,6 +5032,7 @@ impl AppState {
             self.active_board_slug = "all".into();
         }
         self.persist_board_state();
+        self.bump_sidebar();
         self.show_toast(format!("Deleted board \"{slug}\""), cx);
         if let Some(c) = self.client.clone() {
             let rt = self.tokio_rt.clone();
@@ -2640,7 +5156,8 @@ impl AppState {
             let _ = this.update(cx, |s, cx| match res {
                 Ok(_) => {
                     s.show_toast("Dispatched Hermes board workers", cx);
-                    s.refresh_capabilities(false, cx);
+                    s.refresh_boards(cx);
+                    s.refresh_core_capabilities(false, cx);
                 }
                 Err(e) => s.show_toast(e, cx),
             });
@@ -2680,27 +5197,50 @@ impl AppState {
         .detach();
     }
 
+    pub fn refresh_updater_status(&mut self, cx: &mut Context<Self>) {
+        let updater = self.updater.clone();
+        let rt = self.tokio_rt.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(st) = rt.spawn_blocking(move || updater.status()).await else {
+                return;
+            };
+            let _ = this.update(cx, |s, cx| {
+                s.update_status = Some(st);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     // Inspector helpers
     pub fn refresh_inspector_files(&mut self, cx: &mut Context<Self>) {
         let cwd = self.inspector_cwd.clone();
         let is_local = self.connection.is_local();
         let client = self.client.clone();
         let rt = self.tokio_rt.clone();
+        self.inspector_files_gen = self.inspector_files_gen.wrapping_add(1);
+        let gen = self.inspector_files_gen;
         self.inspector_file_error = None;
         cx.spawn(async move |this, cx| {
-            let res = rt
-                .spawn(async move {
-                    if is_local {
-                        workspace::list_workspace_files(&cwd)
-                    } else if let Some(c) = client {
+            let res = if is_local {
+                rt.spawn_blocking(move || workspace::list_workspace_files(&cwd))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            } else {
+                rt.spawn(async move {
+                    if let Some(c) = client {
                         c.list_files(&cwd).await
                     } else {
                         Ok(Vec::new())
                     }
                 })
                 .await
-                .unwrap_or_else(|e| Err(e.to_string()));
+                .unwrap_or_else(|e| Err(e.to_string()))
+            };
             let _ = this.update(cx, |s, cx| {
+                if s.inspector_files_gen != gen {
+                    return;
+                }
                 match res {
                     Ok(files) => {
                         s.inspector_files = files;
@@ -2719,11 +5259,14 @@ impl AppState {
             self.inspector_cwd = entry.path;
             self.inspector_preview_path = None;
             self.inspector_preview_content.clear();
+            self.inspector_preview_gen = self.inspector_preview_gen.wrapping_add(1);
             self.refresh_inspector_files(cx);
             cx.notify();
             return;
         }
         let path = entry.path.clone();
+        self.inspector_preview_gen = self.inspector_preview_gen.wrapping_add(1);
+        let gen = self.inspector_preview_gen;
         self.inspector_preview_path = Some(path.clone());
         self.inspector_preview_content = "Loading…".into();
         let is_local = self.connection.is_local();
@@ -2732,19 +5275,25 @@ impl AppState {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let res = rt
-                .spawn(async move {
-                    if is_local {
-                        workspace::read_workspace_file(&path)
-                    } else if let Some(c) = client {
+            let res = if is_local {
+                rt.spawn_blocking(move || workspace::read_workspace_file(&path))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            } else {
+                rt.spawn(async move {
+                    if let Some(c) = client {
                         c.read_file(&path).await
                     } else {
                         Err("No connection".into())
                     }
                 })
                 .await
-                .unwrap_or_else(|e| Err(e.to_string()));
+                .unwrap_or_else(|e| Err(e.to_string()))
+            };
             let _ = this.update(cx, |s, cx| {
+                if s.inspector_preview_gen != gen {
+                    return;
+                }
                 s.inspector_preview_content = match res {
                     Ok(txt) => txt,
                     Err(e) => format!("Error reading file: {e}"),
@@ -2770,6 +5319,8 @@ impl AppState {
         }
         let cwd = self.inspector_cwd.clone();
         let rt = self.tokio_rt.clone();
+        self.inspector_git_gen = self.inspector_git_gen.wrapping_add(1);
+        let gen = self.inspector_git_gen;
         self.inspector_git_loading = true;
         self.inspector_git_error = None;
         cx.notify();
@@ -2788,6 +5339,9 @@ impl AppState {
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
             let _ = this.update(cx, |s, cx| {
+                if s.inspector_git_gen != gen {
+                    return;
+                }
                 s.inspector_git_loading = false;
                 match res {
                     Ok(st) => s.inspector_git = Some(st),

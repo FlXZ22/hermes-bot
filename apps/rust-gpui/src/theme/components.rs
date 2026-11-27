@@ -339,6 +339,7 @@ pub fn gb_toggle_switch(
 pub fn gb_section_card(theme: &SandTheme) -> Div {
     div()
         .w_full()
+        .flex_shrink_0()
         .rounded(px(16.0))
         .bg(theme.bg_elevated)
         .border_1()
@@ -351,6 +352,7 @@ pub fn gb_section_card(theme: &SandTheme) -> Div {
 pub fn gb_section_card_head(theme: &SandTheme) -> Div {
     div()
         .w_full()
+        .flex_shrink_0()
         .px(px(16.0))
         .py(px(12.0))
         .border_b_1()
@@ -358,12 +360,14 @@ pub fn gb_section_card_head(theme: &SandTheme) -> Div {
         .flex()
         .items_center()
         .justify_between()
+        .flex_wrap()
         .gap(px(10.0))
 }
 
 pub fn gb_row(theme: &SandTheme) -> Div {
     div()
         .w_full()
+        .flex_shrink_0()
         .px(px(16.0))
         .py(px(11.0))
         .border_b_1()

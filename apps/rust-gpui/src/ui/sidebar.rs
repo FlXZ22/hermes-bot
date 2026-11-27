@@ -31,11 +31,13 @@ const BOARD_COLORS: &[&str] = &[
 
 pub struct SidebarView {
     app: Entity<AppState>,
+    last_sidebar_version: (u64, AppViewId, bool, usize, usize, ThemeMode),
     sidebar_width: SpringValue,
     connection_status: Option<ConnectionStatus>,
     connected_at: Option<Instant>,
     search_input: Entity<InputState>,
     show_archived: bool,
+    hovered_bot_name: Option<String>,
     hovered_session_id: Option<String>,
     renaming_id: Option<String>,
     rename_input: Entity<InputState>,
@@ -43,6 +45,7 @@ pub struct SidebarView {
     session_scroll: UniformListScrollHandle,
     session_smooth: SmoothScroller,
     visible_sessions: Vec<HermesSession>,
+    last_filter_key: (String, String, bool),
     // Add Bot modal state
     new_bot_modal: ModalMotion,
     bot_name_input: Entity<InputState>,
@@ -74,21 +77,49 @@ impl SidebarView {
         let board_path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("/home/metis/Projects/..."));
 
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
-        cx.subscribe(&search_input, |_, _, ev: &InputEvent, cx| {
+        cx.observe(&app, |this, app_e, cx| {
+            let s = app_e.read(cx);
+            if s.setup_open || s.initializing {
+                return;
+            }
+            let snap = (
+                s.sidebar_version,
+                s.active_view,
+                s.sidebar_collapsed,
+                s.sessions.len(),
+                s.boards.len(),
+                s.theme_mode(),
+            );
+            if this.last_sidebar_version != snap {
+                this.last_sidebar_version = snap;
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&search_input, |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
+                this.session_smooth.cancel();
+                this.session_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
             }
         })
         .detach();
         cx.subscribe(&rename_input, |this, inp, ev: &InputEvent, cx| {
-            if let InputEvent::PressEnter { .. } = ev {
-                if let Some(sid) = this.renaming_id.take() {
-                    let val = inp.read(cx).value().to_string();
-                    this.app
-                        .update(cx, |s, cx| s.rename_session(sid, val, cx));
-                    cx.notify();
+            match ev {
+                InputEvent::PressEnter { .. } => {
+                    if let Some(sid) = this.renaming_id.take() {
+                        let val = inp.read(cx).value().to_string();
+                        this.app
+                            .update(cx, |s, cx| s.rename_session(sid, val, cx));
+                        cx.notify();
+                    }
                 }
+                InputEvent::Blur => {
+                    if this.renaming_id.take().is_some() {
+                        cx.notify();
+                    }
+                }
+                _ => {}
             }
         })
         .detach();
@@ -96,20 +127,36 @@ impl SidebarView {
         let session_scroll = UniformListScrollHandle::new();
         let session_smooth = SmoothScroller::for_uniform_list(session_scroll.clone());
 
-        let initial_width = if app.read(cx).sidebar_collapsed { 68.0 } else { 280.0 };
+        let (initial_width, initial_ver) = {
+            let s = app.read(cx);
+            (
+                if s.sidebar_collapsed { 68.0 } else { 280.0 },
+                (
+                    s.sidebar_version,
+                    s.active_view,
+                    s.sidebar_collapsed,
+                    s.sessions.len(),
+                    s.boards.len(),
+                    s.theme_mode(),
+                ),
+            )
+        };
         Self {
             app,
+            last_sidebar_version: initial_ver,
             sidebar_width: SpringValue::new(initial_width).with_precision(0.1),
             connection_status: None,
             connected_at: None,
             search_input,
             show_archived: false,
+            hovered_bot_name: None,
             hovered_session_id: None,
             renaming_id: None,
             rename_input,
             session_scroll,
             session_smooth,
             visible_sessions: Vec::new(),
+            last_filter_key: (String::new(), "all".into(), false),
             new_bot_modal: ModalMotion::default(),
             bot_name_input,
             bot_desc_input,
@@ -182,7 +229,7 @@ impl SidebarView {
                     Ok(_) => {
                         v.new_bot_modal.set_open(false);
                         v.app.update(cx, |s, cx| {
-                            s.refresh_capabilities(false, cx);
+                            s.refresh_profiles(cx);
                             s.switch_profile(name, cx);
                         });
                     }
@@ -251,13 +298,6 @@ impl SidebarView {
         } else {
             36.0
         };
-        let face_state = if sess.archived {
-            BotFaceState::Sleeping
-        } else if is_active {
-            active_bot_state
-        } else {
-            BotFaceState::Idle
-        };
 
         let sid = sess.id.clone();
         let sid_pin = sess.id.clone();
@@ -320,8 +360,19 @@ impl SidebarView {
                     av.and_then(|a| a.color_id.as_deref())
                 },
                 face_size,
-                face_state,
-                BotFaceOptions { slot_key: "sidebar-session", is_static: !is_active || sess.archived, ..Default::default() },
+                if sess.archived {
+                    BotFaceState::Sleeping
+                } else if is_active && active_bot_state == BotFaceState::Finished {
+                    BotFaceState::Finished
+                } else {
+                    BotFaceState::Idle
+                },
+                BotFaceOptions {
+                    slot_key: "sidebar-session",
+                    is_static: !(is_active && active_bot_state == BotFaceState::Finished)
+                        || sess.archived,
+                    ..Default::default()
+                },
             ))
             .when(!collapsed, |d| {
                 d.child(
@@ -394,6 +445,7 @@ impl SidebarView {
                                                 let init_t = title_for_ren.clone();
                                                 this.rename_input.update(cx, |st, cx| {
                                                     st.set_value(init_t, window, cx);
+                                                    st.focus(window, cx);
                                                 });
                                                 cx.notify();
                                             })),
@@ -465,7 +517,6 @@ impl Render for SidebarView {
         let active_session_id = s.active_session_id.clone();
         let active_profile = s.active_profile.clone();
         let active_board_slug = s.active_board_slug.clone();
-        let profile_switching = s.profile_switching;
         let conn_status = s.connection_status;
         if self.connection_status != Some(conn_status) {
             self.connection_status = Some(conn_status);
@@ -474,11 +525,22 @@ impl Render for SidebarView {
         // Pulse when a connection becomes live, then keep a static green status dot.
         let pulse_connection = conn_status == ConnectionStatus::Connecting
             || self.connected_at.is_some_and(|at| at.elapsed() < Duration::from_millis(1600));
-        let active_chat = s.active_chat();
-        let active_bot_state = active_chat.bot_state();
-        let active_streaming = active_chat.is_streaming;
+        let active_bot_state = s.active_bot_state();
+        let active_streaming = s.active_is_streaming();
+        let finished_bots: std::collections::HashSet<String> = s
+            .profiles
+            .iter()
+            .filter(|p| s.bot_recently_finished(&p.name))
+            .map(|p| p.name.clone())
+            .collect();
 
         let search_q = self.search_input.read(cx).value().trim().to_lowercase();
+        let filter_key = (search_q.clone(), active_board_slug.clone(), self.show_archived);
+        if self.last_filter_key != filter_key {
+            self.last_filter_key = filter_key;
+            self.session_smooth.cancel();
+            self.session_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
         let filtered: Vec<HermesSession> = s
             .sessions
             .iter()
@@ -591,6 +653,8 @@ impl Render for SidebarView {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.app.update(cx, |s, cx| {
                                             s.sidebar_collapsed = !s.sidebar_collapsed;
+                                            s.bump_sidebar();
+                                            s.bump_shell();
                                             cx.notify();
                                         });
                                     })),
@@ -671,6 +735,7 @@ impl Render for SidebarView {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.app.update(cx, |s, cx| {
                                         s.active_board_slug = "all".into();
+                                        s.bump_sidebar();
                                         cx.notify();
                                     });
                                 })),
@@ -689,6 +754,7 @@ impl Render for SidebarView {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.app.update(cx, |s, cx| {
                                     s.active_board_slug = slug.clone();
+                                    s.bump_sidebar();
                                     cx.notify();
                                 });
                             }))
@@ -751,6 +817,7 @@ impl Render for SidebarView {
                                                             seed: active_prof_for_btn.clone(),
                                                             title: active_title_for_btn.clone(),
                                                         });
+                                                        s.bump_shell();
                                                         cx.notify();
                                                     });
                                                 })),
@@ -759,7 +826,11 @@ impl Render for SidebarView {
                         )
                         .child(
                             div()
+                                .id("sidebar-bots-grid")
                                 .w_full()
+                                .flex_shrink_0()
+                                .max_h(px(210.0))
+                                .overflow_y_scroll()
                                 .py(px(4.0))
                                 .pb(px(10.0))
                                 .flex()
@@ -767,6 +838,7 @@ impl Render for SidebarView {
                                 .gap(px(4.0))
                                 .children(profiles.iter().map(|prof| {
                                     let pname = prof.name.clone();
+                                    let pname_hover = prof.name.clone();
                                     let pname_ctx = prof.name.clone();
                                     let av = bot_avatars.get(&prof.name);
                                     let active = active_profile == prof.name;
@@ -780,8 +852,15 @@ impl Render for SidebarView {
                                             }
                                         });
                                     let display_ctx = display_name.clone();
-                                    let tile_state = if active {
-                                        active_bot_state
+                                    // Bots section animations stay stopped by default. They ONLY
+                                    // pop up and follow the mouse when hovered or when a bot
+                                    // finishes a job — never while thinking, reasoning, or writing.
+                                    let is_hovered_bot =
+                                        self.hovered_bot_name.as_deref() == Some(prof.name.as_str());
+                                    let just_finished = finished_bots.contains(&prof.name);
+                                    let animate_bot = is_hovered_bot || just_finished;
+                                    let tile_state = if just_finished {
+                                        BotFaceState::Finished
                                     } else {
                                         BotFaceState::Idle
                                     };
@@ -804,12 +883,26 @@ impl Render for SidebarView {
                                         .gap(px(6.0))
                                         .cursor_pointer()
                                         .hover(move |st| st.bg(hover_bg))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if !profile_switching {
-                                                this.app.update(cx, |s, cx| {
-                                                    s.switch_profile(pname.clone(), cx);
-                                                });
+                                        .on_hover(cx.listener(move |this, hovered, _, cx| {
+                                            if *hovered {
+                                                if this.hovered_bot_name.as_deref()
+                                                    != Some(pname_hover.as_str())
+                                                {
+                                                    this.hovered_bot_name =
+                                                        Some(pname_hover.clone());
+                                                    cx.notify();
+                                                }
+                                            } else if this.hovered_bot_name.as_deref()
+                                                == Some(pname_hover.as_str())
+                                            {
+                                                this.hovered_bot_name = None;
+                                                cx.notify();
                                             }
+                                        }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.app.update(cx, |s, cx| {
+                                                s.switch_profile(pname.clone(), cx);
+                                            });
                                         }))
                                         .on_mouse_down(
                                             MouseButton::Right,
@@ -819,6 +912,7 @@ impl Render for SidebarView {
                                                         seed: pname_ctx.clone(),
                                                         title: display_ctx.clone(),
                                                     });
+                                                    s.bump_shell();
                                                     cx.notify();
                                                 });
                                             }),
@@ -832,7 +926,9 @@ impl Render for SidebarView {
                                             tile_state,
                                             BotFaceOptions {
                                                 slot_key: "sidebar-pinned",
-                                                max_fps: (!active).then_some(30.0),
+                                                is_static: !animate_bot,
+                                                follow_pointer: animate_bot,
+                                                pop_on_activate: true,
                                                 ..Default::default()
                                             },
                                         ))
@@ -988,8 +1084,7 @@ impl Render for SidebarView {
                             .when(!collapsed, |d| d.child(label))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.app.update(cx, |s, cx| {
-                                    s.active_view = view_id;
-                                    cx.notify();
+                                    s.set_active_view(view_id, cx);
                                 });
                             }))
                     })),
@@ -1022,8 +1117,7 @@ impl Render for SidebarView {
                             .hover(|st| st.bg(theme.sidebar_hover))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.app.update(cx, |s, cx| {
-                                    s.active_view = AppViewId::Settings;
-                                    cx.notify();
+                                    s.set_active_view(AppViewId::Settings, cx);
                                 });
                             }))
                             .child(live_pulse_dot(status_dot_color, 8.0, pulse_connection))
@@ -1060,6 +1154,7 @@ impl Render for SidebarView {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.app.update(cx, |s, cx| {
                                             s.command_palette_open = true;
+                                            s.bump_shell();
                                             cx.notify();
                                         });
                                     })),

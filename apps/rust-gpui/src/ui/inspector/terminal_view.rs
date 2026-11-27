@@ -1,22 +1,25 @@
 use crate::backend::terminal::{EventSink, TerminalEvent, TerminalInfo};
-use crate::state::app_state::AppState;
+use crate::state::app_state::{AppState, RightPaneTabId};
 use crate::theme::components::{
     cursor_icon, gb_badge, gb_btn, gb_mini_icon_btn, BadgeTone, BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::theme::tokens::{SandTheme, ThemeMode};
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags as CellFlags;
-use alacritty_terminal::term::Config as TermConfig;
+use alacritty_terminal::term::{Config as TermConfig, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 use alacritty_terminal::Term;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_component::scroll::{ScrollableElement, ScrollbarHandle};
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 
 #[derive(Clone, Copy)]
 struct TermDims {
@@ -58,6 +61,56 @@ struct TermTab {
     runtime: Arc<Mutex<TermSessionRuntime>>,
 }
 
+const TERMINAL_LINE_HEIGHT: f32 = 16.5;
+const TERMINAL_FONT_SIZE: f32 = 12.0;
+
+#[derive(Clone)]
+struct TerminalScrollHandle {
+    bounds: Rc<Cell<Bounds<Pixels>>>,
+    runtime: Arc<Mutex<TermSessionRuntime>>,
+}
+
+impl ScrollbarHandle for TerminalScrollHandle {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.bounds.get()
+    }
+
+    fn offset(&self) -> Point<Pixels> {
+        let y = self
+            .runtime
+            .lock()
+            .map(|runtime| {
+                let grid = runtime.term.grid();
+                -px((grid.history_size() - grid.display_offset()) as f32 * TERMINAL_LINE_HEIGHT)
+            })
+            .unwrap_or_default();
+        point(px(0.0), y)
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            let grid = runtime.term.grid();
+            let history = grid.history_size() as i32;
+            let from_top = (-f32::from(offset.y) / TERMINAL_LINE_HEIGHT).round() as i32;
+            let delta = (history - from_top).clamp(0, history) - grid.display_offset() as i32;
+            runtime.term.scroll_display(Scroll::Delta(delta));
+        }
+    }
+
+    fn content_size(&self) -> Size<Pixels> {
+        let viewport = self.bounds.get().size;
+        let history = self
+            .runtime
+            .lock()
+            .map(|runtime| runtime.term.grid().history_size())
+            .unwrap_or(0);
+        size(
+            viewport.width,
+            viewport.height + px(history as f32 * TERMINAL_LINE_HEIGHT),
+        )
+    }
+}
+
 pub struct TerminalView {
     app: Entity<AppState>,
     focus_handle: FocusHandle,
@@ -66,12 +119,58 @@ pub struct TerminalView {
     tab_counter: usize,
     wake_notify: Arc<Notify>,
     _wake_task: Task<()>,
+    write_queue: mpsc::Sender<(String, Vec<u8>)>,
+    _write_task: Task<()>,
+    surface_bounds: Rc<Cell<Bounds<Pixels>>>,
+    wheel_pixels: f32,
 }
 
 impl TerminalView {
+    fn is_terminal_visible(app: &AppState) -> bool {
+        !app.setup_open
+            && !app.initializing
+            && app.right_pane_open
+            && app.right_pane_tab == RightPaneTabId::Terminal
+    }
+
     pub fn new(app: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        let initial_state = {
+            let s = app.read(cx);
+            (Self::is_terminal_visible(s), s.theme_mode())
+        };
+        let mut last_state = initial_state;
+        cx.observe(&app, move |_, app, cx| {
+            let next = {
+                let s = app.read(cx);
+                (Self::is_terminal_visible(s), s.theme_mode())
+            };
+            if next != last_state {
+                last_state = next;
+                if next.0 {
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
+
+        let (write_queue, mut writes) = mpsc::channel::<(String, Vec<u8>)>(128);
+        let terminals = app.read(cx).terminals.clone();
+        let rt = app.read(cx).tokio_rt.clone();
+        let write_task = cx.spawn(async move |this, cx| {
+            while let Some((id, bytes)) = writes.recv().await {
+                let terminals = terminals.clone();
+                let result = rt
+                    .spawn_blocking(move || terminals.write(&id, &bytes))
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+                if let Err(error) = result {
+                    let _ = this.update(cx, |view, cx| {
+                        view.app.update(cx, |app, cx| app.show_toast(error, cx));
+                    });
+                }
+            }
+        });
 
         // Event-driven 120fps wake task: sleeps at 0% CPU when idle, wakes immediately on PTY
         // output and coalesces rapid bursts at ~8ms (120Hz) frame pacing just like Zed's terminal!
@@ -86,6 +185,9 @@ impl TerminalView {
                     .await;
                 let keep_going = this
                     .update(cx, |v, cx| {
+                        if !Self::is_terminal_visible(v.app.read(cx)) {
+                            return;
+                        }
                         let mut any_dirty = false;
                         for tab in &v.tabs {
                             if let Ok(mut rt) = tab.runtime.lock() {
@@ -114,6 +216,10 @@ impl TerminalView {
             tab_counter: 0,
             wake_notify,
             _wake_task: wake_task,
+            write_queue,
+            _write_task: write_task,
+            surface_bounds: Rc::new(Cell::new(Bounds::default())),
+            wheel_pixels: 0.0,
         };
         view.open_new_tab(cx);
         view
@@ -201,10 +307,7 @@ impl TerminalView {
         let (shell, actual_cwd, remote) =
             match terminals.start(id.clone(), cwd.clone(), cols, rows, ssh, sink) {
                 Ok(TerminalInfo {
-                    shell,
-                    cwd,
-                    remote,
-                    ..
+                    shell, cwd, remote, ..
                 }) => (shell, cwd, remote),
                 Err(err) => {
                     if let Ok(mut rt) = runtime.lock() {
@@ -250,21 +353,120 @@ impl TerminalView {
         self.open_new_tab(cx);
     }
 
-    fn clear_active_tab(&mut self, cx: &mut Context<Self>) {
+    fn write_active(&self, data: &[u8], cx: &mut Context<Self>) {
         if let Some(id) = &self.active_tab_id {
-            let _ = self.app.read(cx).terminals.write(id, b"\x0c");
+            let error = if data.len() > 1024 * 1024 {
+                Some("Paste is too large (1 MB maximum)")
+            } else if self
+                .write_queue
+                .try_send((id.clone(), data.to_vec()))
+                .is_err()
+            {
+                Some("Terminal input is busy. Try again.")
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                self.app.update(cx, |app, cx| app.show_toast(error, cx));
+            }
         }
     }
 
-    fn write_active(&self, data: &[u8], cx: &Context<Self>) {
-        if let Some(id) = &self.active_tab_id {
-            let _ = self.app.read(cx).terminals.write(id, data);
+    fn scroll_history(&self, scroll: Scroll, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self
+            .tabs
+            .iter()
+            .find(|tab| Some(&tab.id) == self.active_tab_id.as_ref())
+        else {
+            return false;
+        };
+        let Ok(mut runtime) = tab.runtime.lock() else {
+            return false;
+        };
+        let before = runtime.term.grid().display_offset();
+        runtime.term.scroll_display(scroll);
+        if runtime.term.grid().display_offset() != before {
+            cx.notify();
+            true
+        } else {
+            false
         }
     }
 
-    fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn scroll_terminal(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
+        let delta = f32::from(event.delta.pixel_delta(px(TERMINAL_LINE_HEIGHT)).y);
+        if delta == 0.0 {
+            return;
+        }
+        if self.wheel_pixels.signum() != delta.signum() {
+            self.wheel_pixels = 0.0;
+        }
+        self.wheel_pixels += delta;
+        let rows = (self.wheel_pixels / TERMINAL_LINE_HEIGHT).trunc() as i32;
+        if rows == 0 {
+            return;
+        }
+        self.wheel_pixels -= rows as f32 * TERMINAL_LINE_HEIGHT;
+        let Some(tab) = self
+            .tabs
+            .iter()
+            .find(|tab| Some(&tab.id) == self.active_tab_id.as_ref())
+        else {
+            return;
+        };
+        let (mode, cols, height) = match tab.runtime.lock() {
+            Ok(runtime) => (*runtime.term.mode(), tab.cols, tab.rows),
+            Err(_) => return,
+        };
+        if !event.modifiers.shift && mode.intersects(TermMode::MOUSE_MODE) {
+            let bounds = self.surface_bounds.get();
+            let width = f32::from((bounds.size.width - px(22.0)).max(px(1.0)));
+            let relative = event.position - bounds.origin - point(px(11.0), px(11.0));
+            let x = (f32::from(relative.x) / (width / f32::from(cols))).floor() as i32 + 1;
+            let y = (f32::from(relative.y) / TERMINAL_LINE_HEIGHT).floor() as i32 + 1;
+            let x = x.clamp(1, i32::from(cols));
+            let y = y.clamp(1, i32::from(height));
+            let button = if rows > 0 { 64 } else { 65 };
+            let report = if mode.contains(TermMode::SGR_MOUSE) {
+                format!("\x1b[<{button};{x};{y}M").into_bytes()
+            } else {
+                vec![
+                    0x1b,
+                    b'[',
+                    b'M',
+                    button as u8 + 32,
+                    x.min(223) as u8 + 32,
+                    y.min(223) as u8 + 32,
+                ]
+            };
+            self.write_active(&report.repeat(rows.unsigned_abs().min(20) as usize), cx);
+            cx.stop_propagation();
+        } else if self.scroll_history(Scroll::Delta(rows), cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ks = &event.keystroke;
         let mods = &ks.modifiers;
+
+        if mods.shift && !mods.alt && !mods.control && !mods.platform {
+            let scroll = match ks.key.as_str() {
+                "pageup" => Some(Scroll::PageUp),
+                "pagedown" => Some(Scroll::PageDown),
+                _ => None,
+            };
+            if let Some(scroll) = scroll {
+                self.scroll_history(scroll, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
 
         // Copy / Paste shortcuts
         if (mods.control && mods.shift) || mods.platform {
@@ -345,10 +547,11 @@ impl TerminalView {
         let rows = tab.rows as usize;
         let cols = tab.cols as usize;
         let mut lines = Vec::with_capacity(rows);
+        let display_offset = grid.display_offset() as i32;
         for r in 0..rows {
             let mut s = String::with_capacity(cols);
             for c in 0..cols {
-                let cell = &grid[Line(r as i32)][Column(c)];
+                let cell = &grid[Line(r as i32 - display_offset)][Column(c)];
                 s.push(cell.c);
             }
             lines.push(s.trim_end().to_string());
@@ -372,7 +575,11 @@ impl TerminalView {
                     rows: rows as usize,
                 });
             }
-            let _ = self.app.read(cx).terminals.resize(&active_id, cols, rows);
+            let app = self.app.read(cx);
+            let terminals = app.terminals.clone();
+            app.tokio_rt.spawn_blocking(move || {
+                let _ = terminals.resize(&active_id, cols, rows);
+            });
         }
     }
 }
@@ -400,6 +607,19 @@ impl Render for TerminalView {
             .as_deref()
             .and_then(|id| self.tabs.iter().find(|t| t.id == id));
 
+        let scroll_handle = active_tab.map(|tab| TerminalScrollHandle {
+            bounds: self.surface_bounds.clone(),
+            runtime: tab.runtime.clone(),
+        });
+        let active_dimensions = active_tab.map(|tab| (tab.cols, tab.rows));
+        let active_id = self.active_tab_id.clone();
+        let bounds = self.surface_bounds.clone();
+        let terminal = cx.weak_entity();
+        let text_system = window.text_system();
+        let font = text_system.resolve_font(&font(FONT_MONO));
+        let char_width = text_system.advance(font, px(TERMINAL_FONT_SIZE), 'M')
+            .map(|size| f32::from(size.width)).unwrap_or(7.2).max(1.0);
+
         let (rendered_rows, meta_shell, meta_cwd, meta_remote, exit_code, error_msg) =
             if let Some(tab) = active_tab {
                 let mut rows_out: Vec<StyledText> = Vec::with_capacity(tab.rows as usize);
@@ -410,26 +630,35 @@ impl Render for TerminalView {
                     err_m = rt.error.clone();
                     let grid = rt.term.grid();
                     let cursor_pt = grid.cursor.point;
+                    let display_offset = grid.display_offset() as i32;
                     let rows = tab.rows as usize;
                     let cols = tab.cols as usize;
+                    let screen: Vec<_> = (0..rows)
+                        .flat_map(|row| {
+                            (0..cols).map(move |col| {
+                                let cell = &grid[Line(row as i32 - display_offset)][Column(col)];
+                                (cell.c, cell.flags, cell.fg, cell.bg)
+                            })
+                        })
+                        .collect();
+                    drop(rt);
 
-                    for r in 0..rows {
+                    for (r, row) in screen.chunks(cols).enumerate() {
                         let mut line_str = String::with_capacity(cols);
                         let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
                         let mut cur_run: Option<(usize, Hsla, Option<Hsla>, bool)> = None;
 
-                        for c in 0..cols {
-                            let cell = &grid[Line(r as i32)][Column(c)];
-                            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                        for (c, &(character, flags, fg, bg)) in row.iter().enumerate() {
+                            if flags.contains(CellFlags::WIDE_CHAR_SPACER) {
                                 continue;
                             }
-                            let is_cursor = r as i32 == cursor_pt.line.0
+                            let is_cursor = display_offset == 0 && r as i32 == cursor_pt.line.0
                                 && c == cursor_pt.column.0
                                 && exit_c.is_none();
-                            let inverse = cell.flags.contains(CellFlags::INVERSE);
-                            let bold = cell.flags.contains(CellFlags::BOLD);
-                            let mut fg = resolve_ansi_color(cell.fg, default_fg, term_bg, mode);
-                            let mut bg = resolve_ansi_bg(cell.bg, default_fg, term_bg, mode);
+                            let inverse = flags.contains(CellFlags::INVERSE);
+                            let bold = flags.contains(CellFlags::BOLD);
+                            let mut fg = resolve_ansi_color(fg, default_fg, term_bg, mode);
+                            let mut bg = resolve_ansi_bg(bg, default_fg, term_bg, mode);
                             if inverse {
                                 let prev_fg = fg;
                                 fg = bg.unwrap_or(term_bg);
@@ -439,7 +668,7 @@ impl Render for TerminalView {
                                 bg = Some(cursor_bg);
                                 fg = rgb(0xffffff).into();
                             }
-                            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                            let ch = if character == '\0' { ' ' } else { character };
                             let start = line_str.len();
                             line_str.push(ch);
 
@@ -512,6 +741,7 @@ impl Render for TerminalView {
             .child(
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .px(px(8.0))
                     .py(px(6.0))
                     .border_b_1()
@@ -519,15 +749,23 @@ impl Render for TerminalView {
                     .flex()
                     .items_center()
                     .gap(px(4.0))
-                    .overflow_hidden()
-                    .children(self.tabs.iter().enumerate().map(|(idx, tab)| {
+                    .child(
+                        div()
+                            .id("terminal-tabs-scroll")
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .children(self.tabs.iter().map(|tab| {
                         let active = self.active_tab_id.as_deref() == Some(tab.id.as_str());
                         let tid = tab.id.clone();
                         let tid_close = tab.id.clone();
                         let hover_bg = theme.bg_hover;
                         div()
-                            .id(SharedString::from(format!("term-tab-{idx}")))
+                            .id(SharedString::from(format!("term-tab-{}", tab.id)))
                             .h(px(26.0))
+                            .flex_shrink_0()
                             .px(px(8.0))
                             .rounded(px(7.0))
                             .bg(if active {
@@ -573,7 +811,7 @@ impl Render for TerminalView {
                             )
                             .child(
                                 gb_mini_icon_btn(
-                                    SharedString::from(format!("term-close-{idx}")),
+                                    SharedString::from(format!("term-close-{}", tab.id)),
                                     &theme,
                                     true,
                                 )
@@ -584,6 +822,8 @@ impl Render for TerminalView {
                                 })),
                             )
                     }))
+                            .overflow_x_scrollbar(),
+                    )
                     .child(
                         gb_mini_icon_btn("term-add-tab", &theme, false)
                             .child(cursor_icon("plus", 13.0, theme.text_secondary))
@@ -597,6 +837,7 @@ impl Render for TerminalView {
             .child(
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .px(px(10.0))
                     .py(px(5.0))
                     .border_b_1()
@@ -643,7 +884,7 @@ impl Render for TerminalView {
                                 gb_btn("term-clear-btn", &theme, BtnVariant::Ghost, true, false)
                                     .child("Clear")
                                     .on_click(cx.listener(|v, _, window, cx| {
-                                        v.clear_active_tab(cx);
+                                        v.write_active(b"\x0c", cx);
                                         window.focus(&v.focus_handle, cx);
                                     })),
                             )
@@ -655,14 +896,7 @@ impl Render for TerminalView {
                                         window.focus(&v.focus_handle, cx);
                                     })),
                             )
-                            .child(
-                                gb_btn("term-cols-btn", &theme, BtnVariant::Ghost, true, false)
-                                    .child("80×28")
-                                    .on_click(cx.listener(|v, _, _, cx| {
-                                        v.resize_active_grid(80, 28, cx);
-                                        cx.notify();
-                                    })),
-                            ),
+
                     ),
             )
             // Error banner if PTY failed
@@ -684,20 +918,50 @@ impl Render for TerminalView {
                 div()
                     .id("native-gpu-terminal-surface")
                     .track_focus(&self.focus_handle)
+                    .relative()
                     .flex_1()
+                    .min_h_0()
                     .w_full()
                     .bg(term_bg)
                     .p(px(10.0))
                     .overflow_hidden()
                     .font_family(FONT_MONO)
-                    .text_size(px(12.0))
-                    .line_height(px(16.5))
+                    .text_size(px(TERMINAL_FONT_SIZE))
+                    .line_height(px(TERMINAL_LINE_HEIGHT))
                     .border_1()
                     .border_color(if is_focused {
                         theme.agent_accent_border
                     } else {
                         SandTheme::transparent()
                     })
+                    .on_scroll(cx.listener(|view, event, _, cx| view.scroll_terminal(event, cx)))
+                    .child(canvas(
+                        move |measured, window, cx| {
+                            bounds.set(measured);
+                            let (width, height) = (f32::from(measured.size.width), f32::from(measured.size.height));
+                            let cols = ((width - 29.0) / char_width).floor().clamp(2.0, 1000.0) as u16;
+                            let rows = ((height - 22.0) / TERMINAL_LINE_HEIGHT).floor().clamp(2.0, 1000.0) as u16;
+                            if active_dimensions == Some((cols, rows)) {
+                                return;
+                            }
+                            if let Some(id) = active_id.as_deref() {
+                                let id = id.to_string();
+                                let terminal = terminal.clone();
+                                window.defer(cx, move |_, cx| {
+                                    let _ = terminal.update(cx, |view, cx| {
+                                        if view.active_tab_id.as_deref() == Some(id.as_str())
+                                            && view.tabs.iter().any(|tab| tab.id == id && (tab.cols, tab.rows) != (cols, rows))
+                                        {
+                                            view.resize_active_grid(cols, rows, cx);
+                                            cx.notify();
+                                        }
+                                    });
+                                });
+                            }
+                        },
+                        |_, _, _, _| {},
+                    ).absolute().inset_0())
+                    .when_some(scroll_handle, |surface, handle| surface.vertical_scrollbar(&handle))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|v, _, window, cx| {
@@ -737,7 +1001,7 @@ impl Render for TerminalView {
                             .flex_col()
                             .text_color(default_fg)
                             .children(rendered_rows.into_iter().map(|styled_line| {
-                                div().w_full().whitespace_nowrap().child(styled_line)
+                                div().w_full().h(px(TERMINAL_LINE_HEIGHT)).flex_shrink_0().whitespace_nowrap().child(styled_line)
                             }))
                     }),
             )
@@ -745,6 +1009,7 @@ impl Render for TerminalView {
             .child(
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .px(px(10.0))
                     .py(px(5.0))
                     .border_t_1()

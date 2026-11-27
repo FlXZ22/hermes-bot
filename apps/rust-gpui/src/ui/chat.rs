@@ -1,8 +1,12 @@
+use crate::harness::events::{ConversationMode, ExecutionState, SlashCommandInfo};
+use crate::harness::goal_worker::{GoalActivation, GoalPhase, GoalRuntimeSnapshot};
+use crate::harness::metrics::{format_elapsed_ms, MetricProvenance, SessionLiveMetrics};
+use crate::harness::ptc::inspect_ptc_tool_call;
 use crate::hermes::types::{
     ApprovalDecision, HermesApprovalRequest, HermesClarifyRequest, HermesMessage,
     HermesSessionUsage, HermesToolCall, MessageRole, ToolCallStatus,
 };
-use crate::state::app_state::{AppState, AttachmentFile, AvatarEditorTarget};
+use crate::state::app_state::{AppState, AttachmentFile, AvatarEditorTarget, RightPaneTabId};
 use crate::theme::bot_face::{bot_face_with_options, describe_tool, BotFaceOptions, BotFaceState};
 use crate::theme::components::{
     cursor_icon, format_tokens, gb_badge, gb_btn, gb_chip_btn, gb_dot, gb_mini_icon_btn,
@@ -10,7 +14,9 @@ use crate::theme::components::{
     BtnVariant, FONT_MONO, FONT_SANS,
 };
 use crate::theme::tokens::{resolve_bot_color, SandTheme};
-use crate::ui::markdown::{render_code_block, render_markdown, render_thinking_markdown};
+use crate::ui::markdown::{
+    render_code_block, render_highlighted_code_block, render_markdown, render_thinking_markdown,
+};
 use crate::ui::motion::{
     gpu_spinner, live_pulse_dot, pill_enter, popover_enter, typing_dots, view_enter, EntranceKey,
     SpringValue,
@@ -25,18 +31,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/model", "Open model & provider picker"),
-    ("/restart", "Restart Hermes backend & reload providers"),
-    ("/boards", "Switch to Session Boards (Kanban)"),
-    ("/compress", "Compress conversation context"),
-    ("/branch", "Branch this conversation"),
-    ("/skills", "Manage Hermes skills & MCP"),
-    ("/cron", "Manage scheduled automations"),
-    ("/memory", "Inspect SOUL.md & memories"),
-    ("/clear", "Start a fresh chat session"),
-];
 
 const STARTER_PROMPTS: &[(&str, &str, &str, &str)] = &[
     (
@@ -100,27 +94,39 @@ fn thinking_is_live(msg: &HermesMessage) -> bool {
         && !msg.tool_calls.iter().any(|t| t.status == ToolCallStatus::Running)
 }
 
+/// Collapsed-by-default activity disclosure:
+/// - Collapsed by default during streaming AND auto-collapses when the turn completes.
+/// - User can expand while streaming (`expanded_live`), which clears automatically on completion.
+/// - User can reopen any completed or failed turn (`expanded_done`) at any time.
 #[derive(Default)]
-struct ThinkingDisclosure {
-    expanded: HashSet<String>,
-    collapsed_live: HashSet<String>,
+struct ActivityDisclosure {
+    expanded_live: HashSet<String>,
+    expanded_done: HashSet<String>,
 }
 
-impl ThinkingDisclosure {
+impl ActivityDisclosure {
     fn is_expanded(&self, msg: &HermesMessage) -> bool {
-        if thinking_is_live(msg) {
-            !self.collapsed_live.contains(&msg.id)
+        if msg.streaming {
+            self.expanded_live.contains(&msg.id)
         } else {
-            self.expanded.contains(&msg.id)
+            self.expanded_done.contains(&msg.id)
         }
     }
 
-    fn toggle(&mut self, id: &str, live: bool) {
-        // Live auto-expansion never writes to the set of explicitly opened disclosures.
-        let toggles = if live { &mut self.collapsed_live } else { &mut self.expanded };
-        if !toggles.remove(id) {
-            toggles.insert(id.to_owned());
+    fn toggle(&mut self, id: &str, streaming: bool) {
+        let target = if streaming {
+            &mut self.expanded_live
+        } else {
+            &mut self.expanded_done
+        };
+        if !target.remove(id) {
+            target.insert(id.to_owned());
         }
+    }
+
+    fn prune_completed(&mut self, messages: &[HermesMessage]) {
+        self.expanded_live
+            .retain(|id| messages.iter().any(|m| m.id == *id && m.streaming));
     }
 }
 
@@ -140,9 +146,9 @@ pub struct ChatView {
     editing_title: bool,
     attach_menu_open: bool,
     board_menu_open: bool,
-    thinking_disclosure: ThinkingDisclosure,
+    activity_disclosure: ActivityDisclosure,
     expanded_tools: HashSet<String>,
-    collapsed_groups: HashSet<String>,
+    ptc_json_mode: HashSet<String>,
     // Virtualized Zed ListState + 120Hz smooth scroller for chat transcript
     list_state: ListState,
     smooth_scroller: SmoothScroller,
@@ -168,7 +174,11 @@ impl ChatView {
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Session title"));
 
         cx.observe(&app, |_, app_e, cx| {
-            if app_e.read(cx).active_view == crate::state::app_state::AppViewId::Chat {
+            let s = app_e.read(cx);
+            if !s.setup_open
+                && !s.initializing
+                && s.active_view == crate::state::app_state::AppViewId::Chat
+            {
                 cx.notify();
             }
         })
@@ -183,19 +193,14 @@ impl ChatView {
         })
         .detach();
 
-        cx.subscribe_in(&composer, window, |this, state, ev: &InputEvent, window, cx| {
+        cx.subscribe_in(&composer, window, |this, _state, ev: &InputEvent, window, cx| {
             match ev {
                 InputEvent::Change => {
                     cx.notify();
                 }
                 InputEvent::PressEnter { shift, .. } => {
-                    if !*shift {
-                        let text = state.read(cx).value().to_string();
-                        if !text.trim().is_empty() || !this.app.read(cx).attachments.is_empty() {
-                            state.update(cx, |st, cx| st.set_value("", window, cx));
-                            this.app.update(cx, |s, cx| s.send_message(text, cx));
-                            cx.notify();
-                        }
+                    if !*shift && !this.app.read(cx).active_is_streaming() {
+                        this.submit_composer(window, cx);
                     }
                 }
                 _ => {}
@@ -234,9 +239,9 @@ impl ChatView {
             editing_title: false,
             attach_menu_open: false,
             board_menu_open: false,
-            thinking_disclosure: ThinkingDisclosure::default(),
+            activity_disclosure: ActivityDisclosure::default(),
             expanded_tools: HashSet::new(),
-            collapsed_groups: HashSet::new(),
+            ptc_json_mode: HashSet::new(),
             list_state,
             smooth_scroller,
             synced_session_id: None,
@@ -261,17 +266,20 @@ impl ChatView {
         if text.trim().is_empty() && self.app.read(cx).attachments.is_empty() {
             return;
         }
-        self.composer
-            .update(cx, |st, cx| st.set_value("", window, cx));
-        self.app.update(cx, |s, cx| s.send_message(text, cx));
-        self.smooth_scroller.cancel();
-        self.list_state.set_follow_mode(FollowMode::Tail);
-        self.list_state.scroll_to_end();
+        let accepted = self.app.update(cx, |s, cx| s.send_message(text, cx));
+        if accepted {
+            self.composer
+                .update(cx, |st, cx| st.set_value("", window, cx));
+            self.smooth_scroller.cancel();
+            self.list_state.set_follow_mode(FollowMode::Tail);
+            self.list_state.scroll_to_end();
+        }
         cx.notify();
     }
 
     fn pick_attachment_files(&mut self, cx: &mut Context<Self>) {
         self.attach_menu_open = false;
+        let rt = self.app.read(cx).tokio_rt.clone();
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -280,40 +288,46 @@ impl ChatView {
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
-                let mut loaded = Vec::new();
-                for path in paths {
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        if meta.len() > 50 * 1024 * 1024 {
-                            continue;
-                        }
-                        if let Ok(bytes) = std::fs::read(&path) {
-                            let name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "file".into());
-                            let ext = path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("")
-                                .to_lowercase();
-                            let mime = match ext.as_str() {
-                                "png" => "image/png",
-                                "jpg" | "jpeg" => "image/jpeg",
-                                "webp" => "image/webp",
-                                "gif" => "image/gif",
-                                "pdf" => "application/pdf",
-                                _ => "application/octet-stream",
+                let loaded = rt
+                    .spawn_blocking(move || {
+                        let mut loaded = Vec::new();
+                        for path in paths {
+                            if let Ok(meta) = std::fs::metadata(&path) {
+                                if meta.len() > 50 * 1024 * 1024 {
+                                    continue;
+                                }
+                                if let Ok(bytes) = std::fs::read(&path) {
+                                    let name = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "file".into());
+                                    let ext = path
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("")
+                                        .to_lowercase();
+                                    let mime = match ext.as_str() {
+                                        "png" => "image/png",
+                                        "jpg" | "jpeg" => "image/jpeg",
+                                        "webp" => "image/webp",
+                                        "gif" => "image/gif",
+                                        "pdf" => "application/pdf",
+                                        _ => "application/octet-stream",
+                                    }
+                                    .to_string();
+                                    loaded.push(AttachmentFile {
+                                        name,
+                                        path: path.to_string_lossy().into_owned(),
+                                        mime,
+                                        bytes: std::sync::Arc::new(bytes),
+                                    });
+                                }
                             }
-                            .to_string();
-                            loaded.push(AttachmentFile {
-                                name,
-                                path: path.to_string_lossy().into_owned(),
-                                mime,
-                                bytes,
-                            });
                         }
-                    }
-                }
+                        loaded
+                    })
+                    .await
+                    .unwrap_or_default();
                 if !loaded.is_empty() {
                     let _ = this.update(cx, |v, cx| {
                         v.app.update(cx, |s, cx| {
@@ -375,7 +389,18 @@ impl Render for ChatView {
             .cloned();
 
         let chat = s.active_chat();
+        let exec_state = chat.execution_state();
         let bot_state = chat.bot_state();
+        let reduced_motion = s.reduced_motion();
+        let conv_mode = s.active_conversation_mode();
+        let mode_locked = s.is_active_mode_locked();
+        let active_project = s.active_work_project().cloned();
+        let active_work_cwd = s.active_work_cwd();
+        let active_goal = s.active_goal_snapshot();
+        let metrics = s.active_metrics();
+        let git_status = s.inspector_git.clone();
+        let subagents = s.active_subagents();
+        let all_slash_commands = s.slash_commands.clone();
         let has_messages = !chat.messages.is_empty();
         let loading_history = chat.loading_history;
         let is_streaming = chat.is_streaming;
@@ -393,18 +418,33 @@ impl Render for ChatView {
         );
 
         let draft = self.composer.read(cx).value().to_string();
-        let placeholder = format!("Message {bot_name}... (type / for commands)");
+        let placeholder = if conv_mode == ConversationMode::Work {
+            format!("Work with {bot_name}… (type / for commands or /goal)")
+        } else {
+            format!("Message {bot_name}… (type / for commands)")
+        };
         if self.composer.read(cx).presentation().placeholder().as_ref() != placeholder {
             self.composer
                 .update(cx, |state, cx| state.set_placeholder(placeholder, window, cx));
         }
-        let matching_slash: Vec<(&str, &str)> = if draft.starts_with('/') && !draft.contains(' ') {
-            let q = draft.to_lowercase();
-            SLASH_COMMANDS
-                .iter()
-                .copied()
-                .filter(|(cmd, _)| cmd.starts_with(&q))
-                .collect()
+        let matching_slash: Vec<SlashCommandInfo> = if draft.starts_with('/') && !draft.contains('\n') {
+            let token = draft.split_whitespace().next().unwrap_or("/").to_lowercase();
+            if draft.contains(' ') {
+                Vec::new()
+            } else {
+                let q = token.trim_start_matches('/');
+                all_slash_commands
+                    .into_iter()
+                    .filter(|c| {
+                        q.is_empty()
+                            || c.name.to_lowercase().contains(q)
+                            || c.description.to_lowercase().contains(q)
+                            || c.category.to_lowercase().contains(q)
+                            || c.aliases.iter().any(|a| a.to_lowercase().contains(q))
+                    })
+                    .take(14)
+                    .collect()
+            }
         } else {
             Vec::new()
         };
@@ -472,7 +512,11 @@ impl Render for ChatView {
                                         bot_av.as_ref().and_then(|a| a.color_id.as_deref()),
                                         24.0,
                                         bot_state,
-                                        BotFaceOptions { slot_key: "chat-title", ..Default::default() },
+                                        BotFaceOptions {
+                                            slot_key: "chat-title",
+                                            is_static: bot_state == BotFaceState::Idle,
+                                            ..Default::default()
+                                        },
                                     ))
                                     .child(div().w(px(220.0)).max_w_full().min_w_0().child(Input::new(&self.title_input).h(px(24.0))))
                                     .into_any_element()
@@ -535,7 +579,11 @@ impl Render for ChatView {
                                                 bot_av.as_ref().and_then(|a| a.color_id.as_deref()),
                                                 24.0,
                                                 bot_state,
-                                                BotFaceOptions { slot_key: "chat-title", ..Default::default() },
+                                                BotFaceOptions {
+                                                    slot_key: "chat-title",
+                                                    is_static: bot_state == BotFaceState::Idle,
+                                                    ..Default::default()
+                                                },
                                             )),
                                     )
                                     .child(
@@ -553,10 +601,14 @@ impl Render for ChatView {
                                     .into_any_element()
                             }),
                     )
+                    // Centered Chat | Work Segmented Toggle (unlocked before first message; locked badge after)
+                    .child(self.render_mode_toggle(&theme, conv_mode, mode_locked, active_project.as_ref(), cx))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
-                            .flex_shrink_0()
+                            .justify_end()
                             .items_center()
                             .gap(px(6.0))
                             .when(active_session_id.is_some(), |d| {
@@ -608,14 +660,36 @@ impl Render for ChatView {
                                         this.app.update(cx, |s, cx| {
                                             s.right_pane_open = !s.right_pane_open;
                                             if s.right_pane_open {
-                                                s.refresh_inspector_files(cx);
+                                                match s.right_pane_tab {
+                                                    crate::state::app_state::RightPaneTabId::Files => {
+                                                        s.refresh_inspector_files(cx);
+                                                    }
+                                                    crate::state::app_state::RightPaneTabId::Git => {
+                                                        s.refresh_inspector_git(cx);
+                                                    }
+                                                    _ => {}
+                                                }
                                             }
+                                            s.bump_shell();
                                             cx.notify();
                                         });
                                     })),
                             ),
                     ),
             )
+            // Work Mode Live Context & Metrics Bar (project, dir, git branch/+/-, elapsed, tokens/sec)
+            .when(conv_mode == ConversationMode::Work, |d| {
+                d.child(self.render_work_metrics_bar(
+                    &theme,
+                    active_project.as_ref(),
+                    active_work_cwd.as_deref(),
+                    git_status.as_ref(),
+                    &metrics,
+                    exec_state,
+                    subagents.len(),
+                    cx,
+                ))
+            })
             // Center Body: Loading | Empty Hero | Transcript
             .child(if !has_messages && loading_history {
                 div()
@@ -668,16 +742,28 @@ impl Render for ChatView {
                             .line_height(px(30.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme.text_primary)
-                            .child(bot_name),
+                            .child(if conv_mode == ConversationMode::Work {
+                                "What should we work on?".to_string()
+                            } else {
+                                bot_name
+                            }),
                     )
                     .child(
                         div()
-                            .max_w(px(440.0))
+                            .max_w(px(460.0))
                             .text_center()
                             .text_size(px(14.0))
                             .line_height(px(20.0))
                             .text_color(theme.text_secondary)
-                            .child("Your agent, ready to work. Start a conversation or pick up where you left off."),
+                            .child(if conv_mode == ConversationMode::Work {
+                                if let Some(ref proj) = active_project {
+                                    format!("Working in {} ({}) · tools, Git diffs, trajectory & /goal ready.", proj.name, proj.cwd)
+                                } else {
+                                    "Select a project directory on your Hermes server to unlock tools, diffs, trajectory, and /goal.".to_string()
+                                }
+                            } else {
+                                "Your agent, ready to work. Start a conversation or pick up where you left off.".to_string()
+                            }),
                     )
                     // 2x2 starter prompt cards
                     .child(
@@ -759,6 +845,8 @@ impl Render for ChatView {
                     bot_av.as_ref().and_then(|a| a.shape_id.as_deref()),
                     bot_av.as_ref().and_then(|a| a.color_id.as_deref()),
                     bot_state,
+                    exec_state,
+                    reduced_motion,
                     cx,
                 )
                 .into_any_element()
@@ -783,13 +871,20 @@ impl Render for ChatView {
                             .flex()
                             .flex_col()
                             .relative()
-                            // Slash command autocomplete popover
+                            // Persistent Goal Bar docked above composer
+                            .when_some(active_goal.as_ref(), |d, snap| {
+                                d.child(self.render_goal_bar(&theme, snap, cx))
+                            })
+                            // Searchable Hermes slash command discovery popover
                             .when(!matching_slash.is_empty(), |d| {
                                 d.child(popover_enter("slash-completions-enter",
                                     div()
+                                        .id("slash-completions-popover")
                                         .mb(px(8.0))
-                                        .w(px(360.0))
+                                        .w(px(480.0))
                                         .max_w_full()
+                                        .max_h(px(280.0))
+                                        .overflow_y_scroll()
                                         .p(px(5.0))
                                         .rounded(px(14.0))
                                         .bg(theme.bg_elevated)
@@ -798,11 +893,20 @@ impl Render for ChatView {
                                         .flex()
                                         .flex_col()
                                         .gap(px(2.0))
-                                        .children(matching_slash.into_iter().map(|(cmd, desc)| {
-                                            let cmd_s = cmd.to_string();
+                                        .children(matching_slash.into_iter().enumerate().map(|(idx, cmd)| {
+                                            let cmd_name = cmd.name.clone();
+                                            let has_args = !cmd.args_hint.trim().is_empty();
+                                            let cap_badge = cmd.capability.badge();
+                                            let cap_tone = match cmd.capability {
+                                                crate::harness::events::CommandCapability::Available => BadgeTone::Muted,
+                                                crate::harness::events::CommandCapability::RequiresTerminal => BadgeTone::Warning,
+                                                crate::harness::events::CommandCapability::RequiresConfig => BadgeTone::Info,
+                                                crate::harness::events::CommandCapability::Unavailable => BadgeTone::Danger,
+                                            };
                                             div()
-                                                .id(SharedString::from(format!("slash-{cmd}")))
+                                                .id(SharedString::from(format!("slash-{idx}-{}", cmd.name)))
                                                 .w_full()
+                                                .flex_shrink_0()
                                                 .px(px(9.0))
                                                 .py(px(7.0))
                                                 .rounded(px(9.0))
@@ -813,26 +917,61 @@ impl Render for ChatView {
                                                 .cursor_pointer()
                                                 .hover(|st| st.bg(theme.bg_active))
                                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                                    this.composer.update(cx, |st, cx| {
-                                                        st.set_value("", window, cx);
-                                                    });
-                                                    this.app.update(cx, |s, cx| {
-                                                        s.send_message(cmd_s.clone(), cx);
-                                                    });
+                                                    if has_args {
+                                                        let prefill = format!("{cmd_name} ");
+                                                        this.composer.update(cx, |st, cx| {
+                                                            st.set_value(prefill, window, cx);
+                                                        });
+                                                    } else {
+                                                        let accepted = this.app.update(cx, |s, cx| {
+                                                            s.send_message(cmd_name.clone(), cx)
+                                                        });
+                                                        if accepted {
+                                                            this.composer.update(cx, |st, cx| {
+                                                                st.set_value("", window, cx);
+                                                            });
+                                                        }
+                                                    }
+                                                    cx.notify();
                                                 }))
                                                 .child(
                                                     div()
-                                                        .font_family(FONT_MONO)
-                                                        .text_size(px(12.5))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .child(cmd),
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .gap(px(1.0))
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap(px(6.0))
+                                                                .child(
+                                                                    div()
+                                                                        .font_family(FONT_MONO)
+                                                                        .text_size(px(12.5))
+                                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                                        .text_color(theme.text_primary)
+                                                                        .child(cmd.name),
+                                                                )
+                                                                .when(!cmd.args_hint.is_empty(), |d| {
+                                                                    d.child(
+                                                                        clipped_label(cmd.args_hint)
+                                                                            .font_family(FONT_MONO)
+                                                                            .text_size(px(11.0))
+                                                                            .text_color(theme.text_tertiary),
+                                                                    )
+                                                                }),
+                                                        )
+                                                        .child(
+                                                            clipped_label(cmd.description)
+                                                                .text_size(px(11.5))
+                                                                .text_color(theme.text_secondary),
+                                                        ),
                                                 )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(12.0))
-                                                        .text_color(theme.text_tertiary)
-                                                        .child(desc),
-                                                )
+                                                .when_some(cap_badge, |d, b| {
+                                                    d.child(gb_badge(&theme, cap_tone, b))
+                                                })
                                         })),
                                 ))
                             })
@@ -841,10 +980,13 @@ impl Render for ChatView {
                                 let sid_assign = active_session_id.clone();
                                 d.child(popover_enter("board-assignment-enter",
                                     div()
+                                        .id("board-assignment-popover")
                                         .mb(px(8.0))
                                         .self_end()
                                         .w(px(240.0))
                                         .max_w_full()
+                                        .max_h(px(260.0))
+                                        .overflow_y_scroll()
                                         .min_w_0()
                                         .p(px(5.0))
                                         .rounded(px(14.0))
@@ -1033,6 +1175,9 @@ impl Render for ChatView {
                             .when(!attachments.is_empty(), |d| {
                                 d.child(
                                     div()
+                                        .id("chat-attachments-strip")
+                                        .max_h(px(84.0))
+                                        .overflow_y_scroll()
                                         .px(px(12.0))
                                         .pb(px(8.0))
                                         .flex()
@@ -1185,13 +1330,550 @@ impl Render for ChatView {
                                                     }))
                                             })
                                     }),
-                            ),
+                            )
+                            // Work Mode attached bottom action strip (matches reference screenshot: Choose project · Files · Git · Agents · Trajectory · /goal)
+                            .when(conv_mode == ConversationMode::Work, |d| {
+                                d.child(self.render_work_composer_footer(
+                                    &theme,
+                                    active_project.as_ref(),
+                                    active_work_cwd.as_deref(),
+                                    cx,
+                                ))
+                            }),
                     ),
             )
     }
 }
 
 impl ChatView {
+    fn render_mode_toggle(
+        &self,
+        theme: &SandTheme,
+        mode: ConversationMode,
+        locked: bool,
+        project: Option<&crate::harness::events::WorkProject>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        if locked {
+            let label = if mode == ConversationMode::Work {
+                if let Some(p) = project {
+                    format!("Work · {}", p.name)
+                } else {
+                    "Work".to_string()
+                }
+            } else {
+                "Chat".to_string()
+            };
+            return div()
+                .id("chat-mode-locked-pill")
+                .flex_shrink_0()
+                .h(px(30.0))
+                .px(px(11.0))
+                .rounded_full()
+                .bg(theme.bg_chrome)
+                .border_1()
+                .border_color(theme.border_default)
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(px(12.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text_secondary)
+                .cursor_pointer()
+                .hover(|st| st.bg(theme.bg_elevated))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.app.update(cx, |s, cx| {
+                        s.show_toast(
+                            "Mode is locked after the first message. Click + to start a new conversation in another mode.",
+                            cx,
+                        );
+                    });
+                }))
+                .child(cursor_icon(
+                    if mode == ConversationMode::Work { "terminal" } else { "chat-bubble" },
+                    12.5,
+                    if mode == ConversationMode::Work { theme.agent_accent } else { theme.text_secondary },
+                ))
+                .child(clipped_label(label).max_w(px(180.0)))
+                .child(cursor_icon("lock", 10.5, theme.text_tertiary));
+        }
+
+        // Centered Chat | Work segmented pill toggle (matches Grok Bot dark/light styling)
+        div()
+            .id("chat-work-mode-toggle")
+            .flex_shrink_0()
+            .h(px(34.0))
+            .p(px(3.0))
+            .rounded_full()
+            .bg(theme.bg_chrome)
+            .border_1()
+            .border_color(theme.border_default)
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .children([ConversationMode::Chat, ConversationMode::Work].into_iter().map(|opt| {
+                let active = mode == opt;
+                div()
+                    .id(SharedString::from(format!("mode-seg-{}", opt.as_str())))
+                    .h_full()
+                    .px(px(18.0))
+                    .rounded_full()
+                    .bg(if active {
+                        theme.bg_elevated
+                    } else {
+                        SandTheme::transparent()
+                    })
+                    .text_size(px(12.5))
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if active {
+                        theme.text_primary
+                    } else {
+                        theme.text_secondary
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|st| st.text_color(theme.text_primary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.app.update(cx, |s, cx| s.set_draft_mode(opt, cx));
+                    }))
+                    .child(opt.label())
+            }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_work_metrics_bar(
+        &self,
+        theme: &SandTheme,
+        project: Option<&crate::harness::events::WorkProject>,
+        cwd: Option<&str>,
+        git: Option<&crate::backend::workspace::GitWorkspaceStatus>,
+        metrics: &SessionLiveMetrics,
+        exec_state: ExecutionState,
+        subagent_count: usize,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let total_tok = metrics.total_tokens();
+        let tps = metrics.output_tps();
+        let elapsed = metrics.elapsed_ms().map(format_elapsed_ms);
+
+        let tok_label = match (total_tok.value, total_tok.provenance) {
+            (Some(v), MetricProvenance::Measured) => format!("{} tok", format_tokens(v)),
+            (Some(v), MetricProvenance::Estimated) => format!("~{} tok (est.)", format_tokens(v)),
+            _ => "tok: unavailable".to_string(),
+        };
+        let tps_label = match (tps.tokens_per_sec, tps.provenance) {
+            (Some(r), MetricProvenance::Measured) => format!("{:.1} tok/s ({:.0}s)", r, tps.window_secs),
+            (Some(r), MetricProvenance::Estimated) => format!("~{:.1} tok/s (est.)", r),
+            _ => "tok/s: unavailable".to_string(),
+        };
+
+        div()
+            .w_full()
+            .min_w_0()
+            .flex_shrink_0()
+            .px(px(16.0))
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(theme.border_hairline)
+            .bg(theme.bg_pane)
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(px(8.0))
+            .text_size(px(11.5))
+            .text_color(theme.text_secondary)
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("work-bar-project")
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(7.0))
+                            .bg(theme.bg_card)
+                            .border_1()
+                            .border_color(theme.border_subtle)
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(theme.bg_hover))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.app.update(cx, |s, cx| s.open_project_picker(cx));
+                            }))
+                            .child(cursor_icon("folder", 12.0, theme.agent_accent))
+                            .child(clipped_label(
+                                project
+                                    .map(|p| p.name.clone())
+                                    .unwrap_or_else(|| "Select project".into()),
+                            ).max_w(px(140.0)).text_color(theme.text_primary))
+                            .when_some(cwd, |d, c| {
+                                d.child(
+                                    clipped_label(c.to_string())
+                                        .max_w(px(220.0))
+                                        .font_family(FONT_MONO)
+                                        .text_size(px(10.5))
+                                        .text_color(theme.text_tertiary),
+                                )
+                            }),
+                    )
+                    .when_some(git.filter(|g| g.is_repo), |d, g| {
+                        d.child(
+                            div()
+                                .id("work-bar-git")
+                                .px(px(7.0))
+                                .py(px(2.0))
+                                .rounded(px(7.0))
+                                .bg(theme.bg_card)
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .cursor_pointer()
+                                .hover(|st| st.bg(theme.bg_hover))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.app.update(cx, |s, cx| {
+                                        s.right_pane_open = true;
+                                        s.right_pane_tab = RightPaneTabId::Git;
+                                        s.refresh_inspector_git(cx);
+                                        s.bump_shell();
+                                        cx.notify();
+                                    });
+                                }))
+                                .child(cursor_icon("git-branch", 11.5, theme.text_tertiary))
+                                .child(
+                                    clipped_label(if g.branch.is_empty() {
+                                        "HEAD".into()
+                                    } else {
+                                        g.branch.clone()
+                                    })
+                                    .max_w(px(120.0))
+                                    .font_family(FONT_MONO)
+                                    .text_size(px(10.5)),
+                                )
+                                .when(!g.changed_files.is_empty() || g.total_added > 0 || g.total_removed > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(10.5))
+                                            .text_color(theme.success_text)
+                                            .child(format!("+{}", g.total_added)),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(10.5))
+                                            .text_color(theme.danger_text)
+                                            .child(format!("-{}", g.total_removed)),
+                                    )
+                                }),
+                        )
+                    })
+                    .when(subagent_count > 0, |d| {
+                        d.child(
+                            div()
+                                .id("work-bar-subagents")
+                                .px(px(7.0))
+                                .py(px(2.0))
+                                .rounded(px(7.0))
+                                .bg(theme.bg_card)
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .cursor_pointer()
+                                .hover(|st| st.bg(theme.bg_hover))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.app.update(cx, |s, cx| {
+                                        s.right_pane_open = true;
+                                        s.right_pane_tab = RightPaneTabId::Agents;
+                                        s.bump_shell();
+                                        cx.notify();
+                                    });
+                                }))
+                                .child(cursor_icon("layers", 11.0, theme.agent_accent))
+                                .child(format!("{subagent_count} agents")),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(10.0))
+                    .font_family(FONT_MONO)
+                    .text_size(px(10.5))
+                    .text_color(theme.text_tertiary)
+                    .when(exec_state != ExecutionState::Idle, |d| {
+                        d.child(div().text_color(theme.agent_accent).child(exec_state.label()))
+                    })
+                    .when_some(elapsed, |d, el| d.child(el))
+                    .child(tok_label)
+                    .child(tps_label),
+            )
+    }
+
+    fn render_work_composer_footer(
+        &self,
+        theme: &SandTheme,
+        project: Option<&crate::harness::events::WorkProject>,
+        cwd: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let proj_lbl = project
+            .map(|p| p.name.clone())
+            .or_else(|| {
+                cwd.and_then(|c| std::path::Path::new(c).file_name().map(|n| n.to_string_lossy().to_string()))
+            })
+            .unwrap_or_else(|| "Choose project".into());
+
+        div()
+            .w_full()
+            .mt(px(6.0))
+            .px(px(12.0))
+            .py(px(7.0))
+            .rounded(px(14.0))
+            .bg(theme.bg_card)
+            .border_1()
+            .border_color(theme.border_subtle)
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(px(8.0))
+            .text_size(px(12.0))
+            .text_color(theme.text_secondary)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .id("work-footer-project")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .cursor_pointer()
+                            .hover(|st| st.text_color(theme.text_primary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.app.update(cx, |s, cx| s.open_project_picker(cx));
+                            }))
+                            .child(cursor_icon("folder", 13.0, theme.text_secondary))
+                            .child(clipped_label(proj_lbl).max_w(px(180.0))),
+                    )
+                    .child(
+                        div()
+                            .id("work-footer-files")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .cursor_pointer()
+                            .hover(|st| st.text_color(theme.text_primary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.app.update(cx, |s, cx| {
+                                    s.right_pane_open = true;
+                                    s.right_pane_tab = RightPaneTabId::Files;
+                                    s.refresh_inspector_files(cx);
+                                    s.bump_shell();
+                                    cx.notify();
+                                });
+                            }))
+                            .child(cursor_icon("file", 13.0, theme.text_secondary))
+                            .child("Files"),
+                    )
+                    .child(
+                        div()
+                            .id("work-footer-agents")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .cursor_pointer()
+                            .hover(|st| st.text_color(theme.text_primary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.app.update(cx, |s, cx| {
+                                    s.right_pane_open = true;
+                                    s.right_pane_tab = RightPaneTabId::Agents;
+                                    s.bump_shell();
+                                    cx.notify();
+                                });
+                            }))
+                            .child(cursor_icon("layers", 13.0, theme.text_secondary))
+                            .child("Agents"),
+                    )
+                    .child(
+                        div()
+                            .id("work-footer-trajectory")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .cursor_pointer()
+                            .hover(|st| st.text_color(theme.text_primary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.app.update(cx, |s, cx| {
+                                    s.inspect_tool_in_trajectory(None, cx);
+                                });
+                            }))
+                            .child(cursor_icon("activity", 13.0, theme.text_secondary))
+                            .child("Trajectory"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("work-footer-goal")
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .cursor_pointer()
+                    .text_color(theme.text_tertiary)
+                    .hover(|st| st.text_color(theme.text_primary))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.composer
+                            .update(cx, |st, cx| st.set_value("/goal ", window, cx));
+                        cx.notify();
+                    }))
+                    .child(cursor_icon("target", 12.5, theme.agent_accent))
+                    .child("/goal"),
+            )
+    }
+
+    fn render_goal_bar(
+        &self,
+        theme: &SandTheme,
+        snap: &GoalRuntimeSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let g = &snap.goal;
+        let phase_tone = match g.phase {
+            GoalPhase::Active => BadgeTone::Accent,
+            GoalPhase::Paused => BadgeTone::Warning,
+            GoalPhase::Blocked | GoalPhase::Failed => BadgeTone::Danger,
+            GoalPhase::Complete => BadgeTone::Success,
+            GoalPhase::Cancelled => BadgeTone::Muted,
+        };
+        let worker_label = if !snap.worker_connected {
+            "Worker offline"
+        } else if snap.recovered_from_restart && snap.activation == GoalActivation::Disarmed {
+            "Recovered · disarmed (Resume to continue)"
+        } else if snap.activation == GoalActivation::Armed {
+            "Worker armed"
+        } else {
+            "Worker idle"
+        };
+
+        div()
+            .w_full()
+            .mb(px(8.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .rounded(px(14.0))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border_default)
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .flex_wrap()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(cursor_icon("target", 13.0, theme.agent_accent))
+                            .child(gb_badge(theme, phase_tone, g.phase.label()))
+                            .child(
+                                clipped_label(g.objective.clone())
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text_primary),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .when(g.phase == GoalPhase::Active && snap.activation == GoalActivation::Armed, |d| {
+                                d.child(
+                                    gb_btn("goal-pause-btn", theme, BtnVariant::Secondary, true, false)
+                                        .child("Pause")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.app.update(cx, |s, cx| s.pause_active_goal(cx));
+                                        })),
+                                )
+                            })
+                            .when(
+                                matches!(g.phase, GoalPhase::Paused | GoalPhase::Blocked)
+                                    || (g.phase == GoalPhase::Active && snap.activation == GoalActivation::Disarmed),
+                                |d| {
+                                    d.child(
+                                        gb_btn("goal-resume-btn", theme, BtnVariant::Primary, true, !snap.worker_connected)
+                                            .child("Resume")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.app.update(cx, |s, cx| s.resume_active_goal(cx));
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(!g.phase.is_terminal(), |d| {
+                                d.child(
+                                    gb_btn("goal-complete-btn", theme, BtnVariant::Ghost, true, false)
+                                        .child("Complete")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.app.update(cx, |s, cx| s.complete_active_goal(cx));
+                                        })),
+                                )
+                                .child(
+                                    gb_btn("goal-cancel-btn", theme, BtnVariant::Danger, true, false)
+                                        .child("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.app.update(cx, |s, cx| s.cancel_active_goal(cx));
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(10.0))
+                    .font_family(FONT_MONO)
+                    .text_size(px(10.5))
+                    .text_color(theme.text_tertiary)
+                    .child(format!("Round {}/{}", g.rounds_started, g.max_rounds))
+                    .child(worker_label)
+                    .when_some(g.max_tokens, |d, mt| {
+                        d.child(format!("Tokens {}/{}", format_tokens(g.tokens_used), format_tokens(mt)))
+                    })
+                    .when_some(g.stop_reason.as_ref().or(g.blocked_message.as_ref()), |d, reason| {
+                        d.child(clipped_label(reason.clone()).text_color(theme.text_secondary))
+                    }),
+            )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_transcript(
         &mut self,
@@ -1201,6 +1883,8 @@ impl ChatView {
         shape_id: Option<&str>,
         color_id: Option<&str>,
         bot_state: BotFaceState,
+        exec_state: ExecutionState,
+        reduced_motion: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let has_inline_activity = chat.messages.iter().rev().any(|m| m.streaming && message_has_body(m));
@@ -1272,7 +1956,7 @@ impl ChatView {
         self.synced_last_fp = last_fp;
         self.synced_messages = messages;
         self.synced_aux_fp = aux_fp;
-        self.thinking_disclosure.collapsed_live.retain(|id| chat.messages.iter().any(|m| m.id == *id && m.streaming));
+        self.activity_disclosure.prune_completed(&chat.messages);
 
         let is_scrolled_up = self.list_state.max_offset_for_scrollbar().y > px(40.0)
             && !self.list_state.is_following_tail()
@@ -1402,18 +2086,22 @@ impl ChatView {
                                     &theme_copy,
                                     &bot_seed_owned,
                                     shape_owned.as_deref(),
-                                     color_owned.as_deref(),
+                                    color_owned.as_deref(),
+                                    bot_state,
+                                    exec_state,
+                                    reduced_motion,
                                     is_streaming,
-                                     &row_scroll,
+                                    &row_scroll,
                                     cx,
                                 ))
                                 .into_any_element()
                         } else if has_pending && idx == msg_start + msg_count {
                             let status_lbl = if live_status_text.is_empty() {
-                                "Hermes is thinking…".to_string()
+                                format!("{}…", exec_state.label())
                             } else {
                                 live_status_text.clone()
                             };
+                            // Bare inline bot face directly on page background (no card/border/capsule)
                             chat_row()
                                 .pb(px(14.0))
                                 .flex()
@@ -1427,7 +2115,12 @@ impl ChatView {
                                     color_owned.as_deref(),
                                     28.0,
                                     bot_state,
-                                    BotFaceOptions { slot_key: "chat-pending", ..Default::default() },
+                                    BotFaceOptions {
+                                        slot_key: "chat-pending",
+                                        reduced_motion,
+                                        pop_on_activate: !reduced_motion,
+                                        ..Default::default()
+                                    },
                                 ))
                                 .child(
                                     div()
@@ -1435,9 +2128,9 @@ impl ChatView {
                                         .overflow_hidden()
                                         .text_size(px(13.0))
                                         .text_color(theme_copy.text_tertiary)
-                                         .child(StyledText::new(status_lbl)),
-                                 )
-                                .child(typing_dots(theme_copy.text_tertiary))
+                                        .child(StyledText::new(status_lbl)),
+                                )
+                                .when(!reduced_motion, |d| d.child(typing_dots(theme_copy.text_tertiary)))
                                 .into_any_element()
                         } else {
                             div().into_any_element()
@@ -1497,6 +2190,9 @@ impl ChatView {
         bot_seed: &str,
         shape_id: Option<&str>,
         color_id: Option<&str>,
+        live_bot_state: BotFaceState,
+        exec_state: ExecutionState,
+        reduced_motion: bool,
         session_streaming: bool,
         thought_scroll: &ThoughtScrollHitboxes,
         cx: &mut Context<Self>,
@@ -1510,6 +2206,8 @@ impl ChatView {
                 status: ToolCallStatus::Done,
                 duration_ms: None,
                 preview: None,
+                inline_diff: None,
+                waiting_approval: false,
             };
             return chat_row()
                 .flex()
@@ -1541,201 +2239,202 @@ impl ChatView {
 
         let msg_id = msg.id.clone();
         let copy_content = msg.content.clone();
-        let think_streaming = thinking_is_live(msg);
-        let think_open = self.thinking_disclosure.is_expanded(msg);
         let thinking = msg.thinking.as_deref().filter(|t| !t.is_empty());
         let has_answer = !msg.content.trim().is_empty();
+        let has_errors = msg.tool_calls.iter().any(|t| t.status == ToolCallStatus::Error);
+        let has_activity = msg.streaming || thinking.is_some() || !msg.tool_calls.is_empty();
+        let activity_open = self.activity_disclosure.is_expanded(msg);
+        let active_tool = msg
+            .tool_calls
+            .iter()
+            .rev()
+            .find(|t| t.status == ToolCallStatus::Running);
+
+        let activity_label = if msg.streaming {
+            if let Some(t) = active_tool {
+                if t.waiting_approval {
+                    format!("Waiting for approval · {}", t.name)
+                } else {
+                    let (_, lbl, detail, _) =
+                        describe_tool(&t.name, t.arguments.as_ref(), t.preview.as_deref(), true);
+                    format!("{lbl} {detail}")
+                }
+            } else {
+                format!("{}…", exec_state.label())
+            }
+        } else {
+            let mut parts: Vec<String> = Vec::new();
+            if thinking.is_some() {
+                parts.push("Reasoning".into());
+            }
+            if !msg.tool_calls.is_empty() {
+                let n = msg.tool_calls.len();
+                parts.push(format!("{n} tool{}", if n == 1 { "" } else { "s" }));
+            }
+            if has_errors {
+                parts.push("diagnostics available".into());
+            }
+            if parts.is_empty() {
+                "Activity".into()
+            } else {
+                parts.join(" · ")
+            }
+        };
+
+        let inline_face_state = if msg.streaming {
+            if let Some(t) = active_tool {
+                if t.waiting_approval {
+                    BotFaceState::Blocked
+                } else {
+                    describe_tool(&t.name, t.arguments.as_ref(), t.preview.as_deref(), true).3
+                }
+            } else {
+                live_bot_state
+            }
+        } else if has_errors {
+            BotFaceState::Failed
+        } else {
+            BotFaceState::Finished
+        };
 
         chat_row()
             .flex()
             .flex_col()
             .items_start()
-            .gap(px(8.0))
-            // Collapsible Thought Process
-            .when(think_streaming || thinking.is_some(), |d| {
-                let tid = msg_id.clone();
+            .gap(px(6.0))
+            // Bare inline bot face + compact collapsible activity disclosure (collapsed by default, auto-collapses on completion)
+            .when(has_activity, |d| {
+                let aid = msg_id.clone();
+                let is_live = msg.streaming;
                 d.child(
                     chat_row()
                         .flex()
                         .flex_col()
                         .items_start()
-                        .gap(px(5.0))
+                        .gap(px(4.0))
                         .child(
                             div()
-                                .id(SharedString::from(format!("think-head-{msg_id}")))
+                                .id(SharedString::from(format!("activity-head-{msg_id}")))
                                 .max_w_full()
                                 .min_w_0()
                                 .overflow_hidden()
-                                .min_h(px(28.0))
-                                .px(px(9.0))
-                                .py(px(4.0))
-                                .rounded(px(10.0))
-                                .border_1()
-                                .border_color(theme.border_subtle)
-                                .bg(theme.bg_card)
+                                .min_h(px(26.0))
+                                .py(px(2.0))
                                 .flex()
                                 .items_center()
-                                .gap(px(7.0))
-                                .text_size(px(12.0))
+                                .gap(px(8.0))
+                                .text_size(px(12.5))
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.text_tertiary)
+                                .text_color(if has_errors && !msg.streaming {
+                                    theme.danger_text
+                                } else {
+                                    theme.text_tertiary
+                                })
                                 .cursor_pointer()
-                                .hover(|st| st.bg(theme.bg_hover).border_color(theme.border_default).text_color(theme.text_secondary))
+                                .hover(|st| st.text_color(theme.text_secondary))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.thinking_disclosure.toggle(&tid, think_streaming);
+                                    this.activity_disclosure.toggle(&aid, is_live);
                                     this.list_state.remeasure();
                                     cx.notify();
                                 }))
-                                .child(if think_streaming {
-                                    bot_face_with_options(
+                                // Bare inline face popped directly onto page background when working (no card/border/capsule)
+                                .when(msg.streaming, |row| {
+                                    row.child(bot_face_with_options(
                                         theme,
                                         bot_seed,
                                         shape_id,
                                         color_id,
-                                        22.0,
-                                        BotFaceState::Thinking,
-                                        BotFaceOptions { slot_key: "chat-thinking", ..Default::default() },
-                                    )
-                                    .into_any_element()
-                                } else {
-                                    cursor_icon("brain", 14.0, theme.text_tertiary).into_any_element()
+                                        26.0,
+                                        inline_face_state,
+                                        BotFaceOptions {
+                                            slot_key: "chat-inline-work",
+                                            reduced_motion,
+                                            pop_on_activate: !reduced_motion,
+                                            ..Default::default()
+                                        },
+                                    ))
                                 })
-                                .child(clipped_label(if think_streaming {
-                                    "Thinking…"
-                                } else {
-                                    "Thought process"
-                                }))
-                                .when(!think_streaming, |d| {
-                                    d.child(clipped_label("· View").text_size(px(11.0)))
+                                .when(!msg.streaming, |row| {
+                                    row.child(cursor_icon(
+                                        if has_errors { "alert-circle" } else { "activity" },
+                                        13.5,
+                                        if has_errors { theme.danger_text } else { theme.text_tertiary },
+                                    ))
                                 })
-                                .child(cursor_icon(
-                                    if think_open {
-                                        "chevron-down"
-                                    } else {
-                                        "chevron-right"
-                                    },
-                                    12.0,
-                                    theme.text_tertiary,
-                                )),
-                        )
-                        .when_some(thinking.filter(|_| think_open), |d, thinking| {
-                            let thought_scroll = thought_scroll.clone();
-                            d.child(popover_enter(SharedString::from(format!("think-body-anim-{msg_id}")),
-                                chat_row()
-                                    .relative()
-                                    .rounded(px(8.0))
-                                    .border_l_2()
-                                    .border_color(theme.border_default)
-                                    .bg(theme.bg_card)
-                                    .child(canvas(move |bounds, window, _| {
-                                        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-                                        thought_scroll.borrow_mut().push(hitbox);
-                                    }, |_, _, _, _| {}).absolute().size_full())
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!("think-scroll-{msg_id}")))
-                                            .w_full()
-                                            .min_w_0()
-                                            .max_h(px(if think_streaming { 220.0 } else { 320.0 }))
-                                            .overflow_y_scroll()
-                                            .px(px(12.0))
-                                            .py(px(7.0))
-                                            .child(render_thinking_markdown(&format!("thought-{msg_id}"), thinking, theme)),
-                                    ),
-                            ))
-                        }),
-                )
-            })
-            // Tool activity group
-            .when(!msg.tool_calls.is_empty(), |d| {
-                let grp_id = format!("grp-{}", msg.id);
-                let grp_open = !self.collapsed_groups.contains(&grp_id);
-                let active_tool = if msg.streaming {
-                    msg.tool_calls
-                        .iter()
-                        .rev()
-                        .find(|t| t.status == ToolCallStatus::Running)
-                } else {
-                    None
-                };
-                let summary_text = if let Some(t) = active_tool {
-                    let (_, lbl, detail, _) =
-                        describe_tool(&t.name, t.arguments.as_ref(), t.preview.as_deref(), true);
-                    format!("{lbl} {detail}")
-                } else {
-                    format!("Used {} tool{}", msg.tool_calls.len(), if msg.tool_calls.len() == 1 { "" } else { "s" })
-                };
-                let gid_click = grp_id.clone();
-                d.child(
-                    chat_row()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .id(SharedString::from(grp_id))
-                                .w_full()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .min_h(px(28.0))
-                                .py(px(3.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .text_size(px(13.0))
-                                .text_color(theme.text_tertiary)
-                                .cursor_pointer()
-                                .hover(|st| st.text_color(theme.text_secondary))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if !this.collapsed_groups.remove(&gid_click) {
-                                        this.collapsed_groups.insert(gid_click.clone());
-                                    }
-                                    this.list_state.remeasure();
-                                    cx.notify();
-                                }))
-                                .child(if let Some(t) = active_tool {
-                                    let (_, _, _, st) = describe_tool(
-                                        &t.name,
-                                        t.arguments.as_ref(),
-                                        t.preview.as_deref(),
-                                        true,
-                                    );
-                                    bot_face_with_options(theme, bot_seed, shape_id, color_id, 22.0, st,
-                                        BotFaceOptions { slot_key: "chat-tool", ..Default::default() })
-                                        .into_any_element()
-                                } else {
-                                    cursor_icon("layers", 16.0, theme.text_tertiary)
-                                        .into_any_element()
-                                })
+                                .child(clipped_label(activity_label))
                                 .child(
                                     div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .child(summary_text),
-                                )
-                                .child(cursor_icon(
-                                    if grp_open {
-                                        "chevron-down"
-                                    } else {
-                                        "chevron-right"
-                                    },
-                                    12.0,
-                                    theme.text_tertiary,
-                                )),
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(3.0))
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_tertiary)
+                                        .child(if activity_open { "Hide" } else { "Details" })
+                                        .child(cursor_icon(
+                                            if activity_open { "chevron-down" } else { "chevron-right" },
+                                            11.5,
+                                            theme.text_tertiary,
+                                        )),
+                                ),
                         )
-                        .when(grp_open, |d| {
-                            d.child(popover_enter(SharedString::from(format!("tool-group-body-{}", msg.id)),
+                        .when(activity_open, |d| {
+                            let thought_scroll = thought_scroll.clone();
+                            d.child(popover_enter(
+                                SharedString::from(format!("activity-body-{msg_id}")),
                                 chat_row()
+                                    .pl(px(12.0))
+                                    .py(px(4.0))
+                                    .border_l_1()
+                                    .border_color(theme.border_subtle)
                                     .flex()
                                     .flex_col()
-                                    .gap(px(2.0))
-                                    .children(
-                                        msg.tool_calls
-                                            .iter()
-                                            .map(|tc| self.render_tool_card(tc, theme, session_streaming && msg.streaming, cx)),
-                                    ),
+                                    .gap(px(4.0))
+                                    .when_some(thinking, |d, thought| {
+                                        let thought_scroll = thought_scroll.clone();
+                                        d.child(
+                                            chat_row()
+                                                .relative()
+                                                .child(
+                                                    canvas(
+                                                        move |bounds, window, _| {
+                                                            let hitbox = window.insert_hitbox(
+                                                                bounds,
+                                                                HitboxBehavior::Normal,
+                                                            );
+                                                            thought_scroll.borrow_mut().push(hitbox);
+                                                        },
+                                                        |_, _, _, _| {},
+                                                    )
+                                                    .absolute()
+                                                    .size_full(),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "think-scroll-{msg_id}"
+                                                        )))
+                                                        .w_full()
+                                                        .min_w_0()
+                                                        .max_h(px(240.0))
+                                                        .overflow_y_scroll()
+                                                        .py(px(3.0))
+                                                        .child(render_thinking_markdown(
+                                                            &format!("thought-{msg_id}"),
+                                                            thought,
+                                                            theme,
+                                                        )),
+                                                ),
+                                        )
+                                    })
+                                    .children(msg.tool_calls.iter().map(|tc| {
+                                        self.render_tool_card(
+                                            tc,
+                                            theme,
+                                            session_streaming && msg.streaming,
+                                            cx,
+                                        )
+                                    })),
                             ))
                         }),
                 )
@@ -1748,34 +2447,32 @@ impl ChatView {
             .when_some(msg.clarify.as_ref(), |d, cl| {
                 d.child(self.render_clarify_card(cl, theme, cx))
             })
-            // Main assistant markdown bubble
+            // Minimal card-free assistant response directly on the page background (no bubble/card/border)
             .when(has_answer, |d| {
                 d.child(
                     chat_row()
-                        .px(px(16.0))
-                        .py(px(12.0))
-                        .rounded(px(18.0))
-                        .bg(theme.bubble_agent)
+                        .py(px(2.0))
                         .flex()
                         .flex_col()
                         .gap(px(8.0))
                         .child(render_markdown(&msg.id, &msg.content, theme)),
                 )
             })
-            // Footer meta (model + copy)
-            .when(has_answer && !msg.streaming, |d| {
+            // Footer meta (model + verbatim Copy available BOTH during streaming AND after completion)
+            .when(has_answer, |d| {
                 d.child(
                     div()
                         .min_w_0()
                         .max_w_full()
                         .overflow_hidden()
-                        .px(px(6.0))
                         .flex()
                         .items_center()
                         .gap(px(6.0))
                         .text_size(px(11.0))
                         .text_color(theme.text_tertiary)
-                        .when_some(msg.model.as_ref(), |d, m| d.child(clipped_label(short_model_name(m))))
+                        .when_some(msg.model.as_ref(), |d, m| {
+                            d.child(clipped_label(short_model_name(m)))
+                        })
                         .child(
                             gb_mini_icon_btn(
                                 SharedString::from(format!("copy-msg-{}", msg.id)),
@@ -1784,7 +2481,9 @@ impl ChatView {
                             )
                             .child(cursor_icon("copy", 11.0, theme.text_tertiary))
                             .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    copy_content.clone(),
+                                ));
                             }),
                         ),
                 )
@@ -1800,9 +2499,24 @@ impl ChatView {
     ) -> Div {
         let open = self.expanded_tools.contains(&tool.id);
         let tid = tool.id.clone();
+        let tid_inspect = tool.id.clone();
         let running = tool.status == ToolCallStatus::Running;
-        let (icon, label, detail, _) =
+        let ptc = inspect_ptc_tool_call(tool, None, None, Vec::new());
+        let (icon, label, default_detail, _) =
             describe_tool(&tool.name, tool.arguments.as_ref(), tool.preview.as_deref(), running);
+        let detail = ptc
+            .as_ref()
+            .map(|p| p.summary.clone())
+            .unwrap_or(default_detail);
+        let status_badge = if tool.waiting_approval {
+            Some((BadgeTone::Warning, "Waiting for approval"))
+        } else if running {
+            None
+        } else if tool.status == ToolCallStatus::Error {
+            Some((BadgeTone::Danger, "Failed"))
+        } else {
+            Some((BadgeTone::Muted, "Completed"))
+        };
 
         chat_row()
             .flex()
@@ -1810,12 +2524,12 @@ impl ChatView {
             .child(
                 chat_row()
                     .id(SharedString::from(format!("tool-head-{}", tool.id)))
-                    .min_h(px(28.0))
-                    .py(px(3.0))
+                    .min_h(px(24.0))
+                    .py(px(2.0))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
-                    .text_size(px(13.0))
+                    .gap(px(7.0))
+                    .text_size(px(12.5))
                     .text_color(theme.text_tertiary)
                     .cursor_pointer()
                     .hover(|st| st.text_color(theme.text_secondary))
@@ -1826,7 +2540,7 @@ impl ChatView {
                         this.list_state.remeasure();
                         cx.notify();
                     }))
-                    .child(cursor_icon(icon, 16.0, theme.text_tertiary))
+                    .child(cursor_icon(icon, 14.0, theme.text_tertiary))
                     .child(clipped_label(label).flex_shrink_0())
                     .child(
                         div()
@@ -1837,66 +2551,199 @@ impl ChatView {
                             .whitespace_nowrap()
                             .child(detail),
                     )
-                    .when(tool.status == ToolCallStatus::Error, |d| {
-                        d.child(clipped_label("Failed").flex_shrink_0().text_size(px(11.0)).text_color(theme.danger_text))
-                    })
-                    .when(running, |d| {
+                    .when(running && !tool.waiting_approval, |d| {
                         d.child(live_pulse_dot(theme.accent_text, 5.0, streaming))
-                            .child(clipped_label("Running").flex_shrink_0().text_size(px(11.0)).text_color(theme.text_tertiary))
+                            .child(clipped_label("Running").flex_shrink_0().text_size(px(10.5)).text_color(theme.text_tertiary))
+                    })
+                    .when_some(status_badge, |d, (tone, txt)| {
+                        d.child(gb_badge(theme, tone, txt))
                     })
                     .when_some(tool.duration_ms, |d, ms| {
                         d.child(
-                            clipped_label(format!("{:.1}s", (ms as f64) / 1000.0))
+                            clipped_label(format_elapsed_ms(ms))
                                 .flex_shrink_0()
-                                .text_size(px(11.0))
+                                .text_size(px(10.5))
                                 .text_color(theme.text_tertiary),
                         )
                     })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("tool-inspect-{}", tool.id)))
+                            .px(px(5.0))
+                            .py(px(1.0))
+                            .rounded(px(5.0))
+                            .text_size(px(10.5))
+                            .text_color(theme.text_tertiary)
+                            .hover(|st| st.bg(theme.bg_hover).text_color(theme.text_primary))
+                            .child("Inspect")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.app.update(cx, |s, cx| {
+                                    s.inspect_tool_in_trajectory(Some(tid_inspect.clone()), cx);
+                                });
+                            })),
+                    )
                     .child(cursor_icon(
                         if open { "chevron-down" } else { "chevron-right" },
-                        12.0,
+                        11.5,
                         theme.text_tertiary,
                     )),
             )
             .when(open, |d| {
-                d.child(popover_enter(SharedString::from(format!("tool-body-{}", tool.id)),
+                let ptc_json_on = self.ptc_json_mode.contains(&tool.id);
+                let tid_json = tool.id.clone();
+                d.child(popover_enter(
+                    SharedString::from(format!("tool-body-{}", tool.id)),
                     chat_row()
-                        .my(px(4.0))
-                        .pl(px(12.0))
-                        .py(px(4.0))
+                        .my(px(3.0))
+                        .pl(px(10.0))
+                        .py(px(3.0))
                         .border_l_1()
                         .border_color(theme.border_default)
                         .flex()
                         .flex_col()
-                        .gap(px(6.0))
-                        .when_some(tool.arguments.as_ref(), |d, args| {
-                            let pretty = serde_json::to_string_pretty(args)
-                                .unwrap_or_else(|_| args.to_string());
+                        .gap(px(5.0))
+                        .when_some(ptc.as_ref(), |d, p| {
+                            let lang_opt = if ptc_json_on {
+                                Some("json")
+                            } else {
+                                p.language.map(|l| l.as_str())
+                            };
+                            let copy_val = if ptc_json_on {
+                                p.raw_args_json.clone()
+                            } else {
+                                p.source.clone()
+                            };
+                            d.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(10.5))
+                                            .text_color(theme.text_tertiary)
+                                            .child(if ptc_json_on {
+                                                "ORIGINAL JSON".to_string()
+                                            } else {
+                                                format!(
+                                                    "PTC PROGRAM · {}",
+                                                    p.language.map(|l| l.display_label()).unwrap_or("Plain text")
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                gb_btn(
+                                                    SharedString::from(format!("ptc-json-{}", tool.id)),
+                                                    theme,
+                                                    if ptc_json_on { BtnVariant::Primary } else { BtnVariant::Ghost },
+                                                    true,
+                                                    false,
+                                                )
+                                                .child("{}")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if !this.ptc_json_mode.remove(&tid_json) {
+                                                        this.ptc_json_mode.insert(tid_json.clone());
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                            )
+                                            .child(
+                                                gb_btn(
+                                                    SharedString::from(format!("ptc-copy-{}", tool.id)),
+                                                    theme,
+                                                    BtnVariant::Ghost,
+                                                    true,
+                                                    false,
+                                                )
+                                                .child("Copy")
+                                                .on_click(move |_, _, cx| {
+                                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                                        copy_val.clone(),
+                                                    ));
+                                                }),
+                                            ),
+                                    ),
+                            )
+                            .child(render_highlighted_code_block(
+                                SharedString::from(format!("ptc-src-{}", tool.id)),
+                                lang_opt,
+                                if ptc_json_on { &p.raw_args_json } else { &p.source },
+                                true,
+                                false,
+                                theme,
+                            ))
+                        })
+                        .when(ptc.is_none(), |d| {
+                            d.when_some(tool.arguments.as_ref(), |d, args| {
+                                let pretty = serde_json::to_string_pretty(args)
+                                    .unwrap_or_else(|_| args.to_string());
+                                d.child(
+                                    chat_row()
+                                        .font_family(FONT_MONO)
+                                        .text_size(px(10.5))
+                                        .text_color(theme.text_tertiary)
+                                        .child("INPUT"),
+                                )
+                                .child(render_code_block(
+                                    SharedString::from(format!("tool-in-{}", tool.id)),
+                                    "json",
+                                    &pretty,
+                                    theme,
+                                ))
+                            })
+                        })
+                        .when_some(tool.inline_diff.as_ref().filter(|s| !s.is_empty()), |d, diff| {
                             d.child(
                                 chat_row()
                                     .font_family(FONT_MONO)
-                                    .text_size(px(11.0))
+                                    .text_size(px(10.5))
                                     .text_color(theme.text_tertiary)
-                                    .child("INPUT"),
+                                    .child("DIFF"),
                             )
                             .child(render_code_block(
-                                SharedString::from(format!("tool-in-{}", tool.id)),
-                                "json",
-                                &pretty,
+                                SharedString::from(format!("tool-diff-{}", tool.id)),
+                                "diff",
+                                diff,
                                 theme,
                             ))
                         })
                         .when_some(tool.output.as_ref(), |d, out| {
+                            let out_lang = if tool.status == ToolCallStatus::Error {
+                                "text"
+                            } else if ptc.as_ref().is_some_and(|p| p.output_is_json_container) {
+                                "json"
+                            } else {
+                                "text"
+                            };
                             d.child(
                                 chat_row()
                                     .font_family(FONT_MONO)
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_tertiary)
-                                    .child("OUTPUT"),
+                                    .text_size(px(10.5))
+                                    .text_color(if tool.status == ToolCallStatus::Error {
+                                        theme.danger_text
+                                    } else {
+                                        theme.text_tertiary
+                                    })
+                                    .child(if tool.status == ToolCallStatus::Error {
+                                        "ERROR"
+                                    } else {
+                                        "OUTPUT"
+                                    }),
                             )
                             .child(render_code_block(
                                 SharedString::from(format!("tool-out-{}", tool.id)),
-                                "text",
+                                out_lang,
                                 out,
                                 theme,
                             ))
@@ -2155,7 +3002,7 @@ fn render_usage_bar(
     fill: &mut SpringValue,
     window: &mut Window,
 ) -> Div {
-    let used = usage.and_then(|u| u.context_tokens);
+    let used = usage.and_then(|u| u.context_used);
     let limit = usage.and_then(|u| u.context_limit).or(context_limit);
     let known = matches!((used, limit), (Some(_), Some(l)) if l > 0);
     let pct = if let (Some(u), Some(l)) = (used, limit) {
@@ -2226,35 +3073,44 @@ fn render_usage_bar(
 
 #[cfg(test)]
 mod tests {
-    use super::{message_fingerprint, HermesMessage, HermesToolCall, ThinkingDisclosure, ToolCallStatus};
+    use super::{message_fingerprint, ActivityDisclosure, HermesMessage, HermesToolCall, ToolCallStatus};
 
     #[test]
-    fn live_thinking_collapses_when_the_answer_starts_and_can_be_reopened() {
+    fn activity_disclosure_is_collapsed_by_default_auto_collapses_on_completion_and_reopens() {
         let mut msg = HermesMessage::new_assistant("test".into());
-        let mut disclosure = ThinkingDisclosure::default();
-        assert!(disclosure.is_expanded(&msg));
-        disclosure.toggle(&msg.id, true);
+        let mut disclosure = ActivityDisclosure::default();
+        // Collapsed by default while streaming
         assert!(!disclosure.is_expanded(&msg));
+        // User expands during streaming
         disclosure.toggle(&msg.id, true);
         assert!(disclosure.is_expanded(&msg));
-
-        msg.content = "Answer starts".into();
-        assert!(!disclosure.is_expanded(&msg));
-        disclosure.toggle(&msg.id, false);
+        // Turn completes -> auto-collapses!
+        msg.content = "Final answer".into();
         msg.streaming = false;
+        disclosure.prune_completed(std::slice::from_ref(&msg));
+        assert!(!disclosure.is_expanded(&msg));
+        // User can reopen recorded details after completion
+        disclosure.toggle(&msg.id, false);
         assert!(disclosure.is_expanded(&msg));
         disclosure.toggle(&msg.id, false);
         assert!(!disclosure.is_expanded(&msg));
     }
 
     #[test]
-    fn finishing_a_thinking_only_message_hides_its_body() {
-        let mut msg = HermesMessage::new_assistant("test".into());
-        let disclosure = ThinkingDisclosure::default();
-        msg.thinking = Some("Reasoning with no answer yet".into());
-        assert!(disclosure.is_expanded(&msg));
+    fn failed_turn_diagnostics_remain_reopenable_after_completion() {
+        let mut msg = HermesMessage::new_assistant("fail-1".into());
+        let mut disclosure = ActivityDisclosure::default();
+        msg.tool_calls.push(HermesToolCall {
+            id: "tc-err".into(),
+            name: "terminal".into(),
+            status: ToolCallStatus::Error,
+            output: Some("exit code 1".into()),
+            ..Default::default()
+        });
         msg.streaming = false;
         assert!(!disclosure.is_expanded(&msg));
+        disclosure.toggle(&msg.id, false);
+        assert!(disclosure.is_expanded(&msg));
     }
 
     #[test]

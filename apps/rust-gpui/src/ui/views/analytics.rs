@@ -59,7 +59,7 @@ impl AnalyticsView {
 
     fn sync_source(&mut self, cx: &mut Context<Self>) {
         let app = self.app.read(cx);
-        let visible = app.active_view == AppViewId::Analytics;
+        let visible = !app.setup_open && !app.initializing && app.active_view == AppViewId::Analytics;
         let entered = visible && !self.visible;
         self.visible = visible;
 
@@ -83,6 +83,8 @@ impl AnalyticsView {
         }
 
         self.days = days;
+        self.smooth_scroller.cancel();
+        self.scroll_handle.set_offset(Point::default());
         self.report = None;
         self.request = None;
         self.failed = false;
@@ -118,7 +120,9 @@ impl AnalyticsView {
                     Ok(report) => this.report = Some(report),
                     Err(_) => this.failed = true,
                 }
-                cx.notify();
+                if this.visible {
+                    cx.notify();
+                }
             });
         }));
         cx.notify();
@@ -149,6 +153,7 @@ impl Render for AnalyticsView {
                     .track_scroll(&self.scroll_handle)
                     .size_full()
                     .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
                     .p(px(28.0))
                     .flex()
                     .flex_col()
@@ -157,6 +162,7 @@ impl Render for AnalyticsView {
                         div()
                             .w_full()
                             .max_w(px(940.0))
+                            .flex_shrink_0()
                             .flex()
                             .flex_col()
                             .gap(px(18.0))
@@ -238,7 +244,7 @@ impl Render for AnalyticsView {
                     ),
             )
             .vertical_scrollbar(&self.scroll_handle)
-            .child(smooth_scroll_layer(&self.smooth_scroller))
+            .child(smooth_scroll_layer(&self.smooth_scroller).filter_events(|event, _| !event.modifiers.shift))
     }
 }
 
@@ -366,11 +372,17 @@ fn daily_usage(theme: &SandTheme, report: &HermesUsageReport, days: usize) -> Di
         ));
     };
 
-    let stride = timeline.len().div_ceil(6);
+    let stride = timeline.len().div_ceil(6).max(1);
+    let chart_min_width = px(timeline.len() as f32 * 15.0 + 36.0);
     section.child(
         div()
+            .id("usage-chart-scroll")
             .w_full()
-            .px(px(18.0))
+            .child(
+                div()
+                    .w_full()
+                    .min_w(chart_min_width)
+                    .px(px(18.0))
             .py(px(16.0))
             .flex()
             .gap(px(4.0))
@@ -424,6 +436,8 @@ fn daily_usage(theme: &SandTheme, report: &HermesUsageReport, days: usize) -> Di
                             )
                     }),
             ),
+            )
+            .overflow_x_scrollbar()
     )
 }
 
@@ -599,7 +613,7 @@ fn empty_state(theme: &SandTheme, text: &str) -> Div {
 fn metric_card(theme: &SandTheme, label: &str, value: String, subtitle: String) -> Div {
     gb_section_card(theme)
         .flex_1()
-        .min_w(px(128.0))
+        .min_w(px(128.0)).max_w_full()
         .p(px(16.0))
         .gap(px(5.0))
         .child(

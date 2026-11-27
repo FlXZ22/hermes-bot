@@ -311,12 +311,23 @@ impl HermesRealtimeSession {
                     .and_then(Value::as_str)
                     .map(String::from),
             }),
-            "session.usage" => Some(HermesStreamEvent::SessionUsage {
-                session_id,
-                usage: serde_json::from_value(payload).unwrap_or_default(),
-            }),
+            "session.usage" => {
+                let usage_val = payload.get("usage").unwrap_or(&payload).clone();
+                Some(HermesStreamEvent::SessionUsage {
+                    session_id,
+                    usage: serde_json::from_value(usage_val).unwrap_or_default(),
+                })
+            }
+            "session.title" => payload
+                .get("title")
+                .and_then(Value::as_str)
+                .map(|t| HermesStreamEvent::SessionTitle {
+                    session_id,
+                    title: t.to_string(),
+                }),
             "status.update" => Some(HermesStreamEvent::StatusUpdate {
                 session_id,
+                kind: payload.get("kind").and_then(Value::as_str).map(String::from),
                 text: payload
                     .get("text")
                     .or_else(|| payload.get("status"))
@@ -347,7 +358,7 @@ impl HermesRealtimeSession {
                     })
                 }
             }
-            "thinking.delta" | "reasoning.delta" => {
+            "thinking.delta" | "reasoning.delta" | "reasoning.available" => {
                 let d = payload
                     .get("delta")
                     .or_else(|| payload.get("text"))
@@ -382,11 +393,21 @@ impl HermesRealtimeSession {
                     })
                 }
             }
+            "tool.generating" => Some(HermesStreamEvent::ToolGenerating {
+                session_id,
+                name: payload
+                    .get("name")
+                    .or_else(|| payload.get("tool"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string(),
+            }),
             "tool.start" | "tool_call.start" => Some(HermesStreamEvent::ToolStart {
                 session_id,
                 tool_call: HermesToolCall {
                     id: payload
-                        .get("call_id")
+                        .get("tool_id")
+                        .or_else(|| payload.get("call_id"))
                         .or_else(|| payload.get("id"))
                         .or_else(|| payload.get("tool_call_id"))
                         .and_then(Value::as_str)
@@ -403,20 +424,30 @@ impl HermesRealtimeSession {
                         .get("arguments")
                         .or_else(|| payload.get("args"))
                         .or_else(|| payload.get("input"))
-                        .cloned(),
+                        .cloned()
+                        .or_else(|| {
+                            payload
+                                .get("args_text")
+                                .and_then(Value::as_str)
+                                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        }),
                     preview: payload
                         .get("preview")
+                        .or_else(|| payload.get("context"))
                         .and_then(Value::as_str)
                         .map(String::from),
                     output: None,
                     status: ToolCallStatus::Running,
                     duration_ms: None,
+                    inline_diff: None,
+                    waiting_approval: false,
                 },
             }),
             "tool.progress" => Some(HermesStreamEvent::ToolProgress {
                 session_id,
                 tool_call_id: payload
-                    .get("call_id")
+                    .get("tool_id")
+                    .or_else(|| payload.get("call_id"))
                     .or_else(|| payload.get("id"))
                     .or_else(|| payload.get("tool_call_id"))
                     .and_then(Value::as_str)
@@ -431,27 +462,157 @@ impl HermesRealtimeSession {
                     .to_string(),
             }),
             "tool.complete" | "tool.end" | "tool_call.end" | "tool.result" => {
+                let duration_ms = payload
+                    .get("duration_ms")
+                    .or_else(|| payload.get("elapsed_ms"))
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        payload
+                            .get("duration_s")
+                            .and_then(Value::as_f64)
+                            .filter(|s| s.is_finite() && *s >= 0.0)
+                            .map(|s| (s * 1000.0).round() as u64)
+                    });
+                let output = payload
+                    .get("result_text")
+                    .or_else(|| payload.get("output"))
+                    .or_else(|| payload.get("result"))
+                    .or_else(|| payload.get("summary"))
+                    .map(|v| {
+                        v.as_str()
+                            .map(String::from)
+                            .unwrap_or_else(|| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+                    });
+                let error = payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| {
+                        if payload.get("is_error").and_then(Value::as_bool) == Some(true) {
+                            output.clone().or_else(|| Some("Tool execution failed".into()))
+                        } else {
+                            None
+                        }
+                    });
                 Some(HermesStreamEvent::ToolEnd {
                     session_id,
                     tool_call_id: payload
-                        .get("call_id")
+                        .get("tool_id")
+                        .or_else(|| payload.get("call_id"))
                         .or_else(|| payload.get("id"))
                         .or_else(|| payload.get("tool_call_id"))
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string(),
-                    output: payload
-                        .get("output")
-                        .or_else(|| payload.get("result"))
-                        .or_else(|| payload.get("summary"))
-                        .map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())),
-                    error: payload.get("error").and_then(Value::as_str).map(String::from),
-                    duration_ms: payload
-                        .get("duration_ms")
-                        .or_else(|| payload.get("elapsed_ms"))
-                        .and_then(Value::as_u64),
+                    output,
+                    error,
+                    duration_ms,
+                    inline_diff: payload
+                        .get("inline_diff")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 })
             }
+            "subagent.start" => Some(HermesStreamEvent::SubagentStart {
+                session_id,
+                subagent_id: payload
+                    .get("subagent_id")
+                    .or_else(|| payload.get("id"))
+                    .or_else(|| payload.get("child_session_id"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "subagent-{}",
+                            payload.get("task_index").and_then(Value::as_u64).unwrap_or(0)
+                        )
+                    }),
+                parent_id: payload.get("parent_id").and_then(Value::as_str).map(String::from),
+                child_session_id: payload
+                    .get("child_session_id")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                depth: payload.get("depth").and_then(Value::as_u64).unwrap_or(1) as u32,
+                goal: payload
+                    .get("goal")
+                    .or_else(|| payload.get("task"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Subagent task")
+                    .to_string(),
+                model: payload.get("model").and_then(Value::as_str).map(String::from),
+            }),
+            "subagent.tool" | "subagent.thinking" => {
+                let subagent_id = payload
+                    .get("subagent_id")
+                    .or_else(|| payload.get("id"))
+                    .or_else(|| payload.get("child_session_id"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "subagent-{}",
+                            payload.get("task_index").and_then(Value::as_u64).unwrap_or(0)
+                        )
+                    });
+                let tool_name = payload.get("tool_name").and_then(Value::as_str).map(String::from);
+                let operation = if event_type == "subagent.thinking" {
+                    payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(|t| format!("Thinking: {}", t.lines().next().unwrap_or(t)))
+                        .unwrap_or_else(|| "Thinking…".into())
+                } else {
+                    let preview = payload.get("tool_preview").and_then(Value::as_str).unwrap_or("");
+                    match (tool_name.as_deref(), preview.is_empty()) {
+                        (Some(tn), false) => format!("{tn}: {preview}"),
+                        (Some(tn), true) => format!("Running {tn}"),
+                        (None, false) => preview.to_string(),
+                        (None, true) => "Working…".into(),
+                    }
+                };
+                Some(HermesStreamEvent::SubagentUpdate {
+                    session_id,
+                    subagent_id,
+                    operation,
+                    tool_name,
+                    tool_count: payload.get("tool_count").and_then(Value::as_u64),
+                    input_tokens: payload.get("input_tokens").and_then(Value::as_u64),
+                    output_tokens: payload.get("output_tokens").and_then(Value::as_u64),
+                })
+            }
+            "subagent.complete" => Some(HermesStreamEvent::SubagentComplete {
+                session_id,
+                subagent_id: payload
+                    .get("subagent_id")
+                    .or_else(|| payload.get("id"))
+                    .or_else(|| payload.get("child_session_id"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "subagent-{}",
+                            payload.get("task_index").and_then(Value::as_u64).unwrap_or(0)
+                        )
+                    }),
+                status: payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed")
+                    .to_string(),
+                summary: payload
+                    .get("summary")
+                    .or_else(|| payload.get("output_tail"))
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                duration_ms: payload
+                    .get("duration_seconds")
+                    .or_else(|| payload.get("duration_s"))
+                    .and_then(Value::as_f64)
+                    .filter(|s| s.is_finite() && *s >= 0.0)
+                    .map(|s| (s * 1000.0).round() as u64),
+                input_tokens: payload.get("input_tokens").and_then(Value::as_u64),
+                output_tokens: payload.get("output_tokens").and_then(Value::as_u64),
+            }),
             "todo.updated" => {
                 let raw_list = payload
                     .get("todos")
@@ -576,6 +737,9 @@ impl HermesRealtimeSession {
                     .to_string(),
             }),
             "message.complete" | "turn.complete" | "done" | "session.idle" => {
+                let usage = payload
+                    .get("usage")
+                    .and_then(|u| serde_json::from_value::<HermesSessionUsage>(u.clone()).ok());
                 Some(HermesStreamEvent::MessageComplete {
                     session_id,
                     content: payload
@@ -583,7 +747,22 @@ impl HermesRealtimeSession {
                         .or_else(|| payload.get("text"))
                         .and_then(Value::as_str)
                         .map(String::from),
-                    thinking: thinking_from_fields(&payload),
+                    thinking: thinking_from_fields(&payload).or_else(|| {
+                        payload
+                            .get("reasoning")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    }),
+                    status: payload
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    error: payload
+                        .get("error")
+                        .or_else(|| payload.get("failure_reason"))
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    usage,
                 })
             }
             "error" => Some(HermesStreamEvent::Error {
@@ -742,6 +921,41 @@ impl HermesRealtimeSession {
             "command.dispatch",
             json!({ "session_id": session_id, "name": name, "arg": arg }),
             60_000,
+        )
+        .await
+    }
+
+    pub async fn slash_exec(&self, session_id: &str, input: &str) -> Result<Value, String> {
+        self.rpc(
+            "slash.exec",
+            json!({ "session_id": session_id, "input": input }),
+            60_000,
+        )
+        .await
+    }
+
+    pub async fn commands_catalog(&self) -> Result<Value, String> {
+        self.rpc("commands.catalog", json!({}), 15_000).await
+    }
+
+    pub async fn projects_list(&self) -> Result<Value, String> {
+        self.rpc("projects.list", json!({}), 15_000).await
+    }
+
+    pub async fn set_session_cwd(&self, session_id: &str, cwd: &str) -> Result<Value, String> {
+        self.rpc(
+            "session.cwd.set",
+            json!({ "session_id": session_id, "cwd": cwd }),
+            15_000,
+        )
+        .await
+    }
+
+    pub async fn interrupt_subagent(&self, session_id: &str, subagent_id: &str) -> Result<Value, String> {
+        self.rpc(
+            "subagent.interrupt",
+            json!({ "session_id": session_id, "subagent_id": subagent_id }),
+            15_000,
         )
         .await
     }

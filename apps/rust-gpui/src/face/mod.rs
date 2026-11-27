@@ -13,7 +13,7 @@ mod render;
 mod shapes;
 
 pub(crate) use element::{BotFaceElement, FaceLayer};
-pub use element::BotFaceOptions;
+pub use element::{face_frame_stats, BotFaceOptions};
 
 #[cfg(test)]
 mod tests;

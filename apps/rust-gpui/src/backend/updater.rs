@@ -523,6 +523,17 @@ impl AppUpdater {
     }
 
     pub fn apply_update(&self, mode: String, force_native_rebuild: bool) -> Result<UpdateStatus, String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "Tokio runtime handle required for updater".to_string())?;
+        self.apply_update_on(&handle, mode, force_native_rebuild)
+    }
+
+    pub fn apply_update_on(
+        &self,
+        handle: &tokio::runtime::Handle,
+        mode: String,
+        force_native_rebuild: bool,
+    ) -> Result<UpdateStatus, String> {
         let mode = match mode.as_str() {
             "remote" | "local" => mode,
             _ => return Err(format!("Unsupported update mode: {mode}")),
@@ -556,7 +567,7 @@ impl AppUpdater {
         };
 
         let updater = self.clone();
-        tokio::spawn(async move {
+        handle.spawn(async move {
             let outcome = updater
                 .run_update_pipeline(cfg, host, mode, force_native_rebuild, installed_full, native_full)
                 .await;

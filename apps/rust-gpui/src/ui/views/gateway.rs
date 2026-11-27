@@ -14,6 +14,8 @@ pub struct GatewayView {
     app: Entity<AppState>,
     busy_action: Option<&'static str>,
     webhook_modal: ModalMotion,
+    saving_webhook: bool,
+    platform_tests: std::collections::HashSet<String>,
     hook_name_input: Entity<InputState>,
     hook_url_input: Entity<InputState>,
     scroll_handle: ScrollHandle,
@@ -27,7 +29,8 @@ impl GatewayView {
         let hook_url_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("https://hooks.example.com/hermes"));
         cx.observe(&app, |_, app_e, cx| {
-            if app_e.read(cx).active_view == AppViewId::Gateway {
+            let app = app_e.read(cx);
+            if !app.setup_open && !app.initializing && app.active_view == AppViewId::Gateway {
                 cx.notify();
             }
         })
@@ -38,6 +41,8 @@ impl GatewayView {
             app,
             busy_action: None,
             webhook_modal: ModalMotion::default(),
+            saving_webhook: false,
+            platform_tests: Default::default(),
             hook_name_input,
             hook_url_input,
             scroll_handle,
@@ -48,6 +53,16 @@ impl GatewayView {
     fn run_gateway_action(&mut self, action: &'static str, cx: &mut Context<Self>) {
         let (client, rt) = {
             let s = self.app.read(cx);
+            let running = s
+                .hermes_status
+                .as_ref()
+                .and_then(|status| status.gateway_running);
+            if self.busy_action.is_some()
+                || (action == "start" && running == Some(true))
+                || (action == "stop" && running != Some(true))
+            {
+                return;
+            }
             (s.client.clone(), s.tokio_rt.clone())
         };
         let Some(client) = client else {
@@ -64,14 +79,12 @@ impl GatewayView {
                 .unwrap_or_else(|e| Err(e.to_string()));
             let _ = this.update(cx, |v, cx| {
                 v.busy_action = None;
-                v.app.update(cx, |s, cx| {
-                    match res {
-                        Ok(_) => {
-                            s.show_toast(format!("Gateway {action} requested"), cx);
-                            s.refresh_capabilities(false, cx);
-                        }
-                        Err(e) => s.show_toast(e, cx),
+                v.app.update(cx, |s, cx| match res {
+                    Ok(_) => {
+                        s.show_toast(format!("Gateway {action} requested"), cx);
+                        s.refresh_gateway_data(cx);
                     }
+                    Err(e) => s.show_toast(e, cx),
                 });
                 cx.notify();
             });
@@ -87,15 +100,24 @@ impl GatewayView {
         let Some(client) = client else {
             return;
         };
+        if !self.platform_tests.insert(id.clone()) {
+            return;
+        }
         let id_c = id.clone();
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let res = rt
                 .spawn(async move { client.test_messaging_platform(&id_c).await })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
             let _ = this.update(cx, |v, cx| {
+                v.platform_tests.remove(&id);
+                cx.notify();
                 v.app.update(cx, |s, cx| match res {
-                    Ok(_) => s.show_toast(format!("Tested {id}"), cx),
+                    Ok(_) => {
+                        s.refresh_gateway_data(cx);
+                        s.show_toast(format!("Tested {id}"), cx);
+                    }
                     Err(e) => s.show_toast(e, cx),
                 });
             });
@@ -104,77 +126,74 @@ impl GatewayView {
     }
 
     fn create_webhook(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self.hook_name_input.read(cx).value().trim().to_string();
-        let url = self.hook_url_input.read(cx).value().trim().to_string();
-        if url.is_empty() {
+        if self.saving_webhook {
             return;
         }
-        let final_name = if name.is_empty() {
+        let name = self.hook_name_input.read(cx).value().trim().to_string();
+        let url = self.hook_url_input.read(cx).value().trim().to_string();
+        if !reqwest::Url::parse(&url)
+            .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https") && parsed.has_host())
+        {
+            self.app.update(cx, |app, cx| {
+                app.show_toast("Enter a valid HTTP or HTTPS webhook URL.", cx)
+            });
+            return;
+        }
+        let app = self.app.read(cx);
+        let Some(client) = app.client.clone() else {
+            return;
+        };
+        let rt = app.tokio_rt.clone();
+        let source = app.profile_generation;
+        let name = if name.is_empty() {
             "Webhook".to_string()
         } else {
             name
         };
-        let (client, rt) = {
-            let s = self.app.read(cx);
-            (s.client.clone(), s.tokio_rt.clone())
-        };
-        let Some(client) = client else {
-            return;
-        };
-        self.webhook_modal.set_open(false);
-        self.hook_name_input
-            .update(cx, |st, cx| st.set_value("", window, cx));
-        self.hook_url_input
-            .update(cx, |st, cx| st.set_value("", window, cx));
+        self.saving_webhook = true;
         cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let res = rt
-                .spawn(async move { client.create_webhook(&final_name, &url).await })
+        cx.spawn_in(window, async move |this, cx| {
+            let result = rt
+                .spawn(async move { client.create_webhook(&name, &url).await })
                 .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            let _ = this.update(cx, |v, cx| {
-                v.app.update(cx, |s, cx| match res {
+                .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.saving_webhook = false;
+                cx.notify();
+                if view.app.read(cx).profile_generation != source {
+                    return;
+                }
+                match result {
                     Ok(_) => {
-                        s.show_toast("Webhook created", cx);
-                        s.refresh_capabilities(false, cx);
+                        view.webhook_modal.set_open(false);
+                        view.hook_name_input
+                            .update(cx, |state, cx| state.set_value("", window, cx));
+                        view.hook_url_input
+                            .update(cx, |state, cx| state.set_value("", window, cx));
+                        view.app.update(cx, |app, cx| {
+                            app.refresh_gateway_data(cx);
+                            app.show_toast("Webhook created", cx);
+                        });
                     }
-                    Err(e) => s.show_toast(e, cx),
-                });
+                    Err(error) => view.app.update(cx, |app, cx| app.show_toast(error, cx)),
+                }
             });
         })
         .detach();
     }
 
     fn delete_webhook(&mut self, id: String, cx: &mut Context<Self>) {
-        let (client, rt) = {
-            let s = self.app.read(cx);
-            (s.client.clone(), s.tokio_rt.clone())
-        };
-        let Some(client) = client else {
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            let res = rt
-                .spawn(async move { client.delete_webhook(&id).await })
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-            let _ = this.update(cx, |v, cx| {
-                v.app.update(cx, |s, cx| match res {
-                    Ok(_) => {
-                        s.show_toast("Webhook deleted", cx);
-                        s.refresh_capabilities(false, cx);
-                    }
-                    Err(e) => s.show_toast(e, cx),
-                });
-            });
-        })
-        .detach();
+        self.app.update(cx, |s, cx| {
+            if s.client.is_some() {
+                s.delete_webhook_optimistic(id, cx);
+            }
+        });
     }
 }
 
 impl Render for GatewayView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let modal_height = (window.viewport_size().height - px(48.0)).max(px(0.0));
         let starting = self.busy_action == Some("start");
         let restarting = self.busy_action == Some("restart");
         let stopping = self.busy_action == Some("stop");
@@ -197,7 +216,13 @@ impl Render for GatewayView {
         let gw_state = status
             .as_ref()
             .and_then(|st| st.gateway_state.clone())
-            .unwrap_or_else(|| if gw_running { "running".into() } else { "stopped".into() });
+            .unwrap_or_else(|| {
+                if gw_running {
+                    "running".into()
+                } else {
+                    "stopped".into()
+                }
+            });
         let connected_platforms = platforms
             .iter()
             .filter(|p| p.connected || p.configured)
@@ -230,6 +255,7 @@ impl Render for GatewayView {
                         div()
                             .w_full()
                             .max_w(px(940.0))
+                            .flex_shrink_0()
                             .flex()
                             .flex_col()
                             .gap(px(18.0))
@@ -263,6 +289,7 @@ impl Render for GatewayView {
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_wrap()
                                             .items_center()
                                             .gap(px(8.0))
                                             .child(
@@ -320,8 +347,8 @@ impl Render for GatewayView {
                             .child(
                                 div()
                                     .w_full()
-                                    .grid()
-                                    .grid_cols(3)
+                                    .flex()
+                                    .flex_wrap()
                                     .gap(px(12.0))
                                     .child(stat_card(
                                         &theme,
@@ -376,7 +403,7 @@ impl Render for GatewayView {
                                                     .child(cursor_icon("refresh", 12.5, theme.text_secondary))
                                                     .child("Refresh")
                                                     .on_click(cx.listener(|v, _, _, cx| {
-                                                        v.app.update(cx, |s, cx| s.refresh_capabilities(false, cx));
+                                                        v.app.update(cx, |s, cx| s.refresh_gateway_data(cx));
                                                     })),
                                             ),
                                     )
@@ -406,7 +433,7 @@ impl Render for GatewayView {
                                         } else {
                                             "Unconfigured"
                                         };
-                                        gb_row(&theme)
+                                        gb_row(&theme).flex_wrap()
                                             .child(
                                                 div()
                                                     .flex()
@@ -491,7 +518,7 @@ impl Render for GatewayView {
                                     .children(webhooks.iter().enumerate().map(|(idx, hook)| {
                                         let hid = hook.id.clone();
                                         let name = hook.name.clone().unwrap_or_else(|| hook.id.clone());
-                                        gb_row(&theme)
+                                        gb_row(&theme).flex_wrap()
                                             .child(
                                                 div()
                                                     .flex()
@@ -534,9 +561,10 @@ impl Render for GatewayView {
             )
             // Add Webhook Modal
             .when(self.webhook_modal.is_open(), |d| {
-                d.child(
+                d.child(deferred(
                     div()
                         .id("hook-modal-backdrop")
+                        .occlude()
                         .absolute()
                         .inset_0()
                         .child(self.webhook_modal.backdrop("webhook-scrim-enter", theme.bg_scrim))
@@ -551,6 +579,8 @@ impl Render for GatewayView {
                             div()
                                 .id("hook-modal-card")
                                 .w(px(460.0))
+                                .max_w_full()
+                                .max_h(modal_height)
                                 .rounded(px(18.0))
                                 .bg(theme.bg_elevated)
                                 .border_1()
@@ -610,15 +640,16 @@ impl Render for GatewayView {
                                                 })),
                                         )
                                         .child(
-                                            gb_btn("hook-save", &theme, BtnVariant::Primary, false, false)
+                                            gb_btn("hook-save", &theme, BtnVariant::Primary, false, !has_client || self.saving_webhook)
                                                 .child("Save Webhook")
                                                 .on_click(cx.listener(|v, _, window, cx| {
                                                     v.create_webhook(window, cx);
                                                 })),
                                         ),
-                                ),
+                                )
+                                .overflow_y_scrollbar()
                         )),
-                )
+                ))
             })
     }
 }
@@ -638,6 +669,8 @@ fn stat_card(
         .p(px(16.0))
         .flex()
         .flex_col()
+        .flex_1()
+        .min_w(px(135.0))
         .gap(px(6.0))
         .child(
             div()

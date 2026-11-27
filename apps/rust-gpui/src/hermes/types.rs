@@ -189,6 +189,10 @@ pub struct HermesToolCall {
     pub status: ToolCallStatus,
     pub duration_ms: Option<u64>,
     pub preview: Option<String>,
+    #[serde(default)]
+    pub inline_diff: Option<String>,
+    #[serde(default)]
+    pub waiting_approval: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -680,11 +684,33 @@ pub struct HermesLearningGraph {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HermesSessionUsage {
+    #[serde(default, alias = "input")]
     pub input_tokens: Option<u64>,
+    #[serde(default, alias = "prompt")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, alias = "output")]
     pub output_tokens: Option<u64>,
+    #[serde(default, alias = "completion")]
+    pub completion_tokens: Option<u64>,
+    #[serde(default, alias = "reasoning")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, alias = "total")]
     pub total_tokens: Option<u64>,
-    pub context_tokens: Option<u64>,
+    #[serde(default, alias = "context_tokens")]
+    pub context_used: Option<u64>,
+    #[serde(default, alias = "context_max")]
     pub context_limit: Option<u64>,
+    #[serde(default)]
+    pub context_percent: Option<f64>,
+    #[serde(default)]
+    pub cache_hit_pct: Option<f64>,
+    #[serde(default)]
+    pub avg_tps: Option<f64>,
+    #[serde(default)]
+    pub avg_latency_s: Option<f64>,
+    #[serde(default)]
+    pub active_subagents: Option<u64>,
+    #[serde(default)]
     pub cost_usd: Option<f64>,
 }
 
@@ -719,7 +745,12 @@ pub enum HermesStreamEvent {
     },
     StatusUpdate {
         session_id: Option<String>,
+        kind: Option<String>,
         text: String,
+    },
+    SessionTitle {
+        session_id: Option<String>,
+        title: String,
     },
     MessageStart {
         session_id: Option<String>,
@@ -738,6 +769,10 @@ pub enum HermesStreamEvent {
         content: String,
         thinking: Option<String>,
     },
+    ToolGenerating {
+        session_id: Option<String>,
+        name: String,
+    },
     ToolStart {
         session_id: Option<String>,
         tool_call: HermesToolCall,
@@ -753,6 +788,34 @@ pub enum HermesStreamEvent {
         output: Option<String>,
         error: Option<String>,
         duration_ms: Option<u64>,
+        inline_diff: Option<String>,
+    },
+    SubagentStart {
+        session_id: Option<String>,
+        subagent_id: String,
+        parent_id: Option<String>,
+        child_session_id: Option<String>,
+        depth: u32,
+        goal: String,
+        model: Option<String>,
+    },
+    SubagentUpdate {
+        session_id: Option<String>,
+        subagent_id: String,
+        operation: String,
+        tool_name: Option<String>,
+        tool_count: Option<u64>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    },
+    SubagentComplete {
+        session_id: Option<String>,
+        subagent_id: String,
+        status: String,
+        summary: Option<String>,
+        duration_ms: Option<u64>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
     },
     TodoUpdated {
         session_id: Option<String>,
@@ -780,6 +843,9 @@ pub enum HermesStreamEvent {
         session_id: Option<String>,
         content: Option<String>,
         thinking: Option<String>,
+        status: Option<String>,
+        error: Option<String>,
+        usage: Option<HermesSessionUsage>,
     },
     Error {
         session_id: Option<String>,

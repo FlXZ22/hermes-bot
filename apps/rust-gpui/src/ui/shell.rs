@@ -1,5 +1,5 @@
 use crate::face::FaceLayer;
-use crate::state::app_state::{AppState, AppViewId};
+use crate::state::app_state::{AppState, AppViewId, RightPaneTabId};
 use crate::theme::components::{cursor_icon, FONT_SANS};
 use crate::theme::tokens::ThemeMode;
 use crate::ui::chat::ChatView;
@@ -7,6 +7,7 @@ use crate::ui::inspector::right_pane::RightSidePaneView;
 use crate::ui::modals::avatar_editor::AvatarEditorModal;
 use crate::ui::modals::command_palette::CommandPaletteModal;
 use crate::ui::modals::model_picker::ModelPickerModal;
+use crate::ui::modals::project_picker::ProjectPickerModal;
 use crate::ui::motion::{toast_enter, view_enter, EntranceKey, SpringValue};
 use crate::ui::sidebar::SidebarView;
 use crate::ui::views::analytics::AnalyticsView;
@@ -21,10 +22,46 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::time::{Duration, Instant};
 
+#[derive(PartialEq, Eq)]
+struct ShellSnapshot {
+    theme_mode: ThemeMode,
+    setup_open: bool,
+    initializing: bool,
+    active_view: AppViewId,
+    sidebar_collapsed: bool,
+    right_pane_open: bool,
+    model_picker_open: bool,
+    avatar_editor_open: bool,
+    command_palette_open: bool,
+    project_picker_open: bool,
+    toast_at: Option<Instant>,
+    shell_version: u64,
+}
+
+impl ShellSnapshot {
+    fn from_state(s: &AppState) -> Self {
+        Self {
+            theme_mode: s.theme_mode(),
+            setup_open: s.setup_open,
+            initializing: s.initializing,
+            active_view: s.active_view,
+            sidebar_collapsed: s.sidebar_collapsed,
+            right_pane_open: s.right_pane_open,
+            model_picker_open: s.model_picker_open,
+            avatar_editor_open: s.avatar_editor_target.is_some(),
+            command_palette_open: s.command_palette_open,
+            project_picker_open: s.project_picker_open,
+            toast_at: s.toast.as_ref().map(|(_, at)| *at),
+            shell_version: s.shell_version,
+        }
+    }
+}
+
 pub struct HermesShell {
     app: Entity<AppState>,
     focus_handle: FocusHandle,
     last_theme_mode: Option<ThemeMode>,
+    last_snapshot: ShellSnapshot,
 
     // Always-hot primary views
     welcome: Entity<WelcomeView>,
@@ -48,7 +85,8 @@ pub struct HermesShell {
     model_picker: Option<Entity<ModelPickerModal>>,
     avatar_editor: Option<Entity<AvatarEditorModal>>,
     command_palette: Option<Entity<CommandPaletteModal>>,
-    open_modals: (bool, bool, bool),
+    project_picker: Option<Entity<ProjectPickerModal>>,
+    open_modals: (bool, bool, bool, bool),
 
     toast_task: Option<(Instant, Task<()>)>,
     toast_entrance: EntranceKey<Instant>,
@@ -62,17 +100,21 @@ impl HermesShell {
         let chat = cx.new(|cx| ChatView::new(app.clone(), window, cx));
         window.focus(&focus_handle, cx);
 
-        // Observe AppState changes, sync gpui-component ThemeMode, and manage toast auto-dismiss
+        // Observe AppState changes, sync gpui-component ThemeMode, and manage toast auto-dismiss.
+        // Only notify the shell when shell-level state changes so streaming deltas never re-render chrome.
         cx.observe(&app, |this, app_entity, cx| {
-            let (mode, toast_at) = {
+            let snap = {
                 let s = app_entity.read(cx);
-                (s.theme_mode(), s.toast.as_ref().map(|(_, at)| *at))
+                ShellSnapshot::from_state(s)
             };
-            if this.last_theme_mode != Some(mode) {
-                this.last_theme_mode = Some(mode);
-                sync_gpui_component_theme(mode, cx);
+            if this.last_theme_mode != Some(snap.theme_mode) {
+                this.last_theme_mode = Some(snap.theme_mode);
+                sync_gpui_component_theme(snap.theme_mode, cx);
             }
-            if let Some(at) = toast_at.filter(|at| this.toast_task.as_ref().map(|(t, _)| t) != Some(at)) {
+            if let Some(at) = snap
+                .toast_at
+                .filter(|at| this.toast_task.as_ref().map(|(t, _)| t) != Some(at))
+            {
                 let app_toast = app_entity.clone();
                 let delay = Duration::from_secs(3).saturating_sub(at.elapsed());
                 this.toast_task = Some((at, cx.spawn(async move |shell, cx| {
@@ -81,6 +123,7 @@ impl HermesShell {
                         app_toast.update(cx, |s, cx| {
                             if s.toast.as_ref().is_some_and(|(_, current)| *current == at) {
                                 s.toast = None;
+                                s.bump_shell();
                                 cx.notify();
                             }
                         });
@@ -88,11 +131,17 @@ impl HermesShell {
                     });
                 })));
             }
-            cx.notify();
+            if this.last_snapshot != snap {
+                this.last_snapshot = snap;
+                cx.notify();
+            }
         })
         .detach();
 
-        let initial_mode = app.read(cx).theme_mode();
+        let (initial_mode, initial_snapshot) = {
+            let s = app.read(cx);
+            (s.theme_mode(), ShellSnapshot::from_state(s))
+        };
         sync_gpui_component_theme(initial_mode, cx);
 
         // Kick off saved connection bootstrap
@@ -104,6 +153,7 @@ impl HermesShell {
             app,
             focus_handle,
             last_theme_mode: Some(initial_mode),
+            last_snapshot: initial_snapshot,
             welcome,
             sidebar,
             chat,
@@ -122,7 +172,8 @@ impl HermesShell {
             model_picker: None,
             avatar_editor: None,
             command_palette: None,
-            open_modals: (false, false, false),
+            project_picker: None,
+            open_modals: (false, false, false, false),
             toast_task: None,
             toast_entrance: EntranceKey::new(),
         }
@@ -136,6 +187,39 @@ impl HermesShell {
     ) {
         let ks = &event.keystroke;
         let primary = ks.modifiers.control || ks.modifiers.platform;
+        let in_workspace = {
+            let s = self.app.read(cx);
+            !s.setup_open && !s.initializing
+        };
+        if ks.key == "escape" {
+            let mut closed = false;
+            self.app.update(cx, |s, cx| {
+                if s.command_palette_open {
+                    s.command_palette_open = false;
+                    closed = true;
+                } else if s.project_picker_open {
+                    s.project_picker_open = false;
+                    closed = true;
+                } else if s.model_picker_open {
+                    s.model_picker_open = false;
+                    closed = true;
+                } else if s.avatar_editor_target.is_some() {
+                    s.avatar_editor_target = None;
+                    closed = true;
+                }
+                if closed {
+                    s.bump_shell();
+                    cx.notify();
+                }
+            });
+            if closed {
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if !in_workspace {
+            return;
+        }
         if primary && ks.key.eq_ignore_ascii_case("k") {
             self.app.update(cx, |s, cx| {
                 s.command_palette_open = !s.command_palette_open;
@@ -143,6 +227,7 @@ impl HermesShell {
                     s.model_picker_open = false;
                     s.avatar_editor_target = None;
                 }
+                s.bump_shell();
                 cx.notify();
             });
             cx.stop_propagation();
@@ -158,6 +243,8 @@ impl HermesShell {
         if primary && ks.key.eq_ignore_ascii_case("b") {
             self.app.update(cx, |s, cx| {
                 s.sidebar_collapsed = !s.sidebar_collapsed;
+                s.bump_sidebar();
+                s.bump_shell();
                 cx.notify();
             });
             cx.stop_propagation();
@@ -166,6 +253,14 @@ impl HermesShell {
         if primary && matches!(ks.key.as_str(), "\\" | "backslash") {
             self.app.update(cx, |s, cx| {
                 s.right_pane_open = !s.right_pane_open;
+                if s.right_pane_open {
+                    match s.right_pane_tab {
+                        RightPaneTabId::Files => s.refresh_inspector_files(cx),
+                        RightPaneTabId::Git => s.refresh_inspector_git(cx),
+                        _ => {}
+                    }
+                }
+                s.bump_shell();
                 cx.notify();
             });
             cx.stop_propagation();
@@ -178,31 +273,10 @@ impl HermesShell {
                     s.command_palette_open = false;
                     s.avatar_editor_target = None;
                 }
+                s.bump_shell();
                 cx.notify();
             });
             cx.stop_propagation();
-            return;
-        }
-        if ks.key == "escape" {
-            let mut closed = false;
-            self.app.update(cx, |s, cx| {
-                if s.command_palette_open {
-                    s.command_palette_open = false;
-                    closed = true;
-                } else if s.model_picker_open {
-                    s.model_picker_open = false;
-                    closed = true;
-                } else if s.avatar_editor_target.is_some() {
-                    s.avatar_editor_target = None;
-                    closed = true;
-                }
-                if closed {
-                    cx.notify();
-                }
-            });
-            if closed {
-                cx.stop_propagation();
-            }
         }
     }
 }
@@ -226,6 +300,7 @@ impl Render for HermesShell {
             model_picker_open,
             avatar_editor_open,
             command_palette_open,
+            project_picker_open,
             toast_msg,
         ) = {
             let s = self.app.read(cx);
@@ -238,15 +313,17 @@ impl Render for HermesShell {
                 s.model_picker_open,
                 s.avatar_editor_target.is_some(),
                 s.command_palette_open,
-                 s.toast.clone(),
+                s.project_picker_open,
+                s.toast.clone(),
             )
         };
 
-        let modals = (model_picker_open, avatar_editor_open, command_palette_open);
+        let modals = (model_picker_open, avatar_editor_open, command_palette_open, project_picker_open);
         let previous_modals = std::mem::replace(&mut self.open_modals, modals);
         if (previous_modals.0 && !modals.0)
             || (previous_modals.1 && !modals.1)
             || (previous_modals.2 && !modals.2)
+            || (previous_modals.3 && !modals.3)
         {
             let focus_handle = self.focus_handle.clone();
             // After Escape or backdrop dismissal the modal's input may still own
@@ -258,9 +335,10 @@ impl Render for HermesShell {
             });
         }
 
+        let show_workspace = !setup_open && !initializing;
         let app = self.app.clone();
         let full = Some(relative(1.).into());
-        let center_content: AnyElement = match active_view {
+        let center_content: Option<AnyElement> = show_workspace.then(|| match active_view {
             AppViewId::Chat => self.chat_faces.wrap(self.chat.clone().cached(StyleRefinement {
                 size: SizeRefinement { width: full, height: full },
                 min_size: SizeRefinement { width: Some(px(0.).into()), height: Some(px(0.).into()) },
@@ -302,11 +380,12 @@ impl Render for HermesShell {
                 .get_or_insert_with(|| cx.new(|cx| SettingsView::new(app.clone(), window, cx)))
                 .clone()
                 .into_any_element(),
-        };
+        });
 
-        let show_workspace = !setup_open && !initializing;
+        let mut sidebar_w = 0.0_f32;
         let sidebar = show_workspace.then(|| {
             let width = self.sidebar.update(cx, |sidebar, cx| sidebar.measure_width(window, cx));
+            sidebar_w = width;
             self.sidebar_faces.wrap(self.sidebar.clone().cached(StyleRefinement {
                 size: SizeRefinement { width: Some(px(width).into()), height: full },
                 flex_shrink: Some(0.),
@@ -321,6 +400,7 @@ impl Render for HermesShell {
             self.right_pane_progress.snap(0.0);
             0.0
         };
+        let max_inspector_w = (f32::from(window.viewport_size().width) - sidebar_w - 320.0).max(240.0);
         // Keep the pane mounted through the last visible frame of the closing slide.
         let right_pane_el = if show_workspace && (right_pane_open || pane_progress > 0.0) {
             let pane = self.right_pane.get_or_insert_with(|| {
@@ -329,7 +409,14 @@ impl Render for HermesShell {
             if pane.read(cx).open_progress() != pane_progress {
                 pane.update(cx, |pane, cx| pane.set_open_progress(pane_progress, cx));
             }
-            Some(pane.clone())
+            Some(
+                div()
+                    .h_full()
+                    .max_w(px(max_inspector_w))
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .child(pane.clone()),
+            )
         } else {
             None
         };
@@ -370,6 +457,18 @@ impl Render for HermesShell {
             None
         };
 
+        let project_picker_el = if project_picker_open {
+            Some(
+                self.project_picker
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| ProjectPickerModal::new(app.clone(), window, cx))
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
         div()
             .id("hermes-shell-root")
             .track_focus(&self.focus_handle)
@@ -400,7 +499,11 @@ impl Render for HermesShell {
                             .overflow_hidden()
                             .child(view_enter(
                                 view_id,
-                                div().size_full().flex().flex_col().child(center_content),
+                                div()
+                                    .size_full()
+                                    .flex()
+                                    .flex_col()
+                                    .children(center_content),
                             )),
                     )
                     .when_some(right_pane_el, |d, rp| d.child(rp))
@@ -410,6 +513,7 @@ impl Render for HermesShell {
             .when_some(model_picker_el, |d, m| d.child(m))
             .when_some(avatar_editor_el, |d, m| d.child(m))
             .when_some(command_palette_el, |d, m| d.child(m))
+            .when_some(project_picker_el, |d, m| d.child(m))
             // Floating bottom-right Toast notification
             .when_some(toast_msg, |d, (msg, at)| {
                 d.child(toast_enter(

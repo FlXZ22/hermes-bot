@@ -33,7 +33,9 @@ pub struct CommandPaletteModal {
     need_focus: bool,
     query_input: Entity<InputState>,
     selected_idx: usize,
-    scroll_handle: ScrollHandle,
+    visible_items: Vec<PaletteItem>,
+    scroll_handle: UniformListScrollHandle,
+    _keyboard: Subscription,
     smooth_scroller: SmoothScroller,
 }
 
@@ -58,20 +60,54 @@ impl CommandPaletteModal {
         cx.subscribe(&query_input, |this, _, ev: &InputEvent, cx| match ev {
             InputEvent::Change => {
                 this.selected_idx = 0;
+                this.visible_items.clear();
+                this.smooth_scroller.cancel();
+                this.scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(Point::default());
                 cx.notify();
             }
             InputEvent::PressEnter { .. } => {
-                let items = this.build_items(cx);
-                if let Some(it) = items.get(this.selected_idx) {
-                    this.run_action(it.action.clone(), cx);
+                if let Some(action) = this
+                    .visible_items
+                    .get(this.selected_idx)
+                    .map(|item| item.action.clone())
+                {
+                    this.run_action(action, cx);
                 }
             }
             _ => {}
         })
         .detach();
 
-        let scroll_handle = ScrollHandle::new();
-        let smooth_scroller = SmoothScroller::for_handle(scroll_handle.clone());
+        let palette = cx.weak_entity();
+        let query_focus = query_input.read(cx).focus_handle(cx);
+        let keyboard = cx.intercept_keystrokes(move |event, window, cx| {
+            let key = &event.keystroke;
+            if key.modifiers.control
+                || key.modifiers.platform
+                || key.modifiers.alt
+                || key.modifiers.shift
+                || !query_focus.is_focused(window)
+            {
+                return;
+            }
+            let direction = match key.key.as_str() {
+                "up" => -1,
+                "down" => 1,
+                _ => return,
+            };
+            let _ = palette.update(cx, |this, cx| {
+                if this.app.read(cx).command_palette_open {
+                    this.move_selection(direction, cx);
+                    cx.stop_propagation();
+                }
+            });
+        });
+        let scroll_handle = UniformListScrollHandle::new();
+        let smooth_scroller = SmoothScroller::for_uniform_list(scroll_handle.clone());
 
         Self {
             app,
@@ -79,9 +115,24 @@ impl CommandPaletteModal {
             need_focus: true,
             query_input,
             selected_idx: 0,
+            visible_items: Vec::new(),
             scroll_handle,
+            _keyboard: keyboard,
             smooth_scroller,
         }
+    }
+
+    fn move_selection(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let len = self.visible_items.len();
+        if len == 0 {
+            return;
+        }
+        self.selected_idx =
+            (self.selected_idx as isize + direction).rem_euclid(len as isize) as usize;
+        self.smooth_scroller.cancel();
+        self.scroll_handle
+            .scroll_to_item(self.selected_idx, ScrollStrategy::Nearest);
+        cx.notify();
     }
 
     fn build_items(&self, cx: &Context<Self>) -> Vec<PaletteItem> {
@@ -187,7 +238,7 @@ impl CommandPaletteModal {
                 action: PaletteAction::OpenBoard(b.slug.clone()),
             });
         }
-        for sess in s.sessions.iter().take(20) {
+        for sess in &s.sessions {
             items.push(PaletteItem {
                 id: format!("sess:{}", sess.id),
                 label: sess.display_title().to_string(),
@@ -199,30 +250,35 @@ impl CommandPaletteModal {
 
         let q = self.query_input.read(cx).value().trim().to_lowercase();
         if q.is_empty() {
-            items.truncate(14);
-            items
-        } else {
-            items
-                .into_iter()
-                .filter(|it| format!("{} {}", it.label, it.detail).to_lowercase().contains(&q))
-                .take(14)
-                .collect()
+            return items;
         }
+        items.retain(|item| {
+            let label = item.label.to_lowercase();
+            let detail = item.detail.to_lowercase();
+            q.split_whitespace()
+                .all(|word| label.contains(word) || detail.contains(word))
+        });
+        items
     }
 
     fn run_action(&mut self, action: PaletteAction, cx: &mut Context<Self>) {
+        if !self.app.read(cx).command_palette_open {
+            return;
+        }
         self.app.update(cx, |s, cx| {
             s.command_palette_open = false;
+            s.bump_shell();
             match action {
                 PaletteAction::NewChat => s.create_new_session(None, None, None, None, None, cx),
                 PaletteAction::PickModel => s.model_picker_open = true,
                 PaletteAction::RestartBackend => s.restart_backend(cx),
                 PaletteAction::RefreshModels => s.refresh_models(cx),
                 PaletteAction::ToggleTheme => s.toggle_theme(cx),
-                PaletteAction::OpenView(v) => s.active_view = v,
+                PaletteAction::OpenView(v) => s.set_active_view(v, cx),
                 PaletteAction::OpenBoard(slug) => {
                     s.active_board_slug = slug;
-                    s.active_view = AppViewId::Boards;
+                    s.bump_sidebar();
+                    s.set_active_view(AppViewId::Boards, cx);
                 }
                 PaletteAction::SelectSession(sid) => s.select_session(Some(sid), cx),
             }
@@ -245,31 +301,46 @@ impl Render for CommandPaletteModal {
         if !was_open || self.need_focus {
             self.need_focus = false;
             self.selected_idx = 0;
+            self.smooth_scroller.cancel();
+            self.scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(Point::default());
             self.query_input
                 .update(cx, |st, cx| st.set_value("", window, cx));
             let fh = self.query_input.read(cx).focus_handle(cx);
             window.on_next_frame(move |window, cx| {
-                window.focus(&fh, cx);
+                if fh.is_rendered(window) {
+                    window.focus(&fh, cx);
+                }
             });
         }
-        let items = self.build_items(cx);
+        self.visible_items = self.build_items(cx);
+        let count = self.visible_items.len();
+        self.selected_idx = self.selected_idx.min(count.saturating_sub(1));
+        let top = (window.viewport_size().height * 0.12).min(px(80.0));
+        let max_height = (window.viewport_size().height - top - px(84.0)).clamp(px(0.0), px(360.0));
+        let list_height = px(count as f32 * 44.0).min(max_height);
 
         deferred(
             div()
                 .id("cmd-palette-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .child(self.motion.backdrop("cmd-palette-scrim-enter", theme.bg_scrim))
                 .flex()
                 .items_start()
                 .justify_center()
-                .pt(px(80.0))
+                .pt(top)
                 .px(px(20.0))
                 .font_family(FONT_SANS)
                 .text_color(theme.text_primary)
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.app.update(cx, |s, cx| {
                         s.command_palette_open = false;
+                        s.bump_shell();
                         cx.notify();
                     });
                 }))
@@ -317,68 +388,58 @@ impl Render for CommandPaletteModal {
                                         .child("Esc"),
                                 ),
                         )
-                        .child(
+                        .child(if count == 0 {
+                            div()
+                                .p(px(16.0))
+                                .text_color(theme.text_secondary)
+                                .child("No matching commands, boards, or sessions.")
+                                .into_any_element()
+                        } else {
                             div()
                                 .w_full()
-                                .max_h(px(360.0))
-                                .overflow_hidden()
+                                .h(list_height)
+                                .min_h_0()
                                 .relative()
                                 .child(
-                                    div()
-                                        .id("cmd-palette-list")
-                                        .track_scroll(&self.scroll_handle)
-                                        .p(px(8.0))
-                                        .pb(px(12.0))
-                                        .max_h(px(360.0))
-                                        .overflow_y_scroll()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(2.0))
-                                        .children(items.into_iter().enumerate().map(|(idx, item)| {
-                                            let active = idx == self.selected_idx;
-                                            let act = item.action.clone();
-                                            div()
+                                    uniform_list("cmd-palette-list", count, cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                                        range.filter_map(|index| {
+                                            let item = this.visible_items.get(index)?;
+                                            let active = index == this.selected_idx;
+                                            let action = item.action.clone();
+                                            Some(div()
                                                 .id(SharedString::from(format!("cmd-item-{}", item.id)))
                                                 .w_full()
-                                                .px(px(9.0))
-                                                .py(px(7.0))
+                                                .h(px(44.0))
+                                                .px(px(14.0))
                                                 .rounded(px(9.0))
-                                                .bg(if active {
-                                                    theme.bg_active
-                                                } else {
-                                                    SandTheme::transparent()
-                                                })
+                                                .bg(if active { theme.bg_active } else { SandTheme::transparent() })
                                                 .flex()
                                                 .items_center()
                                                 .gap(px(9.0))
                                                 .cursor_pointer()
-                                                .hover(|st| st.bg(theme.bg_active))
+                                                .hover(|style| style.bg(theme.bg_active))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.run_action(act.clone(), cx);
+                                                    this.run_action(action.clone(), cx);
                                                 }))
                                                 .child(cursor_icon(item.icon, 15.0, theme.text_secondary))
                                                 .child(
                                                     div()
                                                         .flex_1()
                                                         .min_w_0()
-                                                        .overflow_hidden()
-                                                        .text_ellipsis()
-                                                        .whitespace_nowrap()
-                                                        .text_size(px(13.0))
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .child(item.label),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(12.0))
-                                                        .text_color(theme.text_tertiary)
-                                                        .child(item.detail),
-                                                )
-                                        })),
+                                                        .flex()
+                                                        .flex_col()
+                                                        .child(div().truncate().text_size(px(13.0)).font_weight(FontWeight::MEDIUM).child(item.label.clone()))
+                                                        .child(div().truncate().text_size(px(11.0)).text_color(theme.text_tertiary).child(item.detail.clone())),
+                                                ))
+                                        }).collect::<Vec<_>>()
+                                    }))
+                                    .size_full()
+                                    .track_scroll(&self.scroll_handle),
                                 )
                                 .vertical_scrollbar(&self.scroll_handle)
-                                .child(smooth_scroll_layer(&self.smooth_scroller)),
-                        ),
+                                .child(smooth_scroll_layer(&self.smooth_scroller))
+                                .into_any_element()
+                        }),
                 )),
         )
         .into_any_element()

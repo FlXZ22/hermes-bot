@@ -7,6 +7,7 @@ use crate::theme::tokens::{resolve_bot_color, SandTheme, BOT_COLOR_PRESETS};
 use crate::ui::motion::ModalMotion;
 use gpui::*;
 use gpui_component::input::{Input, InputState};
+use gpui_component::scroll::ScrollableElement;
 
 const PREVIEW_STATES: &[(BotFaceState, &str)] = &[
     (BotFaceState::Idle, "Idle"),
@@ -84,6 +85,13 @@ impl Render for AvatarEditorModal {
 
         if self.synced_seed.as_deref() != Some(target.seed.as_str()) {
             self.synced_seed = Some(target.seed.clone());
+            self.preview_state = BotFaceState::Idle;
+            let focus = self.name_input.read(cx).focus_handle(cx);
+            window.on_next_frame(move |window, cx| {
+                if focus.is_rendered(window) {
+                    window.focus(&focus, cx);
+                }
+            });
             let init_name = existing
                 .as_ref()
                 .and_then(|e| e.display_name.clone())
@@ -102,12 +110,14 @@ impl Render for AvatarEditorModal {
             self.preview_state = BotFaceState::Idle;
         }
 
+        let card_height = (window.viewport_size().height - px(48.0)).clamp(px(0.0), px(640.0));
         let seed = target.seed.clone();
         let fallback_title = target.title.clone();
 
         deferred(
             div()
                 .id("avatar-editor-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .child(self.motion.backdrop("avatar-editor-scrim-enter", theme.bg_scrim))
@@ -120,6 +130,7 @@ impl Render for AvatarEditorModal {
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.app.update(cx, |s, cx| {
                         s.avatar_editor_target = None;
+                        s.bump_shell();
                         cx.notify();
                     });
                 }))
@@ -128,7 +139,7 @@ impl Render for AvatarEditorModal {
                         .id("avatar-editor-modal")
                         .w(px(480.0))
                         .max_w_full()
-                        .max_h(px(640.0))
+                        .max_h(card_height)
                         .rounded(px(22.0))
                         .bg(theme.bg_elevated)
                         .border_1()
@@ -158,6 +169,7 @@ impl Render for AvatarEditorModal {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.app.update(cx, |s, cx| {
                                                 s.avatar_editor_target = None;
+                                                s.bump_shell();
                                                 cx.notify();
                                             });
                                         })),
@@ -167,7 +179,7 @@ impl Render for AvatarEditorModal {
                             div()
                                 .id("avatar-editor-body")
                                 .flex_1()
-                                .overflow_y_scroll()
+                                .min_h_0()
                                 .p(px(18.0))
                                 .flex()
                                 .flex_col()
@@ -252,8 +264,7 @@ impl Render for AvatarEditorModal {
                                         .child(
                                             div()
                                                 .id("av-shape-grid")
-                                                .max_h(px(210.0))
-                                                .overflow_y_scroll()
+                                                .flex_shrink_0()
                                                 .flex()
                                                 .flex_wrap()
                                                 .gap(px(6.0))
@@ -349,6 +360,7 @@ impl Render for AvatarEditorModal {
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.app.update(cx, |s, cx| {
                                                         s.avatar_editor_target = None;
+                                                        s.bump_shell();
                                                         cx.notify();
                                                     });
                                                 })),
@@ -374,11 +386,13 @@ impl Render for AvatarEditorModal {
                                                             cx,
                                                         );
                                                         s.avatar_editor_target = None;
+                                                        s.bump_shell();
                                                         cx.notify();
                                                     });
                                                 })),
                                         ),
-                                ),
+                                )
+                                .overflow_y_scrollbar()
                         ),
                 )),
         )

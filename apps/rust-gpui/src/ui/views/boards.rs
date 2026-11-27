@@ -7,7 +7,7 @@ use crate::theme::components::{
 };
 use crate::theme::tokens::{resolve_bot_color, SandTheme};
 use crate::ui::motion::ModalMotion;
-use crate::ui::smooth_scroll::{smooth_scroll_layer, smooth_scroll_layer_xy, SmoothScroller};
+use crate::ui::smooth_scroll::{smooth_scroll_layer, smooth_scroll_layer_x, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
@@ -46,14 +46,17 @@ pub struct BoardsView {
     new_board_color: String,
     kanban_scroll: ScrollHandle,
     kanban_smooth: SmoothScroller,
+    column_scroll: Vec<(ScrollHandle, SmoothScroller)>,
+    board_tabs_scroll: ScrollHandle,
     sessions_scroll: ScrollHandle,
     sessions_smooth: SmoothScroller,
 }
 
 impl BoardsView {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let task_title =
-            cx.new(|cx| InputState::new(window, cx).placeholder("What should Hermes build or investigate?"));
+        let task_title = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("What should Hermes build or investigate?")
+        });
         let task_body = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Detailed context, acceptance criteria, or instructions...")
@@ -66,15 +69,17 @@ impl BoardsView {
         });
         let task_cwd =
             cx.new(|cx| InputState::new(window, cx).placeholder("/home/metis/Projects/..."));
-        let new_board_name =
-            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Frontend Sprint, Research Lab"));
+        let new_board_name = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("e.g. Frontend Sprint, Research Lab")
+        });
         let new_board_desc =
             cx.new(|cx| InputState::new(window, cx).placeholder("Optional description"));
         let new_board_path =
             cx.new(|cx| InputState::new(window, cx).placeholder("/home/metis/Projects/..."));
 
         cx.observe(&app, |_, app_e, cx| {
-            if app_e.read(cx).active_view == AppViewId::Boards {
+            let app = app_e.read(cx);
+            if !app.setup_open && !app.initializing && app.active_view == AppViewId::Boards {
                 cx.notify();
             }
         })
@@ -105,12 +110,45 @@ impl BoardsView {
             new_board_color: "violet".into(),
             kanban_scroll,
             kanban_smooth,
+            column_scroll: HermesKanbanStatus::COLUMNS
+                .iter()
+                .map(|_| {
+                    let handle = ScrollHandle::new();
+                    let scroller = SmoothScroller::for_handle(handle.clone());
+                    (handle, scroller)
+                })
+                .collect(),
+            board_tabs_scroll: ScrollHandle::new(),
             sessions_scroll,
             sessions_smooth,
         }
     }
 
-    fn open_new_task(&mut self, default_status: HermesKanbanStatus, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_board(&mut self, slug: String, cx: &mut Context<Self>) {
+        if self.app.read(cx).active_board_slug == slug {
+            return;
+        }
+        self.kanban_smooth.cancel();
+        self.kanban_scroll.set_offset(Point::default());
+        self.sessions_smooth.cancel();
+        self.sessions_scroll.set_offset(Point::default());
+        for (handle, smooth) in &self.column_scroll {
+            smooth.cancel();
+            handle.set_offset(Point::default());
+        }
+        self.app.update(cx, |app, cx| {
+            app.active_board_slug = slug;
+            app.bump_sidebar();
+            cx.notify();
+        });
+    }
+
+    fn open_new_task(
+        &mut self,
+        default_status: HermesKanbanStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (prof, model, prov, cwd) = {
             let s = self.app.read(cx);
             let wp = s
@@ -119,13 +157,22 @@ impl BoardsView {
                 .find(|b| b.slug == s.active_board_slug)
                 .and_then(|b| b.workspace_path.clone())
                 .unwrap_or_default();
-            (s.active_profile.clone(), s.active_model.clone(), s.active_provider.clone(), wp)
+            (
+                s.active_profile.clone(),
+                s.active_model.clone(),
+                s.active_provider.clone(),
+                wp,
+            )
         };
         self.editing_task_id = None;
-        self.task_title.update(cx, |st, cx| st.set_value("", window, cx));
-        self.task_body.update(cx, |st, cx| st.set_value("", window, cx));
-        self.task_priority.update(cx, |st, cx| st.set_value("0", window, cx));
-        self.task_cwd.update(cx, |st, cx| st.set_value(cwd, window, cx));
+        self.task_title
+            .update(cx, |st, cx| st.set_value("", window, cx));
+        self.task_body
+            .update(cx, |st, cx| st.set_value("", window, cx));
+        self.task_priority
+            .update(cx, |st, cx| st.set_value("0", window, cx));
+        self.task_cwd
+            .update(cx, |st, cx| st.set_value(cwd, window, cx));
         self.task_status = default_status;
         self.task_assignee = prof;
         self.task_model = model;
@@ -134,24 +181,33 @@ impl BoardsView {
         cx.notify();
     }
 
-    fn open_edit_task(&mut self, task: &HermesKanbanTask, window: &mut Window, cx: &mut Context<Self>) {
-        let (prof, model, prov) = {
-            let s = self.app.read(cx);
-            (s.active_profile.clone(), s.active_model.clone(), s.active_provider.clone())
-        };
+    fn open_edit_task(
+        &mut self,
+        task: &HermesKanbanTask,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.editing_task_id = Some(task.id.clone());
         let title = task.title.clone();
-        let body = task.body.clone().or_else(|| task.description.clone()).unwrap_or_default();
+        let body = task
+            .body
+            .clone()
+            .or_else(|| task.description.clone())
+            .unwrap_or_default();
         let prio = task.priority_num().to_string();
         let cwd = task.cwd.clone().unwrap_or_default();
-        self.task_title.update(cx, |st, cx| st.set_value(title, window, cx));
-        self.task_body.update(cx, |st, cx| st.set_value(body, window, cx));
-        self.task_priority.update(cx, |st, cx| st.set_value(prio, window, cx));
-        self.task_cwd.update(cx, |st, cx| st.set_value(cwd, window, cx));
+        self.task_title
+            .update(cx, |st, cx| st.set_value(title, window, cx));
+        self.task_body
+            .update(cx, |st, cx| st.set_value(body, window, cx));
+        self.task_priority
+            .update(cx, |st, cx| st.set_value(prio, window, cx));
+        self.task_cwd
+            .update(cx, |st, cx| st.set_value(cwd, window, cx));
         self.task_status = task.status;
-        self.task_assignee = task.assignee.clone().unwrap_or(prof);
-        self.task_model = task.model.clone().unwrap_or(model);
-        self.task_provider = task.provider.clone().unwrap_or(prov);
+        self.task_assignee = task.assignee.clone().unwrap_or_default();
+        self.task_model = task.model.clone().unwrap_or_default();
+        self.task_provider = task.provider.clone().unwrap_or_default();
         self.task_modal.set_open(true);
         cx.notify();
     }
@@ -159,10 +215,22 @@ impl BoardsView {
     fn save_task(&mut self, cx: &mut Context<Self>) {
         let title = self.task_title.read(cx).value().trim().to_string();
         if title.is_empty() {
+            self.app
+                .update(cx, |app, cx| app.show_toast("Enter a task title.", cx));
             return;
         }
         let body = self.task_body.read(cx).value().trim().to_string();
-        let prio: i32 = self.task_priority.read(cx).value().trim().parse().unwrap_or(0);
+        let priority = self.task_priority.read(cx).value();
+        let prio = match priority.trim().parse::<i32>() {
+            Ok(value) => value,
+            Err(_) if priority.trim().is_empty() => 0,
+            Err(_) => {
+                self.app.update(cx, |app, cx| {
+                    app.show_toast("Priority must be a whole number.", cx)
+                });
+                return;
+            }
+        };
         let cwd = self.task_cwd.read(cx).value().trim().to_string();
         let status = self.task_status;
         let assignee = self.task_assignee.clone();
@@ -182,9 +250,9 @@ impl BoardsView {
                 existing.body = Some(body);
                 existing.status = status;
                 existing.priority = Some(json!(prio));
-                existing.assignee = Some(assignee);
-                existing.model = Some(model);
-                existing.provider = Some(provider);
+                existing.assignee = (!assignee.is_empty()).then_some(assignee);
+                existing.model = (!model.is_empty()).then_some(model);
+                existing.provider = (!provider.is_empty()).then_some(provider);
                 existing.cwd = if cwd.is_empty() { None } else { Some(cwd) };
                 s.update_task(eid, existing, cx);
             });
@@ -220,7 +288,8 @@ impl BoardsView {
 }
 
 impl Render for BoardsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let modal_height = (window.viewport_size().height - px(48.0)).max(px(0.0));
         let s = self.app.read(cx);
         let theme = s.sand_theme();
         let boards = s.boards.clone();
@@ -312,6 +381,7 @@ impl Render for BoardsView {
                         div()
                             .flex()
                             .items_center()
+                            .flex_wrap()
                             .gap(px(8.0))
                             .child(
                                 gb_segmented_shell(&theme)
@@ -379,9 +449,15 @@ impl Render for BoardsView {
                     .flex_shrink_0()
                     .child(
                         div()
-                            .id("bd-sub-pills")
                             .flex_1()
-                            .overflow_x_scroll()
+                            .min_w_0()
+                            .relative()
+                            .child(
+                                div()
+                                    .id("bd-sub-pills")
+                                    .track_scroll(&self.board_tabs_scroll)
+                                    .w_full()
+                                    .overflow_x_scroll()
                             .flex()
                             .items_center()
                             .gap(px(6.0))
@@ -389,10 +465,7 @@ impl Render for BoardsView {
                                 gb_board_pill("bd-pill-all", &theme, active_slug == "all")
                                     .child("All Boards")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.app.update(cx, |s, cx| {
-                                            s.active_board_slug = "all".into();
-                                            cx.notify();
-                                        });
+                                        this.select_board("all".into(), cx);
                                     })),
                             )
                             .children(boards.iter().map(|b| {
@@ -406,10 +479,7 @@ impl Render for BoardsView {
                                 .child(gb_dot(preset.hex, 7.0))
                                 .child(b.name.clone())
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.app.update(cx, |s, cx| {
-                                        s.active_board_slug = sl.clone();
-                                        cx.notify();
-                                    });
+                                    this.select_board(sl.clone(), cx);
                                 }))
                             }))
                             .child(
@@ -421,6 +491,8 @@ impl Render for BoardsView {
                                         cx.notify();
                                     })),
                             ),
+                            )
+                            .horizontal_scrollbar(&self.board_tabs_scroll)
                     )
                     .when_some(active_board.filter(|b| b.slug != "default"), |d, b| {
                         let sl = b.slug.clone();
@@ -447,11 +519,13 @@ impl Render for BoardsView {
                             .track_scroll(&self.kanban_scroll)
                             .size_full()
                             .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
                             .px(px(20.0))
                     .py(px(16.0))
                     .flex()
                     .gap(px(12.0))
                     .children(HermesKanbanStatus::COLUMNS.iter().enumerate().map(|(col_idx, &(status, label, dot_hex))| {
+                        let (column_scroll, column_smooth) = &self.column_scroll[col_idx];
                         let col_tasks: Vec<HermesKanbanTask> = visible_tasks
                             .iter()
                             .filter(|t| t.status == status)
@@ -515,7 +589,16 @@ impl Render for BoardsView {
                             // Column body
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("col-body-{}", status.as_str())))
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .relative()
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("col-body-{}", status.as_str())))
+                                            .track_scroll(column_scroll)
+                                            .restrict_scroll_to_axis()
+                                            .size_full()
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_y_scroll()
@@ -544,6 +627,7 @@ impl Render for BoardsView {
                                         div()
                                             .id(SharedString::from(format!("task-card-{}", task.id)))
                                             .w_full()
+                                            .flex_shrink_0()
                                             .p(px(11.0))
                                             .rounded(px(13.0))
                                             .bg(theme.bg_elevated)
@@ -670,11 +754,14 @@ impl Render for BoardsView {
                                                 .child("No tasks yet"),
                                         )
                                     }),
+                                    )
+                                    .vertical_scrollbar(column_scroll)
+                                    .child(smooth_scroll_layer(column_smooth).filter_events(|event, _| !event.modifiers.shift))
                             )
                     }))
                     )
                     .horizontal_scrollbar(&self.kanban_scroll)
-                    .child(smooth_scroll_layer_xy(&self.kanban_smooth))
+                    .child(smooth_scroll_layer_x(&self.kanban_smooth))
                     .into_any_element()
             } else {
                 div()
@@ -690,11 +777,13 @@ impl Render for BoardsView {
                             .overflow_y_scroll()
                             .p(px(24.0))
                     .flex()
-                    .justify_center()
+                    .flex_col()
+                    .items_center()
                     .child(
                         div()
                             .w(px(920.0))
                             .max_w_full()
+                            .flex_shrink_0()
                             .flex()
                             .flex_wrap()
                             .gap(px(12.0))
@@ -705,6 +794,7 @@ impl Render for BoardsView {
                                 div()
                                     .id(SharedString::from(format!("bs-card-{}", sess.id)))
                                     .w(px(280.0))
+                                    .max_w_full()
                                     .p(px(14.0))
                                     .rounded(px(14.0))
                                     .bg(theme.bg_elevated)
@@ -784,11 +874,11 @@ impl Render for BoardsView {
             })
             // Task Editor Modal
             .when(self.task_modal.is_open(), |d| {
-                d.child(self.render_task_modal(&theme, &profiles, cx))
+                d.child(self.render_task_modal(&theme, &profiles, modal_height, cx))
             })
             // New Board Modal
             .when(self.board_modal.is_open(), |d| {
-                d.child(self.render_new_board_modal(&theme, cx))
+                d.child(self.render_new_board_modal(&theme, modal_height, cx))
             })
     }
 }
@@ -798,6 +888,7 @@ impl BoardsView {
         &self,
         theme: &SandTheme,
         profiles: &[crate::hermes::types::HermesProfile],
+        modal_height: Pixels,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_edit = self.editing_task_id.is_some();
@@ -806,6 +897,7 @@ impl BoardsView {
         deferred(
             div()
                 .id("task-modal-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .child(self.task_modal.backdrop("task-modal-scrim-enter", theme.bg_scrim))
@@ -821,7 +913,8 @@ impl BoardsView {
                     div()
                         .id("task-modal")
                         .w(px(520.0))
-                        .max_h(px(640.0))
+                        .max_w_full()
+                        .max_h(modal_height.min(px(640.0)))
                         .rounded(px(22.0))
                         .bg(theme.bg_elevated)
                         .border_1()
@@ -858,7 +951,7 @@ impl BoardsView {
                             div()
                                 .id("task-modal-body")
                                 .flex_1()
-                                .overflow_y_scroll()
+                                .min_h_0()
                                 .p(px(18.0))
                                 .flex()
                                 .flex_col()
@@ -992,16 +1085,18 @@ impl BoardsView {
                                                         })),
                                                 ),
                                         ),
-                                ),
+                                )
+                                .overflow_y_scrollbar()
                         ),
                 )),
         )
     }
 
-    fn render_new_board_modal(&self, theme: &SandTheme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_new_board_modal(&self, theme: &SandTheme, modal_height: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
         deferred(
             div()
                 .id("bd-new-board-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .child(self.board_modal.backdrop("board-view-scrim-enter", theme.bg_scrim))
@@ -1017,6 +1112,8 @@ impl BoardsView {
                     div()
                         .id("bd-new-board-modal")
                         .w(px(460.0))
+                                .max_w_full()
+                                .max_h(modal_height)
                         .rounded(px(22.0))
                         .bg(theme.bg_elevated)
                         .border_1()
@@ -1087,7 +1184,8 @@ impl BoardsView {
                                             cx.notify();
                                         })),
                                 ),
-                        ),
+                        )
+                                .overflow_y_scrollbar()
                 )),
         )
     }

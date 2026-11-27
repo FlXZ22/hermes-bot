@@ -475,3 +475,52 @@ fn edge_arrangement_clips_and_merges_overlapping_polygons() {
     assert_eq!(area(&total[0]).abs(), 7.);
     assert_eq!(area(&common[0]).abs(), 1.);
 }
+
+#[test]
+fn face_frame_pipeline_meets_120fps_budget() {
+    use std::time::Instant;
+    let states = [
+        "thinking",
+        "writing",
+        "searching",
+        "streaming",
+        "waiting",
+        "finished",
+        "failed",
+    ];
+    let dt_120hz = 1.0 / 120.0;
+    let mut host = FaceMotionHost::new(Body::Sphere, "thinking", 7, false);
+    // Warm up
+    for _ in 0..24 {
+        host.advance(dt_120hz);
+        let _ = render_tree(&host.frame(), 36.0);
+    }
+
+    let mut samples_us: Vec<f64> = Vec::with_capacity(1000);
+    for i in 0..1000 {
+        if i % 140 == 0 {
+            let st = states[(i / 140) % states.len()];
+            host.set_state(st);
+        }
+        let t0 = Instant::now();
+        host.advance(dt_120hz);
+        let frame = host.frame();
+        let tree = render_tree(&frame, 36.0);
+        let elapsed_us = t0.elapsed().as_secs_f64() * 1_000_000.0;
+        assert!(!tree.body.is_empty());
+        samples_us.push(elapsed_us);
+    }
+    samples_us.sort_by(|a, b| a.total_cmp(b));
+    let avg_us = samples_us.iter().sum::<f64>() / samples_us.len() as f64;
+    let p50_us = samples_us[samples_us.len() / 2];
+    let p95_us = samples_us[(samples_us.len() * 95) / 100];
+    let max_us = *samples_us.last().unwrap_or(&0.0);
+    eprintln!(
+        "[bench] face 1000 frames @ 120Hz (36px): avg={avg_us:.1}us p50={p50_us:.1}us p95={p95_us:.1}us max={max_us:.1}us (budget=8333us)"
+    );
+    // Even in debug mode, CPU geometry/physics work should stay comfortably within the 8.33ms 120 FPS budget.
+    assert!(
+        p95_us < 8_333.0,
+        "face p95 frame time {p95_us:.1}us exceeded 120 FPS budget (8333us)"
+    );
+}

@@ -1,6 +1,7 @@
 mod assets;
 mod backend;
 mod face;
+mod harness;
 mod hermes;
 mod state;
 mod theme;

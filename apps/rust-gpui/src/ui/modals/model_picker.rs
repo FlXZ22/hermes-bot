@@ -7,7 +7,7 @@ use crate::theme::components::{
 };
 use crate::theme::tokens::SandTheme;
 use crate::ui::motion::{gpu_spinner, ModalMotion};
-use crate::ui::smooth_scroll::{smooth_scroll_layer, SmoothScroller};
+use crate::ui::smooth_scroll::{smooth_scroll_layer, NestedScrollRegions, SmoothScroller};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -24,14 +24,20 @@ pub struct ModelPickerModal {
     save_default: bool,
     list_scroll: UniformListScrollHandle,
     list_smooth: SmoothScroller,
+    body_scroll: ScrollHandle,
+    body_smooth: SmoothScroller,
+    nested_scroll: NestedScrollRegions,
     visible_models: Vec<HermesModelOption>,
+    keyboard_row: Option<usize>,
+    _keyboard: Subscription,
 }
 
 impl ModelPickerModal {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Search models or providers (e.g. anti-gravity, claude, grok, gemini)...")
+            InputState::new(window, cx).placeholder(
+                "Search models or providers (e.g. anti-gravity, claude, grok, gemini)...",
+            )
         });
         let custom_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -49,31 +55,89 @@ impl ModelPickerModal {
             }
         })
         .detach();
-        cx.subscribe(&search_input, |_, _, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::Change) {
-                cx.notify();
-            }
-        })
-        .detach();
-        cx.subscribe_in(&custom_input, window, |this, inp, ev: &InputEvent, window, cx| {
-            if let InputEvent::PressEnter { .. } = ev {
-                let val = inp.read(cx).value().trim().to_string();
-                if !val.is_empty() {
-                    let save_def = this.save_default;
-                    inp.update(cx, |st, cx| st.set_value("", window, cx));
-                    this.app.update(cx, |s, cx| {
-                        let prov = s.active_provider.clone();
-                        s.select_model(val, Some(prov), save_def, cx);
-                        s.model_picker_open = false;
-                        cx.notify();
-                    });
+        cx.subscribe(
+            &search_input,
+            |this, _, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    this.keyboard_row = None;
+                    this.visible_models.clear();
+                    this.reset_list_scroll();
+                    cx.notify();
                 }
+                InputEvent::PressEnter { .. } => {
+                    if let Some(model) = this.visible_models.get(this.keyboard_row.unwrap_or(0)) {
+                        let (id, provider) = (model.id.clone(), model.provider.clone());
+                        this.pick_model(id, provider, cx);
+                    }
+                }
+                _ => {}
+            },
+        )
+        .detach();
+
+        let picker = cx.weak_entity();
+        let search_focus = search_input.read(cx).focus_handle(cx);
+        let keyboard = cx.intercept_keystrokes(move |event, window, cx| {
+            let key = &event.keystroke;
+            if key.modifiers.control
+                || key.modifiers.platform
+                || key.modifiers.alt
+                || key.modifiers.shift
+                || !search_focus.is_focused(window)
+            {
+                return;
             }
-        })
+            let up = match key.key.as_str() {
+                "up" => true,
+                "down" => false,
+                _ => return,
+            };
+            let _ = picker.update(cx, |this, cx| {
+                let count = this.visible_models.len();
+                if !this.app.read(cx).model_picker_open || count == 0 {
+                    return;
+                }
+                let row = match (this.keyboard_row, up) {
+                    (Some(row), true) => (row + count - 1) % count,
+                    (Some(row), false) => (row + 1) % count,
+                    (None, true) => count - 1,
+                    (None, false) => 0,
+                };
+                this.keyboard_row = Some(row);
+                this.list_smooth.cancel();
+                this.list_scroll
+                    .scroll_to_item(row, ScrollStrategy::Nearest);
+                cx.stop_propagation();
+                cx.notify();
+            });
+        });
+
+        cx.subscribe_in(
+            &custom_input,
+            window,
+            |this, inp, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    let val = inp.read(cx).value().trim().to_string();
+                    if !val.is_empty() {
+                        let save_def = this.save_default;
+                        inp.update(cx, |st, cx| st.set_value("", window, cx));
+                        let prov = this.custom_provider(cx);
+                        this.app.update(cx, |s, cx| {
+                            s.select_model(val, Some(prov), save_def, cx);
+                            s.model_picker_open = false;
+                            s.bump_shell();
+                            cx.notify();
+                        });
+                    }
+                }
+            },
+        )
         .detach();
 
         let list_scroll = UniformListScrollHandle::new();
         let list_smooth = SmoothScroller::for_uniform_list(list_scroll.clone());
+        let body_scroll = ScrollHandle::new();
+        let body_smooth = SmoothScroller::for_handle(body_scroll.clone());
 
         Self {
             app,
@@ -85,7 +149,40 @@ impl ModelPickerModal {
             save_default: false,
             list_scroll,
             list_smooth,
+            body_scroll,
+            body_smooth,
+            nested_scroll: NestedScrollRegions::default(),
             visible_models: Vec::new(),
+            keyboard_row: None,
+            _keyboard: keyboard,
+        }
+    }
+    fn pick_model(&mut self, id: String, provider: String, cx: &mut Context<Self>) {
+        let save_default = self.save_default;
+        self.app.update(cx, |app, cx| {
+            if app.model_picker_open {
+                app.select_model(id, Some(provider), save_default, cx);
+                app.model_picker_open = false;
+                app.bump_shell();
+                cx.notify();
+            }
+        });
+    }
+
+    fn reset_list_scroll(&self) {
+        self.list_smooth.cancel();
+        self.list_scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(Point::default());
+    }
+
+    fn custom_provider(&self, cx: &Context<Self>) -> String {
+        if self.provider_filter == "all" {
+            self.app.read(cx).active_provider.clone()
+        } else {
+            self.provider_filter.clone()
         }
     }
 }
@@ -100,14 +197,21 @@ impl Render for ModelPickerModal {
         }
         if !was_open || self.need_focus {
             self.need_focus = false;
+            self.save_default = false;
+            self.keyboard_row = None;
+            self.reset_list_scroll();
+            self.body_smooth.cancel();
+            self.body_scroll.set_offset(Point::default());
             let fh = self.search_input.read(cx).focus_handle(cx);
             window.on_next_frame(move |window, cx| {
-                window.focus(&fh, cx);
+                if fh.is_rendered(window) {
+                    window.focus(&fh, cx);
+                }
             });
         }
         let s = self.app.read(cx);
         let theme = s.sand_theme();
-        let models = s.models.clone();
+        let models = &s.models;
         let active_model = s.active_model.clone();
         let active_provider = s.active_provider.clone();
         let effort = s.reasoning_effort;
@@ -117,7 +221,7 @@ impl Render for ModelPickerModal {
         let restarting = s.restarting_backend;
 
         let mut prov_map: BTreeMap<String, (usize, bool)> = BTreeMap::new();
-        for m in &models {
+        for m in models {
             if m.provider.is_empty() {
                 continue;
             }
@@ -157,13 +261,15 @@ impl Render for ModelPickerModal {
             .collect();
         filtered.sort_by(|a, b| b.configured.cmp(&a.configured));
         let model_count = filtered.len();
+        let list_wheel = self.list_scroll.0.borrow().base_handle.clone();
         self.visible_models = filtered;
-
-        let save_def = self.save_default;
+        self.keyboard_row = self.keyboard_row.filter(|&row| row < model_count);
+        let modal_height = (window.viewport_size().height - px(48.0)).clamp(px(0.0), px(680.0));
 
         deferred(
             div()
                 .id("model-picker-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .child(self.motion.backdrop("model-picker-scrim-enter", theme.bg_scrim))
@@ -176,6 +282,7 @@ impl Render for ModelPickerModal {
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.app.update(cx, |s, cx| {
                         s.model_picker_open = false;
+                        s.bump_shell();
                         cx.notify();
                     });
                 }))
@@ -184,7 +291,7 @@ impl Render for ModelPickerModal {
                         .id("model-picker-modal")
                         .w(px(640.0))
                         .max_w_full()
-                        .max_h(px(680.0))
+                        .max_h(modal_height)
                         .rounded(px(22.0))
                         .bg(theme.bg_elevated)
                         .border_1()
@@ -215,6 +322,7 @@ impl Render for ModelPickerModal {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.app.update(cx, |s, cx| {
                                                 s.model_picker_open = false;
+                                                s.bump_shell();
                                                 cx.notify();
                                             });
                                         })),
@@ -223,13 +331,29 @@ impl Render for ModelPickerModal {
                         // Scrollable Body
                         .child(
                             div()
-                                .id("model-picker-body")
                                 .flex_1()
-                                .overflow_y_scroll()
-                                .p(px(16.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(12.0))
+                                .min_h_0()
+                                .w_full()
+                                .relative()
+                                .child(self.nested_scroll.reset_marker())
+                                .child(
+                                    div()
+                                        .id("model-picker-body")
+                                        .track_scroll(&self.body_scroll)
+                                        .w_full()
+                                        .max_h((modal_height - px(56.0)).max(px(0.0)))
+                                        .overflow_y_scroll()
+                                        .restrict_scroll_to_axis()
+                                        .p(px(16.0))
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(12.0))
                                 // Search + Refresh/Restart row
                                 .child(
                                     div()
@@ -249,7 +373,11 @@ impl Render for ModelPickerModal {
                                             .when(!refreshing, |d| d.child(cursor_icon("refresh", 12.0, theme.text_primary)))
                                             .child(if refreshing { "Refreshing…" } else { "Refresh" })
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.app.update(cx, |s, cx| s.refresh_models(cx));
+                                                this.app.update(cx, |s, cx| {
+                                                    if !s.restarting_backend {
+                                                        s.refresh_models(cx);
+                                                    }
+                                                });
                                             })),
                                         )
                                         .child(
@@ -289,7 +417,10 @@ impl Render for ModelPickerModal {
                                             )
                                             .child(label)
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.provider_filter = pname.clone();
+                                                this.provider_filter.clone_from(&pname);
+                                                this.keyboard_row = None;
+                                                this.visible_models.clear();
+                                                this.reset_list_scroll();
                                                 cx.notify();
                                             }))
                                         })),
@@ -298,8 +429,22 @@ impl Render for ModelPickerModal {
                                 .child(
                                     div()
                                         .w_full()
-                                        .h(px(260.0))
+                                        .h(if model_count == 0 { px(66.0) } else { px(260.0) })
+                                        .flex_shrink_0()
+                                        .id("model-picker-list-viewport")
                                         .relative()
+                                        .on_scroll(move |event, window, cx| {
+                                            if model_count == 0 {
+                                                return;
+                                            }
+                                            let delta = event.delta.pixel_delta(window.line_height()).y;
+                                            let max = list_wheel.max_offset().y;
+                                            let previous = list_wheel.offset().y - delta;
+                                            if max > px(0.0) && ((delta < px(0.0) && previous > -max) || (delta > px(0.0) && previous < px(0.0))) {
+                                                cx.stop_propagation();
+                                            }
+                                        })
+                                        .when(model_count > 0, |list| list.child(self.nested_scroll.mark_nested()))
                                         .child(if model_count == 0 {
                                             div()
                                                 .py(px(18.0))
@@ -334,12 +479,14 @@ impl Render for ModelPickerModal {
                                                         };
                                                         out.push(
                                                             div()
-                                                                .id(SharedString::from(format!("mp-row-{idx}")))
+                                                                .id(SharedString::from(format!("mp-row-{mprov}-{mid}")))
                                                                 .w_full()
                                                                 .h(px(54.0))
                                                                 .px(px(11.0))
                                                                 .rounded(px(11.0))
-                                                                .bg(if selected {
+                                                                .bg(if this.keyboard_row == Some(idx) {
+                                                                    theme_u.bg_active
+                                                                } else if selected {
                                                                     theme_u.accent_soft
                                                                 } else {
                                                                     SandTheme::transparent()
@@ -351,16 +498,7 @@ impl Render for ModelPickerModal {
                                                                 .cursor_pointer()
                                                                 .hover(move |st| st.bg(theme_u.bg_hover))
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.app.update(cx, |s, cx| {
-                                                                        s.select_model(
-                                                                            mid.clone(),
-                                                                            Some(mprov.clone()),
-                                                                            save_def,
-                                                                            cx,
-                                                                        );
-                                                                        s.model_picker_open = false;
-                                                                        cx.notify();
-                                                                    });
+                                                                    this.pick_model(mid.clone(), mprov.clone(), cx);
                                                                 }))
                                                                 .child(
                                                                     div()
@@ -412,7 +550,7 @@ impl Render for ModelPickerModal {
                                             .into_any_element()
                                         })
                                         .vertical_scrollbar(&self.list_scroll)
-                                        .child(smooth_scroll_layer(&self.list_smooth)),
+                                        .when(model_count > 0, |list| list.child(smooth_scroll_layer(&self.list_smooth))),
                                 )
                                 // Custom model entry
                                 .child(
@@ -429,10 +567,11 @@ impl Render for ModelPickerModal {
                                                     if !val.is_empty() {
                                                         let save_def = this.save_default;
                                                         this.custom_input.update(cx, |st, cx| st.set_value("", window, cx));
+                                                        let prov = this.custom_provider(cx);
                                                         this.app.update(cx, |s, cx| {
-                                                            let prov = s.active_provider.clone();
                                                             s.select_model(val, Some(prov), save_def, cx);
                                                             s.model_picker_open = false;
+                                                            s.bump_shell();
                                                             cx.notify();
                                                         });
                                                     }
@@ -450,7 +589,7 @@ impl Render for ModelPickerModal {
                                                         .child(div().text_size(px(13.5)).font_weight(FontWeight::MEDIUM).child("Reasoning Effort"))
                                                         .child(div().text_size(px(12.0)).text_color(theme.text_tertiary).child("Controls extended thinking depth per turn")),
                                                 )
-                                                .child(gb_segmented_shell(&theme).children(
+                                                .child(gb_segmented_shell(&theme).flex_wrap().children(
                                                     ReasoningEffort::ALL.iter().map(|&ef| {
                                                         gb_segmented_item(
                                                             SharedString::from(format!("mp-eff-{}", ef.as_str())),
@@ -518,6 +657,10 @@ impl Render for ModelPickerModal {
                                                 ),
                                         ),
                                 ),
+                                        )
+                                )
+                                .vertical_scrollbar(&self.body_scroll)
+                                .child(smooth_scroll_layer(&self.body_smooth).yield_to(&self.nested_scroll))
                         ),
                 )),
         )

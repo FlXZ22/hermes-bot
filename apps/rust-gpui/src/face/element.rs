@@ -1,5 +1,5 @@
 use super::{
-    clips::{fill_scale, STILL_FILL},
+    clips::{fill_scale, CATALOG, STILL_FILL},
     engine::FaceMotionHost,
     math::*,
     morphs::Primitive,
@@ -11,6 +11,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
     rc::Rc,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -18,11 +19,79 @@ use std::{
 pub struct BotFaceOptions {
     pub slot_key: &'static str,
     pub is_static: bool,
+    /// Freeze the current state expression and disable motion gestures.
+    pub reduced_motion: bool,
     pub follow_pointer: bool,
     pub clickable_spin: bool,
+    /// Triggers a playful pop-up bounce when this face wakes up from a static state.
+    pub pop_on_activate: bool,
     /// `None` follows the native compositor rate.
     pub max_fps: Option<f32>,
 }
+const FRAME_SAMPLE_CAPACITY: usize = 120;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FaceFrameStats {
+    pub samples: usize,
+    pub avg_ms: f32,
+    pub p95_ms: f32,
+    pub estimated_fps: f32,
+}
+
+#[derive(Clone, Copy)]
+struct FrameIntervals {
+    micros: [u32; FRAME_SAMPLE_CAPACITY],
+    next: usize,
+    len: usize,
+}
+
+impl FrameIntervals {
+    const fn new() -> Self {
+        Self {
+            micros: [0; FRAME_SAMPLE_CAPACITY],
+            next: 0,
+            len: 0,
+        }
+    }
+
+    fn record(&mut self, interval: Duration) {
+        let micros = interval.as_micros().min(u128::from(u32::MAX)) as u32;
+        if micros == 0 {
+            return;
+        }
+        self.micros[self.next] = micros;
+        self.next = (self.next + 1) % FRAME_SAMPLE_CAPACITY;
+        self.len = (self.len + 1).min(FRAME_SAMPLE_CAPACITY);
+    }
+
+    fn stats(mut self) -> FaceFrameStats {
+        if self.len == 0 {
+            return FaceFrameStats::default();
+        }
+        let samples = &mut self.micros[..self.len];
+        let sum: u64 = samples.iter().map(|&sample| u64::from(sample)).sum();
+        let avg_ms = sum as f32 / self.len as f32 / 1000.;
+        samples.sort_unstable();
+        let p95 = (self.len * 95).div_ceil(100) - 1;
+        FaceFrameStats {
+            samples: self.len,
+            avg_ms,
+            p95_ms: samples[p95] as f32 / 1000.,
+            estimated_fps: 1000. / avg_ms,
+        }
+    }
+}
+
+static FRAME_INTERVALS: Mutex<FrameIntervals> = Mutex::new(FrameIntervals::new());
+
+/// Intervals between advances of visible animated faces, including faces with a frame cap.
+pub fn face_frame_stats() -> FaceFrameStats {
+    let snapshot = *FRAME_INTERVALS
+        .lock()
+        .unwrap_or_else(|lock| lock.into_inner());
+    snapshot.stats()
+}
+
 pub(crate) struct BotFaceElement {
     key: u64,
     props: FaceProps,
@@ -45,6 +114,7 @@ struct StaticPathKey {
     body: Body,
     size: u32,
     sleeping: bool,
+    reduced_state: Option<&'static str>,
     bounds: [u32; 4],
     ink: [u32; 4],
 }
@@ -60,8 +130,14 @@ impl StaticPaths {
             body: props.body,
             size: props.size.to_bits(),
             sleeping: props.state == "sleeping",
-            bounds: [bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height]
-                .map(|p| f32::from(p).to_bits()),
+            reduced_state: props.options.reduced_motion.then_some(props.state),
+            bounds: [
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                bounds.size.height,
+            ]
+            .map(|p| f32::from(p).to_bits()),
             ink: [props.ink.h, props.ink.s, props.ink.l, props.ink.a].map(f32::to_bits),
         };
         if let Some(index) = self.0.iter().position(|(cached, _)| *cached == key) {
@@ -70,14 +146,51 @@ impl StaticPaths {
             self.0.push_front(entry);
             return paths;
         }
-        let tree = render_tree(&FaceMotionHost::still(key.body, key.sleeping), props.size as f64);
-        let paths = Rc::new(build_paths(&tree, &canvas_at(bounds, props.size), props.ink));
+        let frame = match key.reduced_state {
+            Some(state) => reduced_motion_frame(key.body, state, props.size < 48.),
+            None => FaceMotionHost::still(key.body, key.sleeping),
+        };
+        let tree = render_tree(&frame, props.size as f64);
+        let paths = Rc::new(build_paths(
+            &tree,
+            &canvas_at(bounds, props.size),
+            props.ink,
+        ));
         if self.0.len() == Self::CAPACITY {
             self.0.pop_back();
         }
         self.0.push_front((key, paths.clone()));
         paths
     }
+}
+
+fn reduced_motion_frame(body: Body, state: &'static str, compact: bool) -> super::engine::Frame {
+    let spec = CATALOG.states.get(state).unwrap_or(&CATALOG.states["idle"]);
+    if spec.morph.is_some() {
+        // Sample a deterministic in-state pose after the morph settles into view.
+        // This runs only on a cache miss and never queues a GUI frame.
+        let mut host = FaceMotionHost::new(body, state, 1, compact);
+        for _ in 0..60 {
+            host.advance(DT);
+        }
+        return host.frame();
+    }
+
+    let clips = if compact {
+        spec.compact_clips.as_ref().unwrap_or(&spec.clips)
+    } else {
+        &spec.clips
+    };
+    let expression = spec
+        .face
+        .or_else(|| {
+            let clip = CATALOG.clips.get(clips.first()?)?;
+            Some(clip.rest().1)
+        })
+        .unwrap_or_default();
+    let mut pose = FaceMotionHost::still(body, false);
+    pose.eyes = Some(expression.eyes());
+    pose
 }
 
 thread_local! {
@@ -313,16 +426,28 @@ impl Element for BotFaceElement {
         if self.props.size <= 0. || !bounds.intersects(&mask.bounds) {
             return FacePrepaint(FacePaint::None, None);
         }
-        if self.props.options.is_static {
+        if self.props.options.is_static || self.props.options.reduced_motion {
+            // Release any previous live face state so returning to active triggers a fresh
+            // activation (e.g., pop-up bounce on hover) and frees any pending frame timer.
+            if let Some(el_id) = id {
+                window.with_element_state(el_id, |_: Option<Option<Entity<BotFaceView>>>, _| {
+                    ((), None)
+                });
+            }
             return FacePrepaint(FacePaint::Static, None);
         }
 
         // Unlike use_keyed_state, this doesn't add an observer that notifies
         // the layout owner on every animation tick.
-        let view = window.with_element_state(id.unwrap(), |view: Option<Entity<BotFaceView>>, _| {
-            let view = view.unwrap_or_else(|| cx.new(|_| BotFaceView::new(self.props)));
-            (view.clone(), view)
-        });
+        let view = window.with_element_state(
+            id.unwrap(),
+            |view: Option<Option<Entity<BotFaceView>>>, _| {
+                let view = view
+                    .flatten()
+                    .unwrap_or_else(|| cx.new(|_| BotFaceView::new(self.props)));
+                (view.clone(), Some(view))
+            },
+        );
         let revision = if view.read(cx).props != self.props {
             view.update(cx, |face, _| face.set_props(self.props))
         } else {
@@ -382,16 +507,29 @@ struct BotFaceView {
 
 impl BotFaceView {
     fn new(props: FaceProps) -> Self {
-        Self { props, revision: 0, live: Rc::new(RefCell::new(LiveFace::new(props))) }
+        let mut live = LiveFace::new(props);
+        if props.options.pop_on_activate {
+            live.host.bounce();
+        }
+        Self { props, revision: 0, live: Rc::new(RefCell::new(live)) }
     }
 
     fn set_props(&mut self, props: FaceProps) -> usize {
         let mut live = self.live.borrow_mut();
         if self.props.seed != props.seed || (self.props.size < 48.) != (props.size < 48.) {
             *live = LiveFace::new(props);
+            if props.options.pop_on_activate {
+                live.host.bounce();
+            }
         } else {
+            let entering_finished = props.options.pop_on_activate
+                && props.state == "finished"
+                && self.props.state != "finished";
             live.host.set_body(props.body);
             live.host.set_state(props.state);
+            if entering_finished {
+                live.host.bounce();
+            }
             live.tree = None;
             live.timer = None;
         }
@@ -413,12 +551,23 @@ impl Render for BotFaceView {
                     return;
                 }
                 let now = Instant::now();
-                let interval = props.options.max_fps
+                let effective_fps = props.options.max_fps.or_else(|| {
+                    // Decorative idle faces without pointer tracking don't need 120fps churn.
+                    (props.state == "idle" && !props.options.follow_pointer).then_some(30.0)
+                });
+                let interval = effective_fps
                     .filter(|fps| fps.is_finite() && *fps > 0.)
                     .and_then(|fps| Duration::try_from_secs_f64(1. / f64::from(fps)).ok())
                     .filter(|interval| !interval.is_zero());
                 let mut live = live.borrow_mut();
+                let previous = live.last;
                 paint_paths(live.paths_at(props, bounds, window.mouse_position(), now, interval), window);
+                if live.last != previous {
+                    if let Some(previous) = previous {
+                        FRAME_INTERVALS.lock().unwrap_or_else(|lock| lock.into_inner())
+                            .record(now.saturating_duration_since(previous));
+                    }
+                }
                 if let Some(interval) = interval {
                     if live.timer.is_none() {
                         let last = live.last.unwrap();
@@ -737,6 +886,66 @@ mod tests {
         assert_eq!(face.last, Some(start));
         face.paths_at(props, moved, mouse, start + interval, Some(interval));
         assert_eq!(face.last, Some(start + interval));
+    }
+
+    #[test]
+    fn frame_stats_report_empty_samples_and_use_the_last_120_intervals() {
+        let mut intervals = super::FrameIntervals::new();
+        assert_eq!(intervals.stats().samples, 0);
+        assert_eq!(intervals.stats().estimated_fps, 0.);
+        intervals.record(Duration::from_millis(200));
+        for _ in 0..114 {
+            intervals.record(Duration::from_millis(10));
+        }
+        for _ in 0..6 {
+            intervals.record(Duration::from_millis(30));
+        }
+        let stats = intervals.stats();
+        assert_eq!(stats.samples, 120);
+        assert_eq!(stats.avg_ms, 11.);
+        assert_eq!(stats.p95_ms, 10.);
+        assert!((stats.estimated_fps - 1000. / 11.).abs() < 0.01);
+    }
+
+    #[test]
+    fn reduced_motion_defaults_off_and_uses_the_requested_state_pose() {
+        assert!(!BotFaceOptions::default().reduced_motion);
+        let thinking = super::reduced_motion_frame(Body::Sphere, "thinking", false);
+        assert!(thinking.morph.is_some_and(|frame| frame.amount > 0.5));
+        let finished = super::reduced_motion_frame(Body::Sphere, "finished", false);
+        let expected = super::CATALOG.states["finished"].face.unwrap().eyes();
+        let eyes = finished.eyes.unwrap();
+        assert_eq!(eyes[0].width, expected[0].width);
+    }
+
+    #[test]
+    fn pop_on_activate_triggers_bounce_and_idle_options_default_cleanly() {
+        let mut opts = BotFaceOptions::default();
+        assert!(!opts.is_static);
+        assert!(!opts.follow_pointer);
+        assert!(!opts.pop_on_activate);
+        opts.pop_on_activate = true;
+        opts.follow_pointer = true;
+        let props = BotFaceElement::new(
+            "bot-a",
+            "blob",
+            "idle",
+            60.,
+            rgb(0x1084fe).into(),
+            opts,
+            42,
+        )
+        .props;
+        let mut face = LiveFace::new(props);
+        let before = face.host.frame();
+        face.host.bounce();
+        face.host.advance(0.15);
+        let bounced = face.host.frame();
+        assert!(
+            (bounced.offset.0[1] - before.offset.0[1]).abs() > 0.001
+                || (bounced.squash.0[1] - before.squash.0[1]).abs() > 0.001,
+            "pop-up bounce should animate vertical lift or squash"
+        );
     }
 
     #[test]
